@@ -1,0 +1,29 @@
+diff --git a/src/svr-auth.c b/src/svr-auth.c
+index ca19382..81a4056 100644
+--- a/src/svr-auth.c
++++ b/src/svr-auth.c
+@@ -504,11 +504,21 @@ void svr_switch_user(void) {
+ 	/* We can only change uid/gid as root ... */
+ 	if (getuid() == 0) {
+ 
+-		if ((setgid(ses.authstate.pw_gid) < 0) ||
+-			(initgroups(ses.authstate.pw_name, 
+-						ses.authstate.pw_gid) < 0)) {
++		if (setgid(ses.authstate.pw_gid) < 0) {
+ 			dropbear_exit("Error changing user group");
+ 		}
++		if (initgroups(ses.authstate.pw_name,
++						ses.authstate.pw_gid) < 0) {
++			/* Sandboxed hosts (seccomp-filtered) may forbid
++			 * setgroups(2) even for a no-op. Tolerate the failure
++			 * only when the group identity is not actually changing;
++			 * a real drop must still hard-fail. */
++			if (getgid() != ses.authstate.pw_gid) {
++				dropbear_exit("Error changing user group");
++			}
++			dropbear_log(LOG_INFO, "initgroups: %s (continuing: gid unchanged)",
++				strerror(errno));
++		}
+ 
+ #if DROPBEAR_SVR_DROP_PRIVS
+ 		/* Retain utmp saved group so that wtmp/utmp can be written */

@@ -1,0 +1,23 @@
+# Third-party and provenance
+
+## Fetched at build time, not vendored
+
+* **dropbear** (mkj/dropbear) - MIT. Fetched by `scripts/build-dropbear.sh`,
+  pinned by COMMIT (`DROPBEAR_COMMIT`), because the version lives in
+  `src/sysoptions.h` and not in a git ref, and a published artefact with a patch
+  inside it must be pinned to something that cannot move. Not in this tree.
+* **mbedTLS** (Mbed-TLS) - Apache-2.0. Fetched by `scripts/build-mbedtls.sh`,
+  pinned. It is the TLS implementation, and it is a BUILD INPUT rather than
+  something this project writes; see `docs/decisions-tls.md` for why.
+* **the passwd and isatty shims, and `errandsh`** -
+  [sandhome](https://github.com/talaria0101/sandhome), MIT. Fetched by
+  `scripts/build-dropbear.sh`, pinned by `SANDHOME_REF`.
+
+  These used to be vendored here, in two places, and the copies drifted: the
+  shim read `SANDSSH_PASSWD` while the ecosystem had moved to
+  `SANDHOME_PASSWD`. One copy, in the repository that owns them, fetched at
+  build time, is how that stops happening. The shim still accepts the old
+  variable name, so a machine configured against it keeps working.
+
+* **the two dropbear patches** in `patches/` - MIT, against mkj/dropbear. They
+  are diffs, not copies: they carry no dropbear code.

@@ -1,0 +1,27 @@
+# Build output. None of this is ever committed: a published artefact with a
+# patch in it is pinned by the commit it was built from, not by a binary here.
+/dist/
+/.deps/
+# The sandhome checkout the builder makes for the shim. It is an input, pinned
+# by SANDHOME_REF, and never a vendored copy.
+/.deps/sandhome/
+/.work/
+*.o
+*.a
+*.so
+*.build.log
+
+# ⛔ CREDENTIALS ARE NOT JUST IGNORED, THEY ARE NOTED. A relay token, a host
+# key, a private key or a dropssh binary produced by a local run must never be
+# committed. The relay's own documentation says a token quoted on a web page, a
+# log line, or an example is already compromised, and a repository is the most
+# public place to quote one.
+hostkey
+hostkey.*
+*_ed25519
+*.pem
+id_rsa*
+authorized_keys
+token
+*.token
+.env

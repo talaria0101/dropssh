@@ -1,0 +1,39 @@
+diff --git a/src/netio.c b/src/netio.c
+index 6249f85..79299ba 100644
+--- a/src/netio.c
++++ b/src/netio.c
+@@ -701,6 +701,17 @@ void get_socket_address(int fd, char **local_host, char **local_port,
+ 	if (remote_host || remote_port) {
+ 		addrlen = sizeof(addr);
+ 		if (getpeername(fd, (struct sockaddr*)&addr, &addrlen) < 0) {
++			/* Not a socket (pipe on stdio for inetd-style transports):
++			 * no peer address exists; log a placeholder and continue. */
++			if (errno == ENOTSOCK) {
++				if (remote_host) {
++					*remote_host = m_strdup("(pipe)");
++				}
++				if (remote_port) {
++					*remote_port = m_strdup("0");
++				}
++				return;
++			}
+ 			dropbear_exit("Failed socket address: %s", strerror(errno));
+ 		}
+ 		getaddrstring(&addr, remote_host, remote_port, host_lookup);		
+@@ -754,8 +765,14 @@ void getaddrstring(struct sockaddr_storage* addr,
+ 			getaddrstring(addr, ret_host, ret_port, 0);
+ 			return;
+ 		} else {
+-			/* if we can't do a numeric lookup, something's gone terribly wrong */
+-			dropbear_exit("Failed lookup: %s", gai_strerror(ret));
++			if (addr->ss_family == AF_INET || addr->ss_family == AF_INET6) {
++				/* numeric lookup failed on a real socket: genuinely wrong */
++				dropbear_exit("Failed lookup: %s", gai_strerror(ret));
++			}
++			/* pipe or unix socket on stdio (inetd-style transports):
++			 * there is no peer address; keep serving. */
++			snprintf(host, sizeof(host)-1, "(pipe)");
++			snprintf(serv, sizeof(serv)-1, "0");
+ 		}
+ 	}
+ 

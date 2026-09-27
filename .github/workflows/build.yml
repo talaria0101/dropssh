@@ -1,0 +1,280 @@
+# Build dropssh for every supported target, and PROVE the artefact.
+#
+# ⛔ THE JOB THAT MATTERS IS NOT THE BUILD, IT IS THE SESSION. A dropssh that
+# compiles and a dropbear that links are both cheap; a dropbear that cannot log
+# anyone in is the failure this workflow exists to prevent, and it is invisible
+# to every other check in this file. The `prove` job runs tests/e2e.sh against
+# the artefact this workflow produced, on the target that can execute, with
+# real bytes and a real ssh client.
+#
+# ⛔ EACH TARGET IS BUILT FOR TWO LIBCs AND THE REASON IS NOT A PREFERENCE.
+# dropssh is static musl, because it is the binary a user downloads and it has
+# to run in a cage with no libc. dropbear is dynamic glibc, because the passwd
+# shim is an LD_PRELOAD and musl's RTLD_NEXT resolves to NULL for a libc
+# symbol, so a musl dropbear cannot be interposed at all. Measured, in
+# docs/decisions-tls.md. One --target stretched across both would quietly ship
+# a server that cannot log anyone in.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dropssh-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The dropbear source is pinned by COMMIT, not by version. The version lives
+  # in src/sysoptions.h and not in a ref, so `git clone --branch 2026.94` fails
+  # with "Remote branch not found", and a published artefact with a patch in it
+  # must be pinned to something that cannot move.
+  DROPBEAR_COMMIT: 59870ad43153fe8d4f1c96f5d5752116c94f31ff
+  ZIG_VERSION: 0.13.0
+
+jobs:
+  dropssh:
+    name: dropssh (static, musl) ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only targets where zig cc can produce a genuinely static binary. A
+        # musl target is required: a gnu target under zig cc falls back to a
+        # dynamic link and the build asserts against that, because a
+        # dynamically linked dropssh does not run in the cage it exists for.
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - arm-linux-musleabihf
+          - x86-linux-musl        # zig's name for 32-bit x86. "i386-linux-musl"
+                                 # is not a target: `zig cc` answers
+                                 # "unable to parse target query
+                                 # 'i386-linux-musl': UnknownArchitecture".
+                                 # Naming it in the matrix produces a red job
+                                 # for a target that does not exist.
+          - riscv64-linux-musl
+          - powerpc64le-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: build
+        run: ./scripts/build.sh --target ${{ matrix.target }} --out dist/${{ matrix.target }}
+
+      - name: the artefact is a static binary
+        run: |
+          set -euo pipefail
+          file "dist/${{ matrix.target }}/dropssh"
+          # ⛔ READ THE EXIT CODE FROM `file` ITSELF, NOT FROM A PIPE. A pipe
+          # reports the last command's status, so a grep that found nothing
+          # would be read as success and the check would never fail.
+          file -b "dist/${{ matrix.target }}/dropssh" > linkage.txt
+          grep -q 'statically linked' linkage.txt \
+            || { echo "::error::dropssh is not statically linked for ${{ matrix.target }}"; exit 1; }
+          cat "dist/${{ matrix.target }}/BUILDINFO"
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dropssh-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  dropbear:
+    name: dropbear (dynamic, glibc) ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # glibc only, and that is measured rather than preferred. zig 0.13
+        # cannot build a glibc riscv64 target at all -- its bundled glibc
+        # startup uses an assembler directive lld rejects:
+        #
+        #   /usr/lib/zig/libc/glibc/sysdeps/riscv/start-2.33.S:48:2: error:
+        #   unknown directive .cfi_label
+        #
+        # and powerpc64le musl is refused for a different reason. Both are in
+        # the dropssh matrix, which is where those architectures are wanted.
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - arm-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: build dropbear
+        run: |
+          set -euo pipefail
+          ./scripts/build-dropbear.sh "${{ matrix.target }}" "dist/${{ matrix.target }}" "$DROPBEAR_COMMIT"
+          # ⛔ THE LINKAGE IS ASSERTED ON THE ARTEFACT, AND static-pie IS
+          # REFUSED ALONGSIDE static. A static-pie dropbear is the exact
+          # silent failure: `file` does not call it "statically linked", it
+          # looks plausible, and LD_PRELOAD cannot reach it, so every login
+          # fails with a message naming the wrong thing.
+          file -b "dist/${{ matrix.target }}/dropbear" > linkage.txt
+          cat linkage.txt
+          if grep -qE 'statically linked|static-pie linked' linkage.txt; then
+            echo "::error::dropbear is static; the passwd shim cannot reach it"
+            exit 1
+          fi
+          grep -q 'dynamically linked' linkage.txt \
+            || { echo "::error::could not classify the dropbear linkage"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dropbear-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  refuses:
+    name: a musl dropbear is refused, not shipped
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: the refusal is explicit
+        # ⛔ A GUARD NOBODY CAN SEES IS NOT A GUARD, AND THIS IS THE ONE THAT
+        # MATTERS MOST IN THIS PROJECT. A static or static-pie dropbear passes
+        # every static check and fails every login, on a machine that has no
+        # /etc/passwd, with a message that names a user who does exist.
+        #
+        # So the refusal is exercised here, on every run. `build-dropbear.sh`
+        # must exit non-zero for a musl target and must SAY WHY, because the
+        # failure it prevents is invisible in every other place.
+        run: |
+          set -uo pipefail
+          if ./scripts/build-dropbear.sh x86_64-linux-musl dist/refuse 2>refuse.log; then
+            echo "::error::a musl dropbear built, and it would be static-pie"
+            cat refuse.log
+            exit 1
+          fi
+          echo "the build refused, as it must:"
+          cat refuse.log
+          # The message has to name the reason, not just fail. A refusal an
+          # operator cannot act on is a refusal they work around.
+          grep -q "static-pie" refuse.log \
+            || { echo "::error::the refusal does not say why"; exit 1; }
+
+  prove:
+    name: prove the x86_64 artefact carries a session
+    runs-on: ubuntu-latest
+    needs: [dropssh, dropbear, refuses]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: build for the runner
+        run: ./scripts/build.sh --target x86_64-linux-musl --out dist/x86_64-linux-musl
+
+      - name: the ssh client this needs
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-client
+
+      - name: prove it
+        # ⛔ THE EXIT CODE IS READ FROM THE SCRIPT AND NEVER THROUGH A PIPE.
+        # `tests/e2e.sh | tee log` reports tee's status, so a failing e2e
+        # would be published as green, and this job is the one that exists to
+        # stop exactly that.
+        run: |
+          set -euo pipefail
+          ./tests/e2e.sh dist/x86_64-linux-musl 2>&1 | tee e2e.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: upload the proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-log
+          path: e2e.log
+          if-no-files-found: warn
+
+  release:
+    name: release
+    needs: [prove]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: build the release set
+        run: |
+          set -euo pipefail
+          ./scripts/build.sh --target x86_64-linux-musl --out dist/x86_64-linux-musl
+
+      - name: package
+        run: |
+          set -euo pipefail
+          cd dist/x86_64-linux-musl
+          tar czf ../../dropssh-x86_64-linux-musl.tar.gz \
+            dropssh dropbear dropbearkey fakepwd.so passwd BUILDINFO SHA256SUMS
+          cd ../..
+          ls -la dropssh-x86_64-linux-musl.tar.gz
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dropssh-x86_64-linux-musl.tar.gz
+          generate_release_notes: true
+          body: |
+            dropssh: dropbear with a relay built in.
+
+            Two artefacts, and they are built for different libcs on purpose:
+
+            * `dropssh` is **static musl**. It is the binary you download and
+              run, and it runs in a cage with no libc.
+            * `dropbear` is **dynamic glibc**. The passwd shim is an `LD_PRELOAD`
+              and musl's `RTLD_NEXT` resolves to NULL for a libc symbol, so a
+              musl dropbear cannot be interposed at all.
+
+            Quick start, on a machine with no pty, no `/etc/passwd` and only
+            HTTPS egress:
+
+                # inside the cage
+                ./dropssh serve --name mycage \
+                    --passwd ./passwd --preload ./fakepwd.so \
+                    --server './dropbear -i -E -F -r hostkey -D ak'
+
+                # from your own machine
+                ssh -o ProxyCommand='./dropssh connect --name mycage' root@mycage
+
+            To reach a public ssh gateway through a relay instead, no node
+            needed:
+
+                ssh -o ProxyCommand='./dropssh connect --mint' root@railway.new
+
+            `dropssh connect` mints its own relay token. No token is in this
+            repository and none is needed to get started.

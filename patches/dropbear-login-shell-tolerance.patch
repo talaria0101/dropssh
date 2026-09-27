@@ -1,0 +1,73 @@
+A login shell that exists and is executable is a valid login shell.
+
+dropbear validates the login shell against getusershell(), which reads
+/etc/shells. On a host that has one, a passwd entry naming a shell the file does
+not list is refused, and the login is denied with a message that names the user
+rather than the shell:
+
+    Login attempt with wrong user root from localhost:...
+    Exit before auth from <localhost:...>: (user 'root', 0 fails)
+
+with the user present, the shell present and the shell executable. The same
+dropbear on a host with no /etc/shells works, because getusershell() then
+returns a compiled-in fallback list, so whether a login succeeds depended on
+whether a POLICY FILE existed.
+
+/etc/shells is a policy for a multi-user system. A cage has one user, no
+administrator and no policy, so the check's only effect there is to refuse a
+shell that is present. This patch consults the list first, so a host with a
+policy keeps it, and accepts an executable shell when the list does not name
+one.
+
+It is not a way around a security control: anyone who can write /etc/passwd can
+already name any shell, and the list is still consulted first where one exists.
+What changes is that a missing or narrow policy file stops being a login denial.
+
+diff --git a/src/svr-auth.c b/src/svr-auth.c
+index ca19382..f95031e 100644
+--- a/src/svr-auth.c
++++ b/src/svr-auth.c
+@@ -323,12 +323,39 @@ static int checkusername(const char *username, unsigned int userlen) {
+ 			goto goodshell;
+ 		}
+ 	}
+-	/* no matching shell */
++	/* No match in the list.
++	 *
++	 * /etc/shells is a policy for a multi-user system: it is where an
++	 * administrator says which shells users may log in with. A cage has
++	 * one user, no administrator and no policy, and on such a host the
++	 * check's only effect is to refuse a shell that is present.
++	 *
++	 * Measured on a GitHub Actions runner, 2026-09-27, with a passwd entry
++	 * naming /bin/sh, that file present, the shell present and the shell
++	 * executable:
++	 *
++	 *   Login attempt with wrong user root from localhost:...
++	 *   Exit before auth from <localhost:...>: (user 'root', 0 fails)
++	 *
++	 * The same binary on a host with no /etc/shells works, because
++	 * getusershell() then returns a compiled-in fallback. So whether a
++	 * login succeeded depended on whether a POLICY FILE existed, which
++	 * is the opposite of what a cage wants.
++	 *
++	 * So a shell that exists and is executable is a login shell. The list
++	 * is consulted first, so a host that does have a policy keeps it, and
++	 * this is not a way around one: anyone who can write /etc/passwd can
++	 * already name any shell. What changes is that a missing or narrow
++	 * policy file stops being a login denial. */
+ 	endusershell();
+-	TRACE(("no matching shell"))
++	if (access(usershell, X_OK) == 0) {
++		TRACE(("shell '%s' is not listed but is executable", usershell))
++		goto goodshell;
++	}
++	TRACE(("no matching shell, and '%s' is not executable", usershell))
+ 	ses.authstate.checkusername_failed = 1;
+-	dropbear_log(LOG_WARNING, "User '%s' has invalid shell, rejected",
+-				ses.authstate.pw_name);
++	dropbear_log(LOG_WARNING, "User '%s' has an invalid shell '%s', rejected",
++				ses.authstate.pw_name, usershell);
+ 	return DROPBEAR_FAILURE;
+ 	
+ goodshell:
