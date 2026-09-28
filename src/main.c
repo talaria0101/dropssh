@@ -12,6 +12,7 @@
 #include "ws.h"
 #include "events.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -218,11 +219,28 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "dropssh: --bound-ms needs a value\n");
                 return 2;
             }
-            o.bound_ms = atoi(v);
-            if (o.bound_ms < 0) {
-                fprintf(stderr, "dropssh: --bound-ms is a time in ms, not %s\n", v);
+            /* ⛔ PARSED WITH strtol AND CHECKED, NOT WITH atoi. `atoi("abc")`
+             * is 0, and 0 IS A MEANINGFUL VALUE HERE -- it means "no bound" --
+             * so a typo in this flag SILENTLY REMOVES THE GUARD it was meant to
+             * set. That is the same disease as the `usage()` vararg bug where
+             * an unpassed argument printed as 0: a zero that reads like a
+             * number. Verified: `--bound-ms abc` was accepted with no complaint
+             * before this was added.
+             *
+             * The end pointer is checked rather than assumed, so `60000x` is
+             * rejected for the same reason `abc` is, and the range is bounded
+             * because this value is compared against an unsigned clock. */
+            char *end = NULL;
+            errno = 0;
+            long ms = strtol(v, &end, 10);
+            if (end == v || (end && *end != '\0') || errno == ERANGE ||
+                ms < 0 || ms > 3600000L) {
+                fprintf(stderr,
+                        "dropssh: --bound-ms is a time in ms between 0 and "
+                        "3600000, not `%s`. 0 means no bound at all\n", v);
                 return 2;
             }
+            o.bound_ms = (int)ms;
         } else if (strcmp(a, "--proxy") == 0) {
             const char *p = NEXT();
             /* an explicit --proxy sets the process-wide egress, so every

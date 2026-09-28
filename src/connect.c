@@ -346,11 +346,15 @@ int dropssh_connect(dropssh_opts *o) {
                      "the relay closes an unanswered open at about 15s with "
                      "1013 node open timeout");
             }
-            /* The bound is six times the relay's own open timeout, so a slow
-             * but working node is not cut off and a relay's own 1008 is what
-             * normally ends this wait. It exists for the relay that never
-             * closes, because ssh waits for this process and an operator with
-             * no message has no way out. */
+            /* ⛔ The bound is six times the relay's own open timeout, so a slow
+             * but working node is not cut off and a relay's own close is what
+             * normally ends this wait. ⛔ CORRECTED 2026-09-28: this said "a
+             * relay's own 1008", which is the fault we had measured wrong. The
+             * relay sends **1013** for an unanswered `open` and uses 1008 for
+             * two operator-side errors, so 1008 during this wait means this
+             * process, not a slow node. The bound itself exists for the relay
+             * that never closes, because ssh waits for this process and an
+             * operator with no message has no way out. */
             if (waited_ready >= (unsigned)o->bound_ms) {
                 if (o->bound_ms == 0) {
                     /* ⛔ A ZERO BOUND IS "NONE", NOT "IMMEDIATELY", AND THE TWO
@@ -555,11 +559,26 @@ int dropssh_connect(dropssh_opts *o) {
                                     q++;
                                     size_t k = 0;
                                     while (*q && *q != '"' && k < sizeof reason - 1) {
-                                        /* ⛔ A CONTROL CHARACTER IN A REASON
-                                         * FROM THE NETWORK IS DROPPED, not
+                                        /* ⛔ CONTROL CHARACTERS ARE DROPPED, not
                                          * passed through: stderr is a terminal
                                          * and a reason is a sentence about a
-                                         * node, not a way to paint one. */
+                                         * node, not a way to paint one.
+                                         *
+                                         * ⛔ AND THIS IS THE ONE HAND-ROLLED
+                                         * FILTER IN THE TREE, which is why it
+                                         * exists at all and why the identical
+                                         * rule now also runs in `ws.c`'s
+                                         * `note_close`, where every close
+                                         * reason enters. Two filters is how the
+                                         * next caller ends up printing an
+                                         * unsanitised one; the review that found
+                                         * this put the rule in one place and
+                                         * left this one because the two strings
+                                         * come from different directions
+                                         * (a control frame's JSON versus a
+                                         * close frame's payload). If this ever
+                                         * grows a second caller, it belongs in
+                                         * relayproto.c, not here. */
                                         if ((unsigned char)*q >= 0x20 || *q == ' ') {
                                             reason[k++] = *q;
                                         }

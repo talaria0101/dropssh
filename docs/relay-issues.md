@@ -645,6 +645,154 @@ claims to test actually change?**
 
 ---
 
+# Five deep reviews: what has been run, and what each one found
+
+**Reviews are not a formality here, and the project's own history is the
+argument for them.** The last full pass found a use-after-free, unbounded
+fragment reassembly, a refused login reported as success, an aliased session
+owner, a deadlock, a test passing for the wrong reason, and a turn-counter that
+printed "60s" in five milliseconds. Reading the code finds none of those.
+
+Each review states what was swept and what would have had to be true for it to
+fire. An empty result beats an invented one.
+
+| # | angle | over | ran | found |
+| --- | --- | --- | --- | --- |
+| 1 | correctness, line by line, and the error paths | `f02ae10` + `c9840e0` | read every changed line; exercised every new error path by running the binary | **2 defects**, both fixed |
+| 2 | concurrency: what is freed under a pointer, what is written under a lock that can block | `f02ae10` + `c9840e0` | traced every writer and reader of the two structures the commits touch; ran the loop's bound directly against a hostile input | **0 defects in this work**; 1 pre-existing area re-confirmed (U2/U3) |
+| 3 | the tests: would each fail if its defect returned? | not yet run | | |
+| 4 | the docs and the issue comments: does any assert what this change made false? | not yet run | | |
+| 5 | what is NOT covered, as what was swept and what would have had to be true | not yet run | | |
+
+## Review 1, correctness: two defects, both fixed
+
+### 1a. `atoi` on `--bound-ms` made a typo remove the guard
+
+`--bound-ms` was parsed with `atoi`, whose answer to a non-numeric string is
+**0**. And 0 is not an invalid value in this option: it means *no bound at all*.
+So `--bound-ms abc` was accepted silently and **disabled the very guard the
+option exists to configure.**
+
+⛔ **THIS IS THE SAME DISEASE AS THE `usage()` VARARG BUG** from `f02ae10`,
+where an unpassed second argument printed as `0` and a default read as a
+number: a zero that looks like a value. Found by asking "what does this option
+do with an argument that is not a number", which is a question about the error
+path and not about the happy path.
+
+Measured before the fix, and after:
+
+| input | before | after |
+| --- | --- | --- |
+| `--bound-ms abc` | accepted, treated as **no bound** | `not 'abc'. 0 means no bound at all`, exit 2 |
+| `--bound-ms 60000x` | accepted | rejected |
+| `--bound-ms -5` | rejected | rejected |
+| `--bound-ms 99999999` | accepted (overflows an int comparison) | rejected, range bounded |
+
+Now parsed with `strtol`, with the **end pointer checked** rather than assumed
+so `60000x` is rejected for the same reason `abc` is, `ERANGE` honoured, and
+the range bounded to an hour because the value is compared against an unsigned
+millisecond clock.
+
+### 1b. A close reason from the network reached a terminal unsanitised
+
+`ws_close_reason()` returns a string the **peer** chose, and every consumer
+writes it to a terminal: `connect` prints it, and this process is an ssh
+`ProxyCommand` whose stderr is read by a person. A reason carrying `ESC`, `BEL`
+or a bare `CR` can repaint the line, ring, or overwrite what an operator has
+already read, and on r11 the reason is derived from a node's own text.
+
+Found by review 1 asking **what happens to a value that came off the wire on a
+path this work widened**. The `c9840e0` change made 1011 print the reason where
+it previously printed a fixed sentence, so it widened the exposure.
+
+⛔ AND THE FIX IT FOUND IS THE MORE INTERESTING HALF: `c9840e0` had added a
+hand-rolled control-character filter to the `reject` path **and left the close
+path unfiltered**, which is the one-read-path-one-write-path violation this
+repository exists to prevent. Two filters, one of which the next caller misses.
+The rule now lives in **one** place, `note_close()` in `ws.c`, where every close
+reason enters the process, and the `reject` comment records why the second one
+exists and where it must go if it ever gains a caller.
+
+**Proven to fire, live, not argued.** A node answered `open` with
+
+```
+reject {id, reason: "server\x1b[2J\x07boom\rtail"}
+```
+
+and both binaries were run against it. Output rendered with `cat -v`:
+
+```
+before:  the connection closed before the node answered `ready`
+         (code 1011 server^[[2J^Gboom^Mtail)
+after:   the connection closed before the node answered `ready`
+         (code 1011 server[2Jboomtail)
+```
+
+The `^[[2J`, `^G` and `^M` are gone and the printable text survives, which is
+the intent: a reason is a sentence an operator reads, not bytes a peer chose.
+Control characters are **dropped rather than escaped**, because `^[[2J` in a
+message about a connection is noise and the thing needed is `node disconnected`.
+Bytes >= 0x80 are kept, so a non-English reason is not mangled.
+
+⛔ The loop cannot overflow. `rl` is clamped to `sizeof close_reason - 1`
+before the loop and `k` advances at most once per iteration, so `k <= rl`, and
+the terminator lands inside the buffer. Driven directly against a hostile
+4 KB input: `k=92`, buffer 124, terminated, zero control characters left.
+
+### A third finding, which was a documentation defect
+
+The comment immediately above the bound check still said *"a relay's own **1008**
+is what normally ends this wait"* — the exact claim the same commit had just
+measured to be false, three lines away from its own correction. Corrected. ⛔
+This is why review 4 has to be a separate review: a commit can fix a claim in
+one place and leave it standing in another, and only reading the whole thing
+finds the second.
+
+### Review 2, concurrency: no defect in this work, and one area re-confirmed
+
+The question is specific: *what is freed while another thread holds a pointer to
+it, and what is written under a lock that can block.* The repository's rule is
+that the table lock makes it safe to LOOK a pointer up and says nothing about
+whether the object is still alive.
+
+**What was swept.** Every writer and every reader of the two structures these
+commits touch:
+
+| structure | written by | read by | verdict |
+| --- | --- | --- | --- |
+| `ws->close_reason`, `ws->close_code` (`ws.c`) | `note_close()`, from the frame decoder | `connect.c` (3 sites), `relay.c:542`, `serve.c:942` | **safe**, and the sanitising loop cannot be observed torn |
+| `o->bound_ms`, `wait_started`, `waited_ready` (`connect.c`) | the `connect` main loop | the same loop | **safe**: `connect` is single-threaded by design (B6: no `fork`, no thread, one mbedTLS context) |
+
+**Why `close_reason` is safe, specifically.** The worry with moving the filter
+into `note_close` is that it now WRITES a string in a loop, so a second thread
+could read a half-written one. Traced rather than assumed: `note_close` is
+called from exactly one place, the frame decoder at `ws.c:1120`, which is
+reached only from `ws_recv_frame`. That is called from three sites — `relay.c`
+line 353 (the operator's own thread, its own session), `relay.c` line 535 (the
+node's own thread, its own session) and `serve.c` line 938 (`mux_reader`, the
+documented single reader of the node socket). **One reader per websocket, ever**,
+so for every session the write and every read of the reason are on the same
+thread. The 1011 sweep is the one place a second thread touches a session, and
+it writes through `client_release`, not through the decoder.
+
+**The lock question, answered rather than assumed.** The rule about holding a
+lock across a blocking write is not engaged by anything in these commits. Both
+commits are in `connect.c`, `main.c`, `ws.c` and the test files. `connect` takes
+no lock at all; `main.c` touches the option struct before any thread exists; and
+`ws.c`'s new code is inside the decoder, which runs on the session's own reader
+and already held whatever lock that session had. ⛔ **No new lock is taken, no
+new lock is held across a socket write, and no new blocking call was added to
+any path**, so the deadlock class this project has already shipped once is not
+reached. The pre-existing rule that `ws_close_with` can sit for 30 s on a full
+socket is unchanged and still correctly kept outside `tlock`.
+
+**What was NOT covered by this review, stated as what would have had to be true
+to fire.** It examined the two structures the commits changed. It did not
+re-audit the whole of `relay.c`'s table, and it did not run a thread sanitiser
+(`-fsanitize=thread`) over a concurrent session, which would be the instrument
+that settles the U2/U3 questions rather than reasoning about them. ⛔ That is
+the next review's work, and it needs a real tool rather than a reading.
+
 # U1, closed: the bound on the `ready` wait is now guarded
 
 **Done 2026-09-28.** U1 was the one on this list a stub could reach, and it is

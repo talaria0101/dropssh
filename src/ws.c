@@ -1005,8 +1005,45 @@ static void note_close(WsSession *ws, const unsigned char *pl, size_t plen) {
         if (rl >= sizeof ws->close_reason) {
             rl = sizeof ws->close_reason - 1;
         }
-        memcpy(ws->close_reason, pl + 2, rl);
-        ws->close_reason[rl] = 0;
+        /* ⛔ THE REASON IS SANITISED HERE, AT THE POINT IT ENTERS THE PROCESS,
+         * NOT AT EACH PRINT SITE.
+         *
+         * A close reason is a network-controlled string and every consumer of
+         * it writes to a terminal: `connect` prints it, `relay --status` and
+         * the logs carry it, and this process is an ssh ProxyCommand whose
+         * stderr is read by a person. A reason containing an ESC, a BEL or a
+         * bare CR can repaint the line, ring, or overwrite what an operator
+         * has already read, and the relay's own reason on r11 is derived from
+         * a node's text.
+         *
+         * ⛔ IT WAS NOT SANITISED ANYWHERE, AND THIS WAS FOUND BY A REVIEW
+         * THAT ASKED "what happens to a value that came off the wire on a path
+         * I widened" rather than by a failing test. `connect` gained a
+         * hand-rolled filter for the `reject` path in the same change, which
+         * is exactly the one-read-path-one-write-path violation this file
+         * exists to prevent: two filters, one of them missed the next caller.
+         * The fix is here so there is one.
+         *
+         * ⛔ WHAT IS DROPPED, AND WHY IT IS NOT ESCAPED. Control characters
+         * below 0x20 and DEL are removed. They are not turned into `\x1b`
+         * sequences, because this string is a SENTENCE about a connection that
+         * gets read by eye: an escaped `^[[2J` is noise, and the thing the
+         * operator needs is "node disconnected", not the bytes a peer chose.
+         * Printable ASCII, UTF-8 continuation bytes and any byte >= 0x80 are
+         * kept, so a non-English reason is not mangled. */
+        size_t k = 0;
+        for (size_t i = 0; i < rl; i++) {
+            unsigned char ch = pl[2 + i];
+            if (ch < 0x20 || ch == 0x7f) {
+                if (ch == ' ' || ch == '\t') {
+                    /* a tab inside a sentence is spacing, not a cursor move */
+                    ws->close_reason[k++] = ' ';
+                }
+                continue;
+            }
+            ws->close_reason[k++] = (char)ch;
+        }
+        ws->close_reason[k] = 0;
     } else {
         ws->close_code = 1005;
     }
