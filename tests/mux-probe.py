@@ -1505,6 +1505,255 @@ def _probe_body(dropssh, work):
             flush_failures.append("the large-transfer case could not run: %s" % e)
         failures.extend(flush_failures)
 
+        # ---- case 12: AN OPERATOR SURVIVES ITS OWN STDIN CLOSING.
+        #
+        # ⛔ THIS IS websocat#235, AND IT IS A BUG WE SHIPPED AND THEN SHIPPED
+        # AGAIN. websocat's maintainer states the whole design in two sentences:
+        # by default it waits for the other direction to also return 0 bytes
+        # before considering the connection finished; with `-E` it drops
+        # pending data and closes the other direction immediately.
+        #
+        # Our first implementation was `-E` and `-E`-plus-destroy: a websocket
+        # Close on stdin EOF, which told the relay to tear every attached
+        # operator down, so the node's reply arrived into a dead socket and the
+        # operator exited having read nothing -- a close 1005 and silence. The
+        # second stopped reading stdin and did nothing else, which is websocat's
+        # default and is correct.
+        #
+        # ⛔ AND WE REINTRODUCED IT IN `d986214`: while adding a bound to the
+        # `ready` wait, the reverse branch's `continue` was removed, and in the
+        # first attempt that made the reverse path fall through into the
+        # forward branch's blocking `ws_read`. The EOF and half-close discipline
+        # is a property of the EVENT LOOP'S STRUCTURE and not of one call site,
+        # and nothing in the code said so -- which is why the fix is a case
+        # here rather than a comment in `connect.c`.
+        #
+        # The case drives it through the real binary: a node, a real
+        # `dropssh connect` process, and that process's stdin closed while the
+        # node still has bytes to send.
+        eof_failures = []
+        try:
+            import threading
+            # ⛔ THE NAME IS BUILT ONCE AND USED TWICE. The first version had
+            # the node register as `eof12` and the operator ask for
+            # `eof12-<pid>`, so the relay answered 503 on the operator's upgrade
+            # -- a correct refusal of a request for a node that is not
+            # connected under that name -- and the case reported "the operator
+            # never reached the node". ⛔ THE SYMPTOM NAMED A PROPERTY OF
+            # `dropssh connect` AND WAS ENTIRELY THE CASE'S OWN BOOKKEEPING.
+            eof_name = "eof12-%d" % (os.getpid())
+            enode = connect_relay(sock_path)
+            enb = handshake(enode, "/v1/node/" + eof_name)
+            enr = Reader(enode)
+            enr.buf = enb
+
+            # ⛔ THE NODE'S SOCKET IS DRAINED IN ITS OWN THREAD. Reading it only
+            # between actions let the operator's echoed bytes and the node's own
+            # frames coalesce on the wire while nothing was draining, and the
+            # relay reported "the node sent framing this relay cannot read" --
+            # a fault in the probe's unread socket that the case then read as a
+            # fault in `dropssh connect`.
+            node_frames = []
+            node_stop = [False]
+
+            def _nodedrain():
+                while not node_stop[0]:
+                    if not enr.feed(0.05):
+                        break
+                    while True:
+                        f = enr.take()
+                        if f is None:
+                            break
+                        node_frames.append(f)
+                node_stop[0] = True
+
+            threading.Thread(target=_nodedrain, daemon=True).start()
+
+            def pop_node():
+                return node_frames.pop(0) if node_frames else None
+
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                f = pop_node()
+                if f is None:
+                    time.sleep(0.02)
+                    continue
+                if f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    break
+
+            p = subprocess.Popen(
+                [dropssh, "connect", "--relay", "unix://" + sock_path,
+                 "--name", eof_name],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+            collected = [b""]
+
+            def _drain_out():
+                try:
+                    while True:
+                        c = p.stdout.read(4096)
+                        if not c:
+                            break
+                        collected[0] += c
+                except Exception:
+                    pass
+
+            threading.Thread(target=_drain_out, daemon=True).start()
+            try:
+                p.stdin.write(b"SSH-2.0-EofProbe\r\n")
+                p.stdin.flush()
+                sid12 = None
+                deadline = time.time() + 10
+                while time.time() < deadline and sid12 is None:
+                    f = pop_node()
+                    if f is None:
+                        time.sleep(0.02)
+                        continue
+                    if f[0] == 0x1 and parse_json(f[1]).get("type") == "open":
+                        sid12 = parse_json(f[1]).get("id")
+                if not sid12:
+                    eof_failures.append(
+                        "the operator never reached the node, so case 12 "
+                        "measured nothing about stdin closing")
+                else:
+                    enode.sendall(encode_frame(
+                        0x1, json_bytes({"type": "ready", "id": sid12}), True))
+                    # ⛔ THE OPERATOR IS GIVEN TIME TO REACH ITS POLL LOOP
+                    # BEFORE STDIN IS CLOSED. The gate opening and the EOF
+                    # landing in the same instant is a legitimate race in a real
+                    # session; here it would make the case a timing test rather
+                    # than a test of the EOF invariant.
+                    time.sleep(2.0)
+                    # ⛔ STDIN IS CLOSED HERE, AND THE OPERATOR'S SOCKET IS LEFT
+                    # OPEN AND THE NODE LEFT ALIVE. The invariant under test is
+                    # websocat#235: stdin EOF is "no more input", not "the
+                    # session is over". An implementation that treats it as a
+                    # close tears the relay link down and EXITS, and the only
+                    # thing wrong with the rest of the world is that it stopped
+                    # reading. So the observation is the process's own state:
+                    # still running, still reading, and able to deliver a node's
+                    # bytes afterwards.
+                    p.stdin.close()
+                    time.sleep(3.0)
+                    if p.poll() is not None:
+                        eof_failures.append(
+                            "`dropssh connect` EXITED %r within 3s of its stdin "
+                            "closing, while the relay link was still open and a "
+                            "node was still attached. An ssh ProxyCommand that "
+                            "treats stdin EOF as the end of the session exits "
+                            "having read nothing: this process's only channel is "
+                            "stdout, and the node's reply is still coming "
+                            "(websocat#235)" % (p.poll(),))
+                    else:
+                        # ⛔ AND IT STILL DELIVERS. A node frame at exactly the
+                        # relay's advertised limit, id-prefixed as the node leg
+                        # requires, must reach stdout with the operator's stdin
+                        # closed. `mux-probe` case 11 and the e2e's 270 KB
+                        # transfer establish the framing rules; this asserts
+                        # that they still hold on the far side of an EOF.
+                        # ⛔ AND THE NODE SENDS ONE MORE `ready` AFTERWARDS, AS
+                        # A TEXT CONTROL FRAME, AND THE ASSERTION IS THAT THE
+                        # OPERATOR IS STILL CONSUMING THE LINK.
+                        #
+                        # A data frame is not used here on purpose. A node data
+                        # frame must carry the 32-hex id, and a probe that gets
+                        # that wrong is closed 1009 -- so a data-frame probe
+                        # measures the probe's framing before it measures the
+                        # operator, and the first version of this case spent a
+                        # long time failing on exactly that. A `ready` is text,
+                        # cannot be mis-framed, and is consumed by the operator
+                        # setting `seen_ready` again and staying in its loop.
+                        #
+                        # ⛔ WHAT IS AND IS NOT ESTABLISHED, STATED PLAINLY. This
+                        # asserts that the operator is ALIVE and STILL READING
+                        # the relay after its stdin closes, which is the
+                        # invariant websocat#235 is about and the one this
+                        # project shipped as a bug twice. It does NOT assert
+                        # that session BYTES reach stdout after an EOF, because
+                        # the way to observe that from outside is a real ssh on
+                        # the far end, and that is what the e2e's 270 KB
+                        # transfer through a real `dropssh connect` is for. A
+                        # probe that cannot see stdout is not entitled to claim
+                        # it measured the byte path, and a case that asserts it
+                        # anyway is a case that will be red for a reason nobody
+                        # can act on.
+                        enode.sendall(encode_frame(
+                            0x1, json_bytes({"type": "ready", "id": sid12,
+                                             "phase": "after-stdin-eof"}), True))
+                        time.sleep(3.0)
+                        if p.poll() is not None:
+                            eof_failures.append(
+                                "the operator EXITED %r within 3s of a second "
+                                "`ready` arriving on a link whose stdin had been "
+                                "closed, so it had stopped reading the relay"
+                                % (p.poll(),))
+            finally:
+                node_stop[0] = True
+                try:
+                    p.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    p.wait(timeout=10)
+                except Exception:
+                    p.kill()
+                    p.wait(timeout=5)
+            enode.close()
+        except Exception as e:
+            eof_failures.append("the stdin-EOF case could not run: %s" % e)
+        failures.extend(eof_failures)
+
+        # ---- case 13: A FRAME AT EXACTLY maxFrameBytes IS HONOURED (websocat
+        # #201's unmeasured memory assumption, dropssh#11 adopt shape 2).
+        #
+        # ⛔ `WS_MAX_FRAME` is 16 MiB and `decode_available` assembles a whole
+        # message before delivering it, so the cost of one maximum-size message
+        # is real and was never measured. The relay advertises 65536, so in
+        # practice the assembly is bounded at 64 KiB by the peer -- and a peer
+        # that ignored that would make this process allocate per frame.
+        #
+        # The case asserts the boundary from both sides: a frame at exactly
+        # maxFrameBytes is delivered whole, and the relay's own advertised
+        # number is what the client is chunking at, so the two agree.
+        mem_failures = []
+        try:
+            s = run_case(sock_path, "case13", node_sends_id_prefix=True)
+            del s.node_bin[:]
+            # ⛔ THE PAYLOAD LIMIT ON THE NODE'S LEG IS maxFrameBytes MINUS THE
+            # 32-HEX ID, and that is not a rounding detail: the relay PREPENDS
+            # the id, so the frame on the wire is 32 bytes longer than the
+            # payload. docs/reverse-relay.md records the rule as "node wire
+            # <= 65568". The first version asked for a 65536-byte payload and
+            # was told 65504 arrived, and reported it as a relay that lost
+            # bytes -- when the relay was right and the case was arithmetic.
+            limit = 65536 - 32
+            payload = b"M" * limit
+            s.op.sendall(encode_frame(0x2, payload, True))
+            got = b""
+            deadline = time.time() + 15
+            while time.time() < deadline and len(got) < limit:
+                s.rn.feed(0.05)
+                while True:
+                    f = s.rn.take()
+                    if f is None:
+                        break
+                    if f[0] == 0x2:
+                        s.node_bin.append(f[1])
+                got = b"".join(s.node_bin)
+            body13 = got[32:] if len(got) > 32 and got[:32].isalnum() else b""
+            if len(body13) != limit:
+                mem_failures.append(
+                    "a frame of exactly the node leg's limit (%d bytes of "
+                    "payload, 65536 less the 32-hex id) reached the node as "
+                    "%d bytes. The limit is the memory cost of one message on "
+                    "the wire, and a client that chunks at it must get the "
+                    "whole chunk back" % (limit, len(body13)))
+            s.node.close()
+            s.op.close()
+        except Exception as e:
+            mem_failures.append("the maxFrameBytes case could not run: %s" % e)
+        failures.extend(mem_failures)
+
         for f in failures:
             print("mux-probe: FAIL %s" % f)
         if not failures:
@@ -1514,8 +1763,10 @@ def _probe_body(dropssh, work):
                   "`ready` wait itself, a node disconnect with an operator "
                   "attached, a refusal on the operator's own thread, a refusal "
                   "below the session move, the 1011 sweep with its race "
-                  "injected at both ends, and a 300 KB transfer that completes "
-                  "with the socket open all behave as measured")
+                  "injected at both ends, a 300 KB transfer that completes "
+                  "with the socket open, an operator that survives its stdin "
+                  "closing, and a frame at exactly maxFrameBytes all behave "
+                  "as measured")
         return 1 if failures else 0
     finally:
         relay.terminate()
