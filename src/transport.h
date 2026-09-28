@@ -40,6 +40,13 @@ void  buf_reset(buffer *b);
 
 typedef struct Transport Transport;
 
+/* ⛔ HAND THE RAW DESCRIPTOR TO THE CALLER AND GIVE UP OWNERSHIP OF IT. Used
+ * where a session pumps a socket itself rather than through the Transport:
+ * dropbear's socketpair, and a SOCKS forward's dialed connection. Returns -1
+ * for a TLS transport, whose "descriptor" is an mbedTLS session and handing
+ * the pointer over would hand the caller ciphertext. */
+int transport_detach_fd(Transport *t);
+
 /* ⛔ READ AND WRITE NEVER REPORT "TIMED OUT" AS AN ERROR. A websocket frame
  * header can arrive seconds after the last byte, and a relay that answered in
  * 350 ms can then go quiet for a minute. The transport returns 0 bytes and the

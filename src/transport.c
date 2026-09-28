@@ -357,3 +357,30 @@ Transport *transport_tcp(const char *host, int port,
     }
     return wrap_fd(pfd, "proxy", 0);
 }
+
+/* ⛔ HAND THE DESCRIPTOR OVER WITHOUT CLOSING IT, AND THEN CLOSE THE
+ * TRANSPORT'S OWN COPY OF THE HANDLE.
+ *
+ * `serve` needs a raw descriptor for a socket it is going to pump itself --
+ * dropbear's socketpair has always been handled that way -- and a transport
+ * that closed its descriptor on the way out would take the socket with it.
+ * So the descriptor is DETACHED: the caller owns it from the return, and the
+ * Transport is left in a state where its own close is a no-op rather than a
+ * double close.
+ *
+ * The return is -1 for a transport that is not a plain socket -- a TLS one,
+ * where the descriptor is an mbedTLS session and not a socket at all -- rather
+ * than a guess. A caller that asked for a descriptor and got a wrapped one
+ * would be reading ciphertext as bytes, and a refusal is the only safe answer. */
+int transport_detach_fd(Transport *t) {
+    if (t == NULL || t->state == NULL) {
+        return -1;
+    }
+    if (t->is_tls) {
+        return -1;                 /* not a descriptor: an mbedTLS session */
+    }
+    sockstate *s = (sockstate *)t->state;
+    int fd = s->fd;
+    s->fd = -1;                    /* the Transport no longer owns it */
+    return fd;
+}

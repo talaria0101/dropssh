@@ -782,61 +782,133 @@ static void on_control(Mux *m, const char *json) {
     pthread_cond_init(&s->cv, NULL);
 
     char why[512] = "";
-    if (start_server(server_cmd_for_sessions(), &s->sock, &s->pid, why,
-                     sizeof why) != 0) {
-        /* The server command is per-process (probe already validated it), so
-         * a failure here is a resource failure, not a config one. */
-        char msg[512];
-        snprintf(msg, sizeof msg,
-                 "{\"type\":\"reject\",\"id\":\"%.32s\",\"reason\":\"%.200s\"}", id, why);
-        mux_send_text(m, msg);
-        logf("could not start a server for %.8s: %s", id, why);
-        buf_free(&s->inbox);
-        pthread_mutex_destroy(&s->lock);
-        pthread_cond_destroy(&s->cv);
-        free(s);
-        return;
-    }
 
-    /* Publish the session BEFORE sending `ready`, so a data frame that
-     * arrives in the same instant as the `ready` finds a session to land in.
-     * Publishing after would race, and the frame would be dropped. */
-    pthread_mutex_lock(&m->list_lock);
-    unsigned b = id_bucket(s->id);
-    s->next = m->by_id[b];
-    m->by_id[b] = s;
-    pthread_mutex_unlock(&m->list_lock);
+    /* ⛔ AN `open` THAT NAMES A DESTINATION IS A SOCKS FORWARD AND NOT A
+     * SESSION, and it DIALS instead of starting the ssh server.
+     *
+     * The destination arrives ONCE, in the `open`, and every later frame is
+     * bare bytes for that connection. That is the shape dropssh#10 records as
+     * structurally better than a 32-byte prefix on every frame, and the reason
+     * it records it as NOT adoptable is that the prefix is the ajam relay's
+     * rule. Here both ends are ours, so nothing is being deviated from and
+     * there is no per-frame field to forget.
+     *
+     * A SOCKS forward is refused against an ajam node, and that is visible
+     * here rather than at runtime: an ajam relay never sends an `open` with a
+     * host in it, so this branch is only ever reached from a dropssh relay. */
+    {
+        char host[256] = "";
+        unsigned dport = 0;
+        int is_socks = (relay_parse_string(json, "host", host, sizeof host) == 0 &&
+                        relay_parse_uint(json, "port", &dport) == 0 && dport > 0);
+        if (is_socks) {
+            Transport *out = NULL;
+            char derr[512] = "";
+            /* The node dials through the SAME egress as everything else, which
+             * is the point of the capability: the destination is reached from
+             * the CAGE, over whatever route the cage has, including a 443-only
+             * CONNECT proxy. */
+            if (strncmp(host, "unix://", 7) == 0) {
+                out = transport_tcp_unix(host + 7, derr, sizeof derr);
+            } else {
+                out = transport_tcp(host, (int)dport, dropssh_proxy_host(),
+                                    dropssh_proxy_port(), 15000, derr,
+                                    sizeof derr);
+            }
+            if (out == NULL) {
+                char msg[512];
+                snprintf(msg, sizeof msg,
+                         "{\"type\":\"reject\",\"id\":\"%.32s\","
+                         "\"reason\":\"could not reach %s:%u: %.180s\"}",
+                         id, host, dport, derr);
+                mux_send_text(m, msg);
+                logf("a socks forward to %s:%u failed: %s", host, dport, derr);
+                buf_free(&s->inbox);
+                pthread_mutex_destroy(&s->lock);
+                pthread_cond_destroy(&s->cv);
+                free(s);
+                return;
+            }
+            /* ⛔ THE DIALED TRANSPORT BECOMES THE SESSION'S SOCKET, EXACTLY AS
+             * dropbear's socketpair does, so everything below this line is the
+             * ordinary session path with no special case in it. */
+            int tfd = transport_detach_fd(out);
+            if (tfd < 0) {
+                out->close(out);
+                char msg[512];
+                snprintf(msg, sizeof msg,
+                         "{\"type\":\"reject\",\"id\":\"%.32s\","
+                         "\"reason\":\"the connection to %s:%u could not be "
+                         "handed over\"}", id, host, dport);
+                mux_send_text(m, msg);
+                logf("a socks forward to %s:%u could not be detached", host, dport);
+                buf_free(&s->inbox);
+                pthread_mutex_destroy(&s->lock);
+                pthread_cond_destroy(&s->cv);
+                free(s);
+                return;
+            }
+            logf("socks forward opened: %s:%u as %.8s", host, dport, id);
+            s->sock = tfd;
+            s->pid = -1;
+        } else {
+        if (start_server(server_cmd_for_sessions(), &s->sock, &s->pid, why,
+                         sizeof why) != 0) {
+            /* The server command is per-process (probe already validated it), so
+             * a failure here is a resource failure, not a config one. */
+            char msg[512];
+            snprintf(msg, sizeof msg,
+                     "{\"type\":\"reject\",\"id\":\"%.32s\",\"reason\":\"%.200s\"}", id, why);
+            mux_send_text(m, msg);
+            logf("could not start a server for %.8s: %s", id, why);
+            buf_free(&s->inbox);
+            pthread_mutex_destroy(&s->lock);
+            pthread_cond_destroy(&s->cv);
+            free(s);
+            return;
+        }
 
-    char ready[96];
-    snprintf(ready, sizeof ready, "{\"type\":\"ready\",\"id\":\"%s\"}", s->id);
-    if (mux_send_text(m, ready) != 0) {
-        /* The relay went away between `open` and `ready`. Mark it and let the
-         * thread's teardown reap the server. */
-        pthread_mutex_lock(&s->lock);
-        s->stop = 1;
-        pthread_mutex_unlock(&s->lock);
-    }
+        /* Publish the session BEFORE sending `ready`, so a data frame that
+         * arrives in the same instant as the `ready` finds a session to land in.
+         * Publishing after would race, and the frame would be dropped. */
+        pthread_mutex_lock(&m->list_lock);
+        unsigned b = id_bucket(s->id);
+        s->next = m->by_id[b];
+        m->by_id[b] = s;
+        pthread_mutex_unlock(&m->list_lock);
 
-    sess_arg *a = calloc(1, sizeof *a);
-    if (a == NULL) {
-        pthread_mutex_lock(&s->lock);
-        s->stop = 1;
-        pthread_mutex_unlock(&s->lock);
-        return;
-    }
-    a->mux = m;
-    a->s = s;
-    a->servercmd = server_cmd_for_sessions();
-    pthread_t th;
-    if (pthread_create(&th, NULL, session_thread, a) != 0) {
-        pthread_mutex_lock(&s->lock);
-        s->stop = 1;
-        pthread_mutex_unlock(&s->lock);
-        free(a);
-        return;
-    }
-    pthread_detach(th);
-    logf("operator opened session %.8s (ready sent)", s->id);
+        char ready[96];
+        snprintf(ready, sizeof ready, "{\"type\":\"ready\",\"id\":\"%s\"}", s->id);
+        if (mux_send_text(m, ready) != 0) {
+            /* The relay went away between `open` and `ready`. Mark it and let the
+             * thread's teardown reap the server. */
+            pthread_mutex_lock(&s->lock);
+            s->stop = 1;
+            pthread_mutex_unlock(&s->lock);
+        }
+
+        sess_arg *a = calloc(1, sizeof *a);
+        if (a == NULL) {
+            pthread_mutex_lock(&s->lock);
+            s->stop = 1;
+            pthread_mutex_unlock(&s->lock);
+            return;
+        }
+        a->mux = m;
+        a->s = s;
+        a->servercmd = server_cmd_for_sessions();
+        pthread_t th;
+        if (pthread_create(&th, NULL, session_thread, a) != 0) {
+            pthread_mutex_lock(&s->lock);
+            s->stop = 1;
+            pthread_mutex_unlock(&s->lock);
+            free(a);
+            return;
+        }
+        pthread_detach(th);
+        logf("operator opened session %.8s (ready sent)", s->id);
+        }   /* end of the else: the ordinary session path */
+        }
 }
 
 /* Route ONE data frame to its session, or refuse it.

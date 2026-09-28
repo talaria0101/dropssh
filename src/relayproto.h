@@ -32,4 +32,22 @@ int relay_parse_control(const char *json, char *verb, size_t verblen,
  * "maxSessions: -1" must not become UINT_MAX. */
 int relay_parse_uint(const char *json, const char *key, unsigned *out);
 
+/* ⛔ Read one STRING field into a fixed buffer, bounded and WITHOUT UNESCAPING.
+ *
+ * The caller supplies the buffer and the length, so a hostile control frame
+ * cannot make this allocate and cannot overflow: the copy stops at the
+ * caller's bound and at the closing quote, whichever comes first, and a
+ * truncated result is a value the caller then refuses rather than a value it
+ * acts on.
+ *
+ * ⛔ AND ESCAPES ARE LEFT AS THE ESCAPER WROTE THEM. The one field read this
+ * way is a SOCKS destination host, which this project validates by comparing
+ * it against the one the operator named; unescaping would let a control frame
+ * encode a character the sender never put in, and a destination that survives
+ * unescaping but is not the one named is exactly the open-proxy case the
+ * comparison exists to prevent. A backslash in a host is a host no operator
+ * will name, and it is refused by the comparison rather than decoded here. */
+int relay_parse_string(const char *json, const char *key, char *out,
+                       size_t outlen);
+
 #endif /* DROPSSH_RELAYPROTO_H */

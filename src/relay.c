@@ -44,6 +44,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -239,6 +240,32 @@ typedef struct Client {
      * data is read in the OPERATOR's thread, so without a flag the two
      * threads disagreed about whether the session existed. */
     int         ready_seen;
+    /* ⛔ A SOCKS5 REQUEST IS AN OPERATOR, AND IT IS THIS STRUCT RATHER THAN A
+     * SECOND DATA PATH BECAUSE OF WHAT IT REUSES.
+     *
+     * `dropssh#4` (wiretap) and `#8` both name a server-side SOCKS5 that
+     * reaches a client. The obvious implementation is a private loop that
+     * reads the SOCKS socket and writes to the node's websocket -- and that
+     * would be a SECOND way to put bytes on a node's socket, which is the
+     * defect this file has produced three double frees and one deadlock over.
+     * A frame is a header and a payload that must arrive together, and two
+     * writers on one socket produce a frame whose length and payload disagree,
+     * which is why `wlock` exists at all.
+     *
+     * So a SOCKS request becomes an ordinary Client: the same table, the same
+     * `client_thread`, the same `ws_write` under the same `wlock`, the same
+     * refcount, the same 1011 sweep. The only differences are that its
+     * "stdin" is a SOCKS client socket and that its `open` names a
+     * destination. There is no second reader on a node's socket, so there is
+     * no second framing bug, and none of this needed to be proved by a
+     * reasoning exercise about a private loop.
+     *
+     * `socks_fd` is -1 for every operator that came in over a websocket, and
+     * >= 0 for the ones that came in over SOCKS5. `socks_done` records that
+     * the SOCKS reply has already been written, so a failure after the reply
+     * is not answered twice. */
+    int         socks_fd;
+    int         socks_done;
     /* ⛔ A REFERENCE COUNT, BECAUSE A POINTER OUT OF THE TABLE IS NOT A
      * REFERENCE TO THE OBJECT.
      *
@@ -330,6 +357,15 @@ static const char *only_name = NULL;
  * PRINTED ANYWHERE. The flag is read into a local and turned immediately into
  * a SHA-256 digest; see token.h for why the raw value is not retained. */
 static const char *token_key_arg = NULL;
+/* The SOCKS listener's three settings, taken from the command line and used
+ * once at startup. `--socks` is the LISTEN address, `--socks-node` is the node
+ * whose advertised destination is reachable, and `--socks-dest` is that
+ * destination. They are three and not one because they answer three different
+ * questions -- where do I listen, whose network do I use, and what am I allowed
+ * to reach -- and folding them together would make the policy invisible. */
+static const char *socks_listen_arg = NULL;
+static const char *socks_dest_arg = NULL;
+static const char *socks_node_arg = NULL;
 
 /* ⛔ THE LIMITS ARE POLICY NUMBERS, NAMED, AND ENFORCED AT ACCEPT TIME. B9 was
  * "no peer cap, no idle timeout, no handshake rate limit", and each of those is
@@ -1199,6 +1235,498 @@ static int check_token(const char *token, dropssh_role role, const char *name,
     return 0;
 }
 
+/* ⛔ THE SOCKS5 LISTENER IS A THIRD DOOR AND IT IS OPTIONAL. A relay without
+ * `--socks` never binds it and never reads a SOCKS byte, so the default
+ * behaviour and the attack surface of every existing deployment are unchanged.
+ *
+ * ⛔ IT IS HERE, ON THE OPERATOR, AND NOT IN THE CAGE, AND THAT IS A MEASUREMENT
+ * RATHER THAN A PREFERENCE. dropssh#6 re-measured 24/24 that every INET bind is
+ * refused with EACCES at uid 0, so a listener in a cage cannot exist at all.
+ * ⛔ WHICH CORRECTS sandssh#6's FRAMING, WHICH CALLED THIS A "reverse SOCKS".
+ * It is not a reverse SOCKS. A reverse SOCKS would be a listener the CAGE
+ * cannot have, and the sentence names a capability that does not exist in the
+ * reference cage. */
+static char socks_node_name[RELAY_NAME_MAX] = "";
+static char socks_host[256] = "";
+static int  socks_port = 0;
+static int  socks_listen_fd = -1;
+
+/* RFC 1928 reply codes, named. Only the ones this speaks, because a list of
+ * numbers a reader has to look up is not a list. */
+#define SOCKS_OK                0x00
+#define SOCKS_FAIL              0x01
+#define SOCKS_RULESET           0x02   /* the answer to "not this node" */
+#define SOCKS_HOST_UNREACHABLE  0x04
+#define SOCKS_CMD_NOT_SUPPORTED 0x07
+
+static int socks_reply(int fd, unsigned char rep, unsigned char atyp,
+                       const void *addr, unsigned char dport) {
+    unsigned char buf[262];
+    size_t o = 0;
+    buf[o++] = 0x05;
+    buf[o++] = rep;
+    buf[o++] = 0x00;
+    buf[o++] = atyp;
+    if (atyp == 0x01) {
+        memcpy(buf + o, addr, 4);
+        o += 4;
+    } else if (atyp == 0x03) {
+        size_t n = ((const unsigned char *)addr)[0];
+        if (n + 1 + 2 > sizeof buf - o) {
+            return -1;
+        }
+        buf[o++] = (unsigned char)n;
+        memcpy(buf + o, ((const unsigned char *)addr) + 1, n);
+        o += n;
+    } else if (atyp == 0x04) {
+        memcpy(buf + o, addr, 16);
+        o += 16;
+    } else {
+        return -1;
+    }
+    buf[o++] = dport;
+    return write(fd, buf, o) == (ssize_t)o ? 0 : -1;
+}
+
+/* ⛔ EVERY READ IS EXACTLY n BYTES OR IT IS AN ERROR. A short read on a stream
+ * is a truncated request, and treating a partial greeting as a complete one is
+ * how a SOCKS parser ends up reading a length byte out of nothing. Every
+ * length is checked against what actually arrived BEFORE it is used. */
+static int read_exact(int fd, void *buf, size_t n, unsigned timeout_ms) {
+    unsigned start = dropssh_now_ms();
+    size_t got = 0;
+    while (got < n) {
+        if (dropssh_now_ms() - start > timeout_ms) {
+            return -1;
+        }
+        struct pollfd pf = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pf, 1, 100);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (pr == 0) {
+            continue;
+        }
+        ssize_t r = read(fd, ((char *)buf) + got, n - got);
+        if (r > 0) {
+            got += (size_t)r;
+        } else if (r == 0) {
+            return -1;
+        } else if (errno != EINTR && errno != EAGAIN) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ⛔ THE ONE POLICY QUESTION A SOCKS REQUEST CAN ASK, AND THE ANSWER IS ALWAYS
+ * "is this exactly the destination the operator named".
+ *
+ * A SOCKS5 proxy that dials whatever it is asked to dial is an open proxy the
+ * moment it is reachable, and this listener is reachable by everything that can
+ * reach the operator. So the destination is NOT taken from the request: the
+ * operator names it with `--socks`, and a request for anything else is refused
+ * with SOCKS `connection not allowed by ruleset` (0x02), which is a code every
+ * client already knows how to report.
+ *
+ * An IPv6 destination is refused rather than compared. A relay that accepted
+ * one would have a second, unchecked door, and there is no reason for it to
+ * exist before somebody asks for one by name. */
+static int socks_destination_allowed(unsigned char atyp,
+                                     const unsigned char *addr, unsigned port) {
+    if (socks_port <= 0 || port != (unsigned)socks_port) {
+        return 0;
+    }
+    if (atyp == 0x01) {
+        struct in_addr want, got;
+        if (inet_pton(AF_INET, socks_host, &want) != 1) {
+            return 0;
+        }
+        memcpy(&got, addr, 4);
+        return memcmp(&want, &got, 4) == 0;
+    }
+    if (atyp == 0x03) {
+        size_t n = (size_t)addr[0];
+        if (n != strlen(socks_host)) {
+            return 0;
+        }
+        for (size_t i = 0; i < n; i++) {
+            char a = (char)addr[1 + i];
+            char b = socks_host[i];
+            if (a >= 'A' && a <= 'Z') { a = (char)(a + 32); }
+            if (b >= 'A' && b <= 'Z') { b = (char)(b + 32); }
+            if (a != b) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* ⛔ A SOCKS REQUEST IS SERVED BY THE ORDINARY OPERATOR PATH, AND THE WHOLE OF
+ * THIS FUNCTION IS BUILDING A Client. There is no private forwarding loop here
+ * and no second reader on a node's socket, which is the property that makes
+ * this safe to add: bytes reach a node exactly one way in this file.
+ *
+ * The sequence is RFC 1928's, and every field is bounded before it is read:
+ * greeting (VER NMETHODS METHODS), then request (VER CMD RSV ATYP ADDR PORT). */
+/* The SOCKS client's socket and the socketpair end its bytes go into. The pump
+ * is a poll over both: readable client -> write into the socketpair, readable
+ * socketpair -> write to the client. `client_thread` owns the OTHER end of the
+ * socketpair and is the only reader of it, so a frame's header and payload
+ * always leave the relay together. */
+struct socks_ctx {
+    int cfd;         /* the SOCKS client */
+    int pair;        /* the socketpair end the relay reads and writes */
+};
+
+static void socks_pump(struct socks_ctx *s) {
+    unsigned char buf[32768];
+    struct pollfd pf[2];
+    pf[0].fd = s->cfd;  pf[0].events = POLLIN;
+    pf[1].fd = s->pair; pf[1].events = POLLIN;
+    for (;;) {
+        pf[0].revents = 0;
+        pf[1].revents = 0;
+        int pr = poll(pf, 2, 1000);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        if (pr == 0) {
+            continue;
+        }
+        if (pf[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            ssize_t n = read(s->cfd, buf, sizeof buf);
+            if (n > 0) {
+                size_t off = 0;
+                while (off < (size_t)n) {
+                    ssize_t w = write(s->pair, buf + off, (size_t)n - off);
+                    if (w > 0) {
+                        off += (size_t)w;
+                    } else if (w < 0 && errno == EINTR) {
+                        continue;
+                    } else {
+                        return;
+                    }
+                }
+            } else if (n == 0) {
+                /* ⛔ THE CLIENT HALF-CLOSED, AND THE FAR END IS TOLD SO RATHER
+                 * THAN THE CONNECTION SIMPLY ENDING. A SOCKS client that sends
+                 * a request and half-closes is normal -- HTTP over a SOCKS
+                 * proxy does it -- and the response still has to come back. */
+                shutdown(s->pair, SHUT_WR);
+                pf[0].events = 0;      /* stop polling it; only the far side now */
+            } else if (errno != EINTR && errno != EAGAIN) {
+                return;
+            }
+        }
+        if (pf[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+            ssize_t n = read(s->pair, buf, sizeof buf);
+            if (n > 0) {
+                size_t off = 0;
+                while (off < (size_t)n) {
+                    ssize_t w = write(s->cfd, buf + off, (size_t)n - off);
+                    if (w > 0) {
+                        off += (size_t)w;
+                    } else if (w < 0 && errno == EINTR) {
+                        continue;
+                    } else {
+                        return;
+                    }
+                }
+            } else if (n == 0) {
+                return;
+            } else if (errno != EINTR && errno != EAGAIN) {
+                return;
+            }
+        }
+    }
+}
+
+static void *socks_thread(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    unsigned char head[2];
+    if (read_exact(fd, head, 2, 10000) != 0 || head[0] != 0x05) {
+        close(fd);
+        return NULL;
+    }
+    unsigned char methods[255];
+    if (head[1] == 0 || head[1] > sizeof methods) {
+        close(fd);
+        return NULL;
+    }
+    if (read_exact(fd, methods, head[1], 10000) != 0) {
+        close(fd);
+        return NULL;
+    }
+    int noauth = 0;
+    for (unsigned i = 0; i < head[1]; i++) {
+        if (methods[i] == 0x00) {
+            noauth = 1;
+        }
+    }
+    /* ⛔ NOAUTH IS ALL THAT IS OFFERED, AND 0xFF IS HOW A SERVER SAYS "NONE OF
+     * YOUR METHODS". A relay that accepted a username and password it never
+     * checked would be worse than one that refuses, and refusing is what a
+     * client can act on. */
+    unsigned char sel[2] = { 0x05, noauth ? 0x00 : 0xff };
+    if (write(fd, sel, 2) != 2 || !noauth) {
+        close(fd);
+        return NULL;
+    }
+    unsigned char req[4];
+    if (read_exact(fd, req, 4, 10000) != 0 || req[0] != 0x05) {
+        close(fd);
+        return NULL;
+    }
+    unsigned char atyp = req[3];
+    unsigned char addr[256];
+    size_t alen;
+    if (atyp == 0x01) {
+        alen = 4;
+    } else if (atyp == 0x03) {
+        if (read_exact(fd, addr, 1, 10000) != 0) {
+            close(fd);
+            return NULL;
+        }
+        alen = (size_t)addr[0] + 1;
+        if (alen > sizeof addr) {
+            close(fd);
+            return NULL;
+        }
+        if (alen > 1 && read_exact(fd, addr + 1, alen - 1, 10000) != 0) {
+            close(fd);
+            return NULL;
+        }
+    } else if (atyp == 0x04) {
+        alen = 16;
+    } else {
+        /* ⛔ AN UNKNOWN ADDRESS TYPE IS REFUSED, NOT ASSUMED. RFC 1928 defines
+         * three; a fourth is a client speaking something else, and guessing its
+         * length is how a parser reads past the request. */
+        close(fd);
+        return NULL;
+    }
+    unsigned char dport[2];
+    if (read_exact(fd, dport, 2, 10000) != 0) {
+        close(fd);
+        return NULL;
+    }
+    unsigned port = ((unsigned)dport[0] << 8) | dport[1];
+
+    if (req[1] != 0x01) {
+        /* BIND and UDP ASSOCIATE are refused rather than half-implemented: a
+         * reply a client believes is a promise this relay does not keep. */
+        logf("socks: refused command %u; only CONNECT is served", req[1]);
+        socks_reply(fd, SOCKS_CMD_NOT_SUPPORTED, atyp, addr, dport[1]);
+        close(fd);
+        return NULL;
+    }
+    if (!socks_destination_allowed(atyp, addr, port)) {
+        logf("socks: refused a destination that is not the one --socks named");
+        socks_reply(fd, SOCKS_RULESET, atyp, addr, dport[1]);
+        close(fd);
+        return NULL;
+    }
+
+    /* The node must be connected, or the client is told so rather than being
+     * given a CONNECT that succeeds and then delivers nothing. */
+    pthread_mutex_lock(&tlock);
+    NameSlot *ns = slot_locked(socks_node_name, 0);
+    int have_node = (ns != NULL && ns->node != NULL);
+    pthread_mutex_unlock(&tlock);
+    if (!have_node) {
+        logf("socks: no node is connected as %s", socks_node_name);
+        socks_reply(fd, SOCKS_HOST_UNREACHABLE, atyp, addr, dport[1]);
+        close(fd);
+        return NULL;
+    }
+
+    /* The socketpair is the Client's "websocket": the far end is the thread
+     * that pumps the SOCKS client's bytes, and `client_thread` sees an
+     * ordinary operator from here on. This is the same shape the node's
+     * socketpair uses for dropbear, and it is why no forwarding loop is
+     * needed. */
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        socks_reply(fd, SOCKS_FAIL, atyp, addr, dport[1]);
+        close(fd);
+        return NULL;
+    }
+    if (socks_reply(fd, SOCKS_OK, atyp, addr, dport[1]) != 0) {
+        close(pair[0]);
+        close(pair[1]);
+        close(fd);
+        return NULL;
+    }
+    logf("socks: forwarding a connection to %s:%u through node %s",
+         socks_host, port, socks_node_name);
+
+    /* A WsSession over the socketpair's relay end. `ws_client` owns the
+     * transport and the buffers, and `ws_move` below hands it to the Client,
+     * so the session has exactly one owner for its whole life -- which is U2,
+     * enforced by construction rather than by a rule somebody has to remember. */
+    Transport *t = transport_from_fd(pair[0], "socks");
+    if (t == NULL) {
+        close(pair[0]);
+        close(pair[1]);
+        close(fd);
+        return NULL;
+    }
+    WsSession ws;
+    ws_status st;
+    memset(&st, 0, sizeof st);
+    /* The socketpair is already a byte pipe; there is no upgrade to accept, so
+     * the session is initialised directly rather than through a handshake. */
+    memset(&ws, 0, sizeof ws);
+    ws.t = t;
+    ws.is_client = 1;
+    ws.keepalive_ms = 0;          /* a SOCKS connection is not keepalived here */
+    ws.fq_cap = WS_DEFAULT_QUEUE_BYTES;
+    ws.max_frame = WS_HELLO_DEFAULT_FRAME;
+    ws.max_sessions = WS_HELLO_DEFAULT_SESSIONS;
+    buf_init(&ws.rbuf);
+    buf_init(&ws.frag);
+    buf_init(&ws.spill);
+
+    Client *c = calloc(1, sizeof *c);
+    if (c == NULL) {
+        buf_free(&ws.rbuf);
+        buf_free(&ws.frag);
+        buf_free(&ws.spill);
+        t->close(t);
+        close(pair[1]);
+        close(fd);
+        return NULL;
+    }
+    c->fd = pair[0];
+    c->refs = 1;
+    c->socks_fd = fd;
+    c->socks_done = 1;
+    ws_move(&c->ws, &ws);
+    snprintf(c->name, sizeof c->name, "%s", socks_node_name);
+    random_id(c->id);
+    pthread_mutex_lock(&tlock);
+    ns = slot_locked(socks_node_name, 0);
+    c->next = ns->clients;
+    ns->clients = c;
+    ns->client_count++;
+    session_count++;
+    stat_sessions_opened++;
+    peer_count++;
+    if (peer_count > stat_peak_peers) {
+        stat_peak_peers = peer_count;
+    }
+    /* ⛔ THE NODE IS TOLD IMMEDIATELY, WITH THE DESTINATION IN THE `open`, AND
+     * NOT WITH A 32-BYTE PREFIX ON EVERY DATA FRAME.
+     *
+     * This is the shape dropssh#10 records as structurally better than ours
+     * and names as not adoptable, because the 32-hex prefix is the AJAM
+     * RELAY's rule and a node that deviates is closed 1009. Here there is no
+     * ajam relay involved: both ends are ours, so the destination is announced
+     * once, at setup, in the `open` this relay already writes. There is no
+     * per-frame field to forget, and forgetting one is what produced close
+     * 1009 "bad multiplex frame" in the first place.
+     *
+     * The consequence, stated rather than discovered later: a SOCKS forward
+     * works against a `dropssh serve` node and NOT against an ajam node, and
+     * that is in the option's help. */
+    {
+        NodeCtx *enc = node_hold_locked(ns);
+        if (ns) {
+            pthread_mutex_lock(&ns->wlock);
+        }
+        char open_msg[512];
+        int on = snprintf(open_msg, sizeof open_msg,
+                          "{\"type\":\"open\",\"id\":\"%s\",\"host\":\"%s\","
+                          "\"port\":%u,\"mode\":\"socks\"}",
+                          c->id, socks_host, port);
+        int wrote = (enc != NULL && on > 0 && (size_t)on < sizeof open_msg) &&
+                    ws_write_text(&enc->ws, (const unsigned char *)open_msg,
+                                  (size_t)on) == 0;
+        if (ns) {
+            pthread_mutex_unlock(&ns->wlock);
+        }
+        if (enc) {
+            node_drop(enc);
+        }
+        if (!wrote) {
+            client_release(c, 1011, "the node disconnected");
+        }
+    }
+    pthread_mutex_unlock(&tlock);
+
+    if (!c->ws_released) {
+        /* ⛔ THE SOCKS CLIENT'S BYTES ARE PUMPED ON THE SOCKETPAIR, AND THE
+         * PUMP IS A POLL WITH NO BUSY WAIT. This is the only place the SOCKS
+         * socket is read, and it runs in THIS thread, so `client_thread` below
+         * remains the only reader of the Client's websocket. Two readers on one
+         * session is the defect this file has already produced once. */
+        struct socks_ctx sc = { .cfd = c->socks_fd, .pair = pair[1] };
+        socks_pump(&sc);
+    }
+    /* The SOCKS client's socket belongs to this thread, not to the Client, so
+     * it is closed here and not by client_release. */
+    if (c->socks_fd >= 0) {
+        close(c->socks_fd);
+        c->socks_fd = -1;
+    }
+
+    pthread_mutex_lock(&tlock);
+    ns = slot_locked(socks_node_name, 0);
+    if (ns) {
+        for (Client **pp = &ns->clients; *pp; pp = &(*pp)->next) {
+            if (*pp == c) {
+                *pp = c->next;
+                break;
+            }
+        }
+        if (ns->client_count) {
+            ns->client_count--;
+        }
+    }
+    peer_count--;
+    pthread_mutex_unlock(&tlock);
+    client_unref(c);
+    close(pair[1]);
+    return NULL;
+}
+
+/* The SOCKS accept loop. It owns `socks_listen_fd` for the life of the relay
+ * and hands each connection to a detached thread, exactly as the websocket
+ * listener does. */
+static void *socks_accept_thread(void *unused) {
+    (void)unused;
+    while (socks_listen_fd >= 0) {
+        int sfd = accept(socks_listen_fd, NULL, NULL);
+        if (sfd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            logf("socks accept: %s", strerror(errno));
+            dropssh_sleep_ms(100);
+            continue;
+        }
+        pthread_t th;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&th, &attr, socks_thread,
+                           (void *)(intptr_t)sfd) != 0) {
+            close(sfd);
+        }
+        pthread_attr_destroy(&attr);
+    }
+    return NULL;
+}
+
 static void *conn_thread(void *arg) {
     int fd = (int)(intptr_t)arg;
     Transport *t = transport_from_fd(fd, "relay");
@@ -1827,6 +2355,12 @@ int dropssh_relay_main(int argc, char **argv) {
             RELAY_MAX_SESSIONS = (unsigned)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--idle-timeout") == 0 && i + 1 < argc) {
             RELAY_IDLE_TIMEOUT_MS = (unsigned)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--socks") == 0 && i + 1 < argc) {
+            socks_listen_arg = argv[++i];
+        } else if (strcmp(argv[i], "--socks-dest") == 0 && i + 1 < argc) {
+            socks_dest_arg = argv[++i];
+        } else if (strcmp(argv[i], "--socks-node") == 0 && i + 1 < argc) {
+            socks_node_arg = argv[++i];
         } else if (strcmp(argv[i], "--token-key") == 0 && i + 1 < argc) {
             token_key_arg = argv[++i];
         } else if (strcmp(argv[i], "--pair-ttl") == 0 && i + 1 < argc) {
@@ -1862,6 +2396,26 @@ int dropssh_relay_main(int argc, char **argv) {
 "                              issues nothing, which is what it has always\n"
 "                              done. DROPSSH_RELAY_KEY does the same.\n"
 "  --pair-ttl SECONDS           how long an issued pair is good for (86400)\n"
+"\n"
+"SOCKS5, on the OPERATOR and never in the cage\n"
+"  --socks HOST:PORT           serve a SOCKS5 listener here. The listener is on\n"
+"                              this machine because a cage cannot bind INET at\n"
+"                              all (dropssh#6, measured 24/24), which is also\n"
+"                              why this is not a 'reverse SOCKS'\n"
+"  --socks-node NAME           reach the destination through this node\n"
+"  --socks-dest HOST:PORT      and only this destination. A client asking for\n"
+"                              anything else is refused with SOCKS 0x02, and\n"
+"                              omitting this option is refused at startup: a\n"
+"                              SOCKS5 proxy that dials what it is asked to\n"
+"                              dial is an open proxy\n"
+"\n"
+"                              A restart forgets the forwards, deliberately\n"
+"                              (wiretap's README:481 says the same and this is\n"
+"                              the right shape for a single-tenant relay). A\n"
+"                              forward works against a `dropssh serve` node and\n"
+"                              NOT against an ajam one: the destination is sent\n"
+"                              once in the `open`, which the ajam protocol has\n"
+"                              no field for.\n"
 "  --status                     print what this process is doing, and exit\n"
 "\n"
 "TESTING\n"
@@ -1975,6 +2529,108 @@ int dropssh_relay_main(int argc, char **argv) {
         }
         logf("listening on %s:%d (rendezvous, multiplexed)", host, port);
     }
+    /* ⛔ THE SOCKS LISTENER IS BOUND AND SERVED BY A THREAD OF ITS OWN, AND IT
+     * IS OPTIONAL IN THE STRICTEST SENSE: a relay without --socks never binds
+     * it, never reads a SOCKS byte, and has the same attack surface it had
+     * before this existed.
+     *
+     * It is a separate listener rather than a path on the websocket listener
+     * because the two protocols share nothing: a SOCKS greeting is three
+     * bytes and an HTTP upgrade is a header block, and a parser that could
+     * tell them apart by sniffing would be a parser with two grammars and one
+     * set of bugs. */
+    if (socks_listen_arg != NULL) {
+        if (socks_node_arg == NULL || socks_dest_arg == NULL) {
+            fprintf(stderr, "dropssh relay: --socks needs --socks-node (whose "
+                    "node to reach through) and --socks-dest HOST:PORT (what "
+                    "it is allowed to reach). Refusing to start a listener "
+                    "with no policy, because a SOCKS5 proxy that dials what it "
+                    "is asked to dial is an open proxy.\n");
+            return 2;
+        }
+        snprintf(socks_node_name, sizeof socks_node_name, "%s", socks_node_arg);
+        char dhost[256] = "";
+        int dport = 0;
+        struct in_addr dummy_addr;
+        if (sscanf(socks_dest_arg, "%255[^:]:%d", dhost, &dport) != 2 ||
+            dhost[0] == 0 || dport <= 0 || dport > 65535) {
+            fprintf(stderr, "dropssh relay: --socks-dest wants HOST:PORT, and "
+                    "'%s' is not one. The destination is NAMED rather than "
+                    "taken from the request, so a client that asks for "
+                    "anything else is refused.\n", socks_dest_arg);
+            return 2;
+        }
+        snprintf(socks_host, sizeof socks_host, "%s", dhost);
+        socks_port = dport;
+        /* ⛔ A DESTINATION IS REFUSED IF IT CANNOT BE AN ADDRESS OR A NAME. The
+         * check is here, before the listener is created, and that ordering is
+         * the point: on a host that cannot bind INET -- which is every
+         * reference cage, dropssh#6 measured 24/24 -- a bind failure comes
+         * first and a policy that was never validated is never reported. So a
+         * typo in `--socks-dest` has to be refused by this line, not by the
+         * comparison three hundred lines later where it would look like a
+         * client asking for the wrong thing. */
+        if (inet_pton(AF_INET, dhost, &dummy_addr) != 1) {
+            for (const char *c = dhost; *c; c++) {
+                if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+                      (*c >= '0' && *c <= '9') || *c == '.' || *c == '-' ||
+                      *c == '_')) {
+                    fprintf(stderr, "dropssh relay: --socks-dest host '%s' "
+                            "contains a character that is neither a dotted "
+                            "quad nor a domain name.\n", dhost);
+                    return 2;
+                }
+            }
+        }
+
+        char lhost[128] = "127.0.0.1";
+        int lport = 1080;
+        if (socks_listen_arg[0] != ':') {
+            sscanf(socks_listen_arg, "%127[^:]:%d", lhost, &lport);
+        } else {
+            lport = atoi(socks_listen_arg + 1);
+        }
+        if (lport <= 0 || lport > 65535) {
+            fprintf(stderr, "dropssh relay: --socks wants a port in "
+                    "1..65535.\n");
+            return 2;
+        }
+        socks_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (socks_listen_fd < 0) {
+            logf("socks socket: %s", strerror(errno));
+            return 1;
+        }
+        int one = 1;
+        setsockopt(socks_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        struct sockaddr_in ssa;
+        memset(&ssa, 0, sizeof ssa);
+        ssa.sin_family = AF_INET;
+        ssa.sin_port = htons((uint16_t)lport);
+        ssa.sin_addr.s_addr = inet_addr(lhost[0] ? lhost : "127.0.0.1");
+        if (bind(socks_listen_fd, (struct sockaddr *)&ssa, sizeof ssa) != 0) {
+            logf("socks bind %s:%d: %s", lhost, lport, strerror(errno));
+            return 1;
+        }
+        if (listen(socks_listen_fd, 16) != 0) {
+            logf("socks listen: %s", strerror(errno));
+            return 1;
+        }
+        logf("SOCKS5 on %s:%d, reaching %s:%d through node %s", lhost, lport,
+             socks_host, socks_port, socks_node_name);
+        logf("SOCKS5: a relay that restarts forgets its forwards, and a client "
+             "asking for anything other than %s:%d is refused with SOCKS 0x02",
+             socks_host, socks_port);
+        {
+            pthread_t sth;
+            if (pthread_create(&sth, NULL, socks_accept_thread, NULL) != 0) {
+                logf("socks: could not start the accept thread; the relay is "
+                     "running without a SOCKS listener");
+            } else {
+                pthread_detach(sth);
+            }
+        }
+    }
+
     if (listen(lfd, 64) != 0) {
         logf("listen: %s", strerror(errno));
         return 1;

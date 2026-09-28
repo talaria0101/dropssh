@@ -190,3 +190,43 @@ int relay_parse_uint(const char *json, const char *key, unsigned *out) {
     *out = (unsigned)n;
     return 0;
 }
+
+int relay_parse_string(const char *json, const char *key, char *out,
+                       size_t outlen) {
+    if (json == NULL || key == NULL || out == NULL || outlen == 0) {
+        return -1;
+    }
+    char pat[64];
+    int pn = snprintf(pat, sizeof pat, "\"%s\"", key);
+    if (pn <= 0 || (size_t)pn >= sizeof pat) {
+        return -1;
+    }
+    const char *p = strstr(json, pat);
+    if (p == NULL) {
+        return -1;
+    }
+    p += pn;
+    while (*p == ' ' || *p == '\t' || *p == ':') {
+        p++;
+    }
+    if (*p != '"') {
+        return -1;
+    }
+    p++;
+    size_t o = 0;
+    while (*p && *p != '"' && o < outlen - 1) {
+        if (*p == '\\') {
+            /* an escape ends the VALUE rather than being decoded: a host with
+             * a backslash in it is not a host this will dial, and guessing at
+             * the encoding is how a destination stops being the one that was
+             * checked. See the note in relayproto.h. */
+            return -1;
+        }
+        out[o++] = *p++;
+    }
+    if (*p != '"') {
+        return -1;                   /* unterminated: refuse, do not half-use */
+    }
+    out[o] = 0;
+    return o ? 0 : -1;
+}

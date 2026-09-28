@@ -586,6 +586,49 @@ kill "$nokey_pid" 2>/dev/null
 wait "$nokey_pid" 2>/dev/null
 rm -f "$nosock"
 
+head_ "the SOCKS5 listener reaches exactly one named destination"
+# ⛔ THE SOCKS5 DESTINATION POLICY IS THE WHOLE SECURITY OF THE FEATURE, AND IT
+# IS ASSERTED AS A DECISION RATHER THAN AS A LISTENER.
+#
+# The listener binds an INET socket and dropssh#6 measured 24/24 that every
+# INET bind is refused with EACCES at uid 0, so on this machine -- and on the
+# reference cage the project exists for -- the listener cannot be started at
+# all. A probe case for it would be a case that cannot run, and this repository
+# has shipped four of those.
+#
+# So the DECISION is tested, on the function lifted out of src/relay.c at build
+# time. The extraction fails the build if the function is renamed or removed,
+# which is the point: a test that copies the policy asserts the copy, and a
+# test that includes the real one cannot go stale without saying so.
+#
+# What is NOT established, and is not claimed: that the SOCKS5 wire format is
+# parsed correctly, that a forward reaches a node, or that bytes move. None of
+# those can be run here, and a case that claims to cover them is the thing this
+# project keeps refusing to write.
+if [ -f "$HERE/socks-policy-test.sh" ]; then
+    if sh "$HERE/socks-policy-test.sh"; then
+        ok "the SOCKS5 listener reaches only the destination the operator named, and refuses everything else"
+    else
+        bad "the SOCKS5 destination policy does not hold: a SOCKS5 proxy that dials what it is asked to dial is an OPEN PROXY (see the output above)"
+    fi
+else
+    bad "tests/socks-policy-test.sh is missing, so the SOCKS5 policy is unasserted"
+fi
+
+# ⛔ AND THE CONFIGURATION GUARDS, WHICH ARE CHECKED HERE BECAUSE THEY ARE THE
+# PART THAT CAN BE RUN ON THIS MACHINE. Both refuse rather than starting a
+# listener with no policy, and a listener with no policy is the open proxy
+# arriving through a different door.
+sockcfg_out="$WORK/socks-cfg.out"
+"$DROPSSH" relay --listen "unix://$WORK/socks-cfg.sock" --socks 127.0.0.1:11080 \
+    >"$sockcfg_out" 2>&1
+if grep -q "open proxy" "$sockcfg_out" 2>/dev/null; then
+    ok "--socks without a named destination is refused: a listener with no policy is an open proxy"
+else
+    bad "--socks with no --socks-dest did not refuse; see $sockcfg_out"
+fi
+rm -f "$WORK/socks-cfg.sock"
+
 head_ "a node that cannot pair says so instead of retrying for ever"
 # ⛔ A CAPPED BACKOFF WITH NO TOTAL IS AN AGENT THAT NEVER ADMITS IT IS BROKEN,
 # and from outside it looks healthy: the process is running, it is not
