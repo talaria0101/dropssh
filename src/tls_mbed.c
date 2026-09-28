@@ -182,22 +182,42 @@ static int mbed_send(void *ctx, const unsigned char *buf, size_t len) {
     return t->write(t, buf, len) == 0 ? (int)len : -1;
 }
 
+/* ⛔ THIS BIO IS NON-BLOCKING, AND "NOTHING RIGHT NOW" IS REPORTED AS
+ * MBEDTLS_ERR_SSL_WANT_READ RATHER THAN WAITED FOR.
+ *
+ * The first version slept 20 ms and asked the transport again, for ever. That
+ * is a correct blocking BIO and a wrong one here, and the difference is
+ * invisible from the return value: mbedtls_ssl_read returns WANT_READ in both
+ * cases, so the caller cannot tell "the library is waiting politely" from
+ * "this thread is asleep inside the socket layer".
+ *
+ * The cost was a hang that only reproduced against a real relay, because the
+ * local relay is a unix socket and this is the TLS path. The multiplexed
+ * operator received the node's banner, released its ready gate, wrote the
+ * banner out, and then called ws_poll_frame a third time -- which entered
+ * mbed_recv, found nothing, and slept in there. stdin was never serviced, the
+ * operator's own banner and KEXINIT were never sent, and the session stalled
+ * with every log line reporting success.
+ *
+ * A non-blocking BIO returns MBEDTLS_ERR_SSL_WANT_READ and mbedtls_ssl_read
+ * turns that into the same WANT_READ the caller already knows how to handle,
+ * and the caller's own loop is where the waiting happens. The transport
+ * underneath is non-blocking (wrap_fd sets O_NONBLOCK), so a read that yields
+ * nothing genuinely means nothing has arrived. */
 static int mbed_recv(void *ctx, unsigned char *buf, size_t len) {
     Transport *t = ctx;
     size_t got = 0;
     int eof = 0;
-    for (;;) {
-        if (t->read(t, buf, len, &got, &eof) != 0) {
-            return -1;
-        }
-        if (got) {
-            return (int)got;
-        }
-        if (eof) {
-            return 0;
-        }
-        dropssh_sleep_ms(20);
+    if (t->read(t, buf, len, &got, &eof) != 0) {
+        return -1;
     }
+    if (got) {
+        return (int)got;
+    }
+    if (eof) {
+        return 0;
+    }
+    return MBEDTLS_ERR_SSL_WANT_READ;
 }
 
 static int tls_read(Transport *t, void *out, size_t len, size_t *got, int *eof) {
@@ -213,8 +233,12 @@ static int tls_read(Transport *t, void *out, size_t len, size_t *got, int *eof) 
                 continue;
             }
             if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                dropssh_sleep_ms(10);
-                continue;
+                /* ⛔ SAME REASON AS IN tls_read: the handshake is not waited
+                 * for here either. ws_client reads in a loop until the 101 has
+                 * arrived, so a WANT_READ is simply "not yet", and the loop's
+                 * own 20 ms sleep is the wait. Spinning inside the transport
+                 * means a caller that must service another leg cannot. */
+                return 0;
             }
             /* A real handshake failure. The verify result is what makes this
              * actionable, so it is put in front of the generic error code
@@ -246,8 +270,27 @@ static int tls_read(Transport *t, void *out, size_t len, size_t *got, int *eof) 
             return 0;
         }
         if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            dropssh_sleep_ms(10);
-            continue;
+            /* ⛔ WANT_READ IS REPORTED AS "NOTHING YET", NOT WAITED FOR. The
+             * first version slept 10 ms and called mbedtls_ssl_read again,
+             * which is a blocking read with a sleep in it, and it is invisible
+             * because the return value is the same either way.
+             *
+             * The cost was a hang that only happened against a real relay. The
+             * multiplexed operator calls ws_poll_frame in a loop and expects
+             * "no frame right now" so it can go back and service stdin. Over a
+             * plain socket that is instant; over TLS this loop held the call
+             * for ever, so the operator received the node's banner, opened its
+             * ready gate, and then never sent its own banner. The session
+             * stalled with every log line correct and the local relay passing
+             * every test, because the local relay is a unix socket and this
+             * code path is TLS.
+             *
+             * The socket underneath is non-blocking (wrap_fd guarantees it), so
+             * WANT_READ genuinely means "nothing has arrived", and returning 0
+             * with eof=0 is the truth rather than a convenience. A caller that
+             * wants to WAIT does so itself, by polling, which is what
+             * ws_recv_frame's loop has always done. */
+            return 0;
         }
         if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
             *eof = 1;
@@ -319,6 +362,10 @@ Transport *transport_tls(Transport *tcp, const char *sni, int insecure,
     t->name = tcp->name;
     t->state = s;
     t->read = tls_read;
+    /* ⛔ AND THE FLAG IS CLEARED, because the TLS read above was made
+     * non-blocking to match the socket's. Leaving it set would be a lie in the
+     * safe direction that a future caller would trust. */
+    t->read_can_block = 0;
     t->write = tls_write;
     t->close = tls_close;
     t->is_tls = 1;

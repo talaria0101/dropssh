@@ -150,6 +150,7 @@ zig cc -O2 -target "$TARGET" \
     "$ROOT"/src/dns.c "$ROOT"/src/tls_mbed.c "$ROOT"/src/ws.c \
     "$ROOT"/src/relayproto.c "$ROOT"/src/connect.c "$ROOT"/src/serve.c \
     "$ROOT"/src/relay.c "$ROOT"/src/main.c \
+    "$ROOT"/src/events.c "$ROOT"/src/doctor.c "$ROOT"/src/pair.c \
     -L"$MBED_PREFIX/lib" -lmbedtls -lmbedx509 -lmbedcrypto -lpthread \
     ${STATIC_FLAG:--static} \
     -o "$OUT/dropssh" 2>"$OUT/dropssh.build.log" \

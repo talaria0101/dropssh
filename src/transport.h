@@ -53,6 +53,26 @@ struct Transport {
     void (*close)(Transport *t);
     int  is_tls;
     int  family;               /* 4, 6, or 0 for "not a socket" */
+    /* ⛔ WHETHER read() MAY BLOCK, DECLARED BY THE TRANSPORT AND NOT ASSUMED.
+     * A plain socket read returns immediately with 0 bytes when nothing has
+     * arrived, because the descriptor is non-blocking. A TLS read CANNOT: it
+     * calls into the library, which asks the socket for more, is told to wait,
+     * and the first version answered that by sleeping 10 ms and asking again,
+     * for ever. So a caller that must not block cannot tell from the return
+     * value whether "nothing yet" is instant or is a wait.
+     *
+     * That is not a theoretical difference. The multiplexed operator has to
+     * service stdin while waiting for the node, and against the ajam relay --
+     * which is TLS -- the operator received the node's banner, released its
+     * ready gate, and then stopped: the third ws_poll_frame call never
+     * returned, so the operator's ssh banner and KEXINIT were never sent and
+     * the session hung with every log line correct. Against a local unix relay
+     * the same code worked perfectly, which is why the whole multiplexer was
+     * proven locally and then failed live.
+     *
+     * So the property is a field the transport sets, and a caller that must
+     * not block checks it. */
+    int  read_can_block;
 };
 
 typedef enum {

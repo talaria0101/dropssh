@@ -402,6 +402,206 @@ else
     strings "$WORK/session_ghost-serve.log" 2>/dev/null | tail -4 | sed 's/^/        /'
 fi
 
+# ============================================ the multiplexed reverse path
+# ⛔ EVERY CASE BELOW IS ABOUT ONE SOCKET CARRYING MANY SESSIONS, AND THE FIRST
+# VERSION OF THIS FILE HAD A `session2` CASE THAT WAS SEQUENTIAL: it ran after
+# session1 had finished. One session cannot catch the defect, because the
+# defect only exists when two sessions are live at the same time and a frame
+# can be taken by whichever thread happens to be running. A sequential suite
+# is a suite that reports the multiplexer working.
+#
+# The relay's protocol is asymmetric and the asymmetry is the whole test:
+# the operator writes BARE bytes and the relay prepends the 32-hex session id,
+# while the node prefixes the id itself and the relay strips it. Both rules
+# are asserted here, one by a real session and one negatively.
+head_ "TWO CONCURRENT SESSIONS ON ONE NODE SOCKET"
+# ⛔ BOTH OPERATORS ARE LAUNCHED BEFORE EITHER IS WAITED ON, AND ONE OF THEM
+# SLEEPS FIRST. If they ran one after the other this would be the old
+# sequential case. The sleeping session is the harder one: it holds its
+# socket open and idle for seconds while the other runs a 270 KB transfer
+# through the same node websocket, so every frame of that transfer is a frame
+# the sleeping session's reader could have taken.
+rm -f "$WORK/mux.sock"
+"$DROPSSH" relay --listen "unix://$WORK/mux.sock" >"$WORK/mux-relay.log" 2>&1 &
+mux_relay_pid=$!
+i=0; while [ $i -lt 50 ] && [ ! -S "$WORK/mux.sock" ]; do sleep 0.05; i=$((i+1)); done
+if [ ! -S "$WORK/mux.sock" ]; then
+    bad "the multiplexer relay never bound $WORK/mux.sock"
+else
+    "$DROPSSH" serve --relay "unix://$WORK/mux.sock" --name muxbox \
+        --passwd "$WORK/passwd" --preload "$SHIM" \
+        --server "$DROPBEAR -i -E -F -r $WORK/hostkey -D $WORK/ak" \
+        >"$WORK/mux-serve.log" 2>&1 &
+    mux_serve_pid=$!
+    # the node needs its socket up before an operator can attach to it: a
+    # relay that is asked for a node that has not connected answers 503, and a
+    # bounded wait on the log is more honest than a sleep that might be short.
+    i=0
+    while [ $i -lt 100 ] && ! strings "$WORK/mux-serve.log" 2>/dev/null | grep -q "registered with"; do
+        sleep 0.1; i=$((i+1))
+    done
+
+    mux_ssh() {   # 1: session name, 2: remote command
+        LD_PRELOAD="$SHIM" SANDHOME_PASSWD="$WORK/passwd" \
+        timeout 45 ssh \
+            -o "ProxyCommand=$DROPSSH connect --relay unix://$WORK/mux.sock --name muxbox" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR \
+            -i "$WORK/user_ed25519" "$LOGIN_USER@muxbox" "$2" \
+            >"$WORK/$1.out" 2>"$WORK/$1.err"
+        echo $?
+    }
+
+    # Launched together, waited on separately. `mux_ssh` echoes the exit
+    # status rather than setting it, so a background subshell can report it.
+    ( mux_ssh mux_a 'sleep 4; echo MUX_ALPHA; id -u' >"$WORK/mux_a.rc" ) &
+    mux_a_pid=$!
+    ( mux_ssh mux_b 'echo MUX_BETA; wc -c < '"$WORK"'/big.txt' >"$WORK/mux_b.rc" ) &
+    mux_b_pid=$!
+    wait $mux_a_pid $mux_b_pid
+    mux_a_rc=$(cat "$WORK/mux_a.rc" 2>/dev/null)
+    mux_b_rc=$(cat "$WORK/mux_b.rc" 2>/dev/null)
+
+    # ⛔ EACH SESSION IS ASSERTED ON ITS OWN MARKER AND ON ITS OWN OUTPUT, and
+    # then CROSS-CHECKED: alpha's marker must not appear in beta's output and
+    # beta's byte count must not appear in alpha's. One session's bytes landing
+    # in another session's stream is the failure this case exists to catch, and
+    # asserting only that both succeeded would not see it.
+    mux_fail=""
+    [ "$mux_a_rc" = 0 ] || mux_fail="alpha exited $mux_a_rc"
+    [ "$mux_b_rc" = 0 ] || mux_fail="$mux_fail; beta exited $mux_b_rc"
+    grep -q MUX_ALPHA "$WORK/mux_a.out" 2>/dev/null || mux_fail="$mux_fail; alpha produced no marker"
+    grep -q MUX_BETA  "$WORK/mux_b.out" 2>/dev/null || mux_fail="$mux_fail; beta produced no marker"
+    grep -q MUX_BETA  "$WORK/mux_a.out" 2>/dev/null && mux_fail="$mux_fail; beta's output appeared in alpha's stream"
+    grep -q MUX_ALPHA "$WORK/mux_b.out" 2>/dev/null && mux_fail="$mux_fail; alpha's output appeared in beta's stream"
+    if [ -z "$mux_fail" ]; then
+        ok "two concurrent sessions on one node socket, each receiving only its own bytes"
+    else
+        bad "the concurrent sessions failed:$mux_fail"
+        sed 's/^/        /' "$WORK/mux_a.err" 2>/dev/null | head -4
+        sed 's/^/        /' "$WORK/mux_b.err" 2>/dev/null | head -4
+    fi
+
+    # The node must have served all three sessions (the one before this block
+    # plus these two) over ONE socket, not one socket per session. The count of
+    # "registered with" lines in the node's own log is that measurement, and it
+    # is what makes "one session per socket" fail here rather than pass slowly.
+    mux_registers=$(strings "$WORK/mux-serve.log" 2>/dev/null | grep -c "registered with")
+    mux_opens=$(strings "$WORK/mux-serve.log" 2>/dev/null | grep -c "operator opened session")
+    if [ "$mux_registers" = 1 ] && [ "$mux_opens" -ge 2 ]; then
+        ok "the node held one websocket for $mux_opens sessions (not one per session)"
+    else
+        bad "the node re-registered $mux_registers times for $mux_opens sessions"
+    fi
+    kill $mux_serve_pid $mux_relay_pid 2>/dev/null
+    wait $mux_serve_pid $mux_relay_pid 2>/dev/null
+fi
+
+head_ "the id-prefix rule, asserted rather than described (R11)"
+# ⛔ THE NODE'S DATA FRAME MUST CARRY THE 32-HEX ID AND THE RELAY'S OWN CLOSE
+# IS THE ASSERTION. docs/reverse-relay.md documents the asymmetry in a table
+# and a reader has to trust it; a regression that drops the prefix then looks
+# exactly like a relay that has gone quiet, which is how B11 cost an afternoon.
+#
+# So this drives the node's own reader with a well-formed frame and a bare one
+# and reads what the relay DID, not what a document says it does. The bare
+# frame must produce a named close (1009 "bad multiplex frame", measured live
+# against tcp.ssh.relay.ajam.dev on 2026-09-28), never silence. A relay that
+# drops it quietly is the bug this case was written for, and it is the failure
+# the old documentation described as expected behaviour.
+if [ -f "$HERE/mux-probe.py" ]; then
+    if python3 "$HERE/mux-probe.py" "$DROPSSH" "$WORK"; then
+        ok "the id-prefix rule holds: a bare node frame is closed by name, not dropped"
+    else
+        bad "the id-prefix rule failed (see the output above)"
+    fi
+else
+    bad "tests/mux-probe.py is missing, so the id-prefix rule is unasserted"
+fi
+
+head_ "doctor, config and pair answer without a network"
+# ⛔ THESE THREE ARE ASSERTED BECAUSE EACH WAS PREVIOUSLY EITHER MISSING OR
+# A FLAG THAT DID NOTHING. `doctor` answers the environment questions that were
+# previously answered by guessing; `config` is the answer to "it ignored my
+# flag"; and `--json` used to be accepted and read by nothing at all, which is
+# worse than refusing it.
+doctor_out=$("$DROPSSH" doctor --relay "unix://$WORK/nonexistent.sock" 2>&1)
+doctor_rc=$?
+# ⛔ DOCTOR EXITS NON-ZERO WHEN A CHECK FAILED, and the check that fails here is
+# the relay that is not there -- which is the point: a doctor run against a
+# relay that is down must say so in its exit status, not only in its text.
+if [ "$doctor_rc" != 0 ] && printf '%s' "$doctor_out" | grep -q "relay reachable"; then
+    ok "doctor reports the environment and exits non-zero on a failed check"
+else
+    bad "doctor exited $doctor_rc and did not name the unreachable relay"
+    printf '%s\n' "$doctor_out" | sed 's/^/        /' | head -8
+fi
+# ⛔ AND IT MUST NOT PRINT A CREDENTIAL, because a doctor is the thing people
+# paste into a bug report.
+if printf '%s' "$doctor_out" | grep -qiE "token=|--token [a-z0-9]"; then
+    bad "doctor printed something that looks like a token"
+else
+    ok "doctor prints no credential"
+fi
+
+config_out=$("$DROPSSH" config --relay relay.example:443 --name mybox 2>&1)
+# ⛔ CONFIG MUST SHOW THE VALUE *AND ITS SOURCE*, because a wrong setting found
+# by reading the resolved output is a class of report that otherwise arrives as
+# "it ignored my flag".
+if printf '%s' "$config_out" | grep -q "relay.example:443" \
+   && printf '%s' "$config_out" | grep -q "mybox"; then
+    ok "config prints every setting with the value that was given"
+else
+    bad "config did not report the relay and name that were passed"
+    printf '%s\n' "$config_out" | sed 's/^/        /' | head -12
+fi
+# ⛔ THE ASSERTION IS ON THE WORD, NOT ON A REGEX OVER ALIGNED COLUMNS. An
+# earlier version of this case matched a pattern with escaped parentheses
+# against the printed columns, and the pattern did not match its own output
+# because a literal `(` inside an -E bracket expression is not a group. A test
+# whose pattern cannot match the thing it describes fails for the wrong reason
+# and sends the next reader looking in the code instead of in the config.
+if printf '%s' "$config_out" | grep -q "set, not printed" \
+   || printf '%s' "$config_out" | grep -q "^ *token *(unset)"; then
+    ok "config reports whether a token is set without printing it"
+else
+    bad "config does not report the token's presence safely"
+    printf '%s\n' "$config_out" | sed 's/^/        /' | head -12
+fi
+# ⛔ AND WITH A TOKEN SET, THE VALUE MUST NOT APPEAR. The check above can pass
+# on a run where no token was given, which proves nothing about the case where
+# one is; this one passes one and requires the value to stay out of the output.
+config_tok=$("$DROPSSH" config --relay relay.example:443 --token SUPERSECRETVALUE 2>&1)
+if printf '%s' "$config_tok" | grep -q "set, not printed" \
+   && ! printf '%s' "$config_tok" | grep -q "SUPERSECRETVALUE"; then
+    ok "config with a token set reports it without printing the value"
+else
+    bad "config printed the token's value, or did not report its presence"
+    printf '%s\n' "$config_tok" | sed 's/^/        /' | head -12
+fi
+
+head_ "--json is honoured, not accepted and ignored"
+# ⛔ THE FLAG WAS DEAD: main.c set o.json and nothing read it, so an operator
+# who passed it believed they had machine-readable output. It is now either a
+# real event stream or a refusal, and this asserts the former. The assertion is
+# that a JSON object with an "event" key appears, not that the word json
+# appears somewhere.
+json_out=$("$DROPSSH" config --relay relay.example:443 --json 2>&1 >/dev/null)
+if printf '%s' "$json_out" | grep -q '"event":"start"'; then
+    ok "--json produces a parseable event line on stderr, not on stdout"
+else
+    bad "--json produced no event line"
+    printf '%s\n' "$json_out" | sed 's/^/        /' | head -5
+fi
+# ⛔ AND STDOUT MUST STAY EMPTY IN --json MODE, because on the connect verb
+# stdout is ssh's byte pipe. A JSON line on stdout would land in the middle of
+# an ssh version string.
+json_stdout=$("$DROPSSH" config --relay relay.example:443 --json 2>/dev/null)
+case "$json_stdout" in
+    *'"event"'*) bad "--json wrote an event to stdout, which is ssh's byte pipe" ;;
+    *) ok "--json keeps stdout clean; the events are on stderr" ;;
+esac
+
 head_ "a name no node is using is refused, not silently accepted"
 # ⛔ "COULD NOT RUN MUST NEVER READ AS DENIED" IS ALSO TRUE IN THE OTHER
 # DIRECTION. A relay that pairs a client with nothing produces a session that
