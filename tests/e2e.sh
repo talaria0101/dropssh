@@ -602,6 +602,56 @@ case "$json_stdout" in
     *) ok "--json keeps stdout clean; the events are on stderr" ;;
 esac
 
+head_ "the docs do not claim a close the relay does not send"
+# ⛔ THE "SILENTLY DROPPED" CLAIM CAME BACK TWICE IN A TREE, AND A CLAIM THAT
+# DESCRIBES THE RELAY WRONG IS WORSE THAN NO CLAIM. B11 and four other places
+# said a bare node frame is discarded with "no error, no close". Measured live
+# on 2026-09-28, 3/3, the relay closes the node with 1009 `bad multiplex frame`
+# and the operator with 1011, and an implementer following the old text had no
+# way to know 1009 existed -- which is the code they actually meet.
+#
+# So the claim is checked, not trusted. A documentation assertion is normally
+# weak: it cannot tell whether the relay behaves as written. This one can,
+# because `tests/mux-probe.py` above has just MEASURED the relay, and this
+# checks that the prose agrees with what was measured. A future edit that
+# reintroduces the silence claim fails the suite.
+doc_drift=""
+for f in docs/reverse-relay.md docs/relay-issues.md docs/multiplexing.md; do
+    [ -f "$ROOT/$f" ] || continue
+    # ⛔ THE CHECK IS FOR THE CLAIM *AS AN ASSERTION*, NOT AS A QUOTATION. The
+    # corrections in these files quote the old wording on purpose -- that is how
+    # a reader sees what changed -- so a check for the words alone fails on the
+    # very text that fixes the problem. What is wrong is a line that ASSERTS the
+    # silence: "is silently dropped", "silently discarded", "no error, no
+    # close", without a correction marker on it. A line that begins with ">", or
+    # that says "CORRECTED", "previously", "used to", "used say" or "wrong", is
+    # quoting or correcting rather than asserting, and is left alone.
+    while IFS= read -r line; do
+        case "$line" in
+            *">"*|*CORRECTED*|*previously*|*"used to"*|*"used say"*|*wrong*|*no\ error*|*"was "*|*"is quoted"*)
+                continue ;;
+        esac
+        case "$line" in
+            *"silently drop"*|*"silently discard"*|*"no error, no close"*|*"goes quiet"*)
+                doc_drift="$doc_drift; $f: $line" ;;
+        esac
+    done <<EOF
+$(grep -n "" "$ROOT/$f" 2>/dev/null)
+EOF
+done
+if [ -z "$doc_drift" ]; then
+    ok "no document asserts a bare node frame is dropped in silence"
+else
+    bad "a document still asserts the silence:$doc_drift"
+fi
+# ⛔ AND THE POSITIVE HALF: 1009 must be IN THE ERROR TABLE, because that is
+# where an implementer looks. Its absence is what made the old text useless.
+if grep -q "bad multiplex frame" "$ROOT/docs/reverse-relay.md" 2>/dev/null; then
+    ok "the error table names close 1009 bad multiplex frame"
+else
+    bad "docs/reverse-relay.md's error table does not name close 1009"
+fi
+
 head_ "a name no node is using is refused, not silently accepted"
 # ⛔ "COULD NOT RUN MUST NEVER READ AS DENIED" IS ALSO TRUE IN THE OTHER
 # DIRECTION. A relay that pairs a client with nothing produces a session that

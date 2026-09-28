@@ -1,11 +1,26 @@
-# Sessions are one-per-socket today, and the relay protocol is not
+# Sessions are multiplexed now, and this page is why they are not trivially so
 
-## What is shipped
+## Status: shipped, and this page is the design note behind it
 
-`dropssh relay` and `dropssh serve` pair one operator with one node and splice
-their bytes. That is a **rendezvous**, and it works: `tests/e2e.sh` carries a
-pubkey session to uid 0 through it, and a 270 KB transfer comes back byte for
-byte.
+`dropssh serve` holds **one** websocket to the relay and serves **many**
+sessions on it, told apart by a 32-hex id. Measured 2026-09-28 against
+`tcp.ssh.relay.ajam.dev` through a 443-only CONNECT proxy: two concurrent
+pubkey sessions on one node socket, one sleeping while the other transfers
+270177 bytes back byte for byte. `tests/e2e.sh` carries two concurrent
+sessions with cross-checks, and `tests/mux-probe.py` pins the framing rules.
+
+**Every defect in the table below was real and every one of them is now
+structural rather than fixed** -- one reader per socket, one writer per socket,
+the frame boundary as the message boundary in the framer, and a test that
+fails if any of them is undone. Read the table as "this is what happens if you
+do it the obvious way", not as an open list.
+
+## What was shipped
+
+`dropssh relay` and `dropssh serve` used to pair one operator with one node and
+splice their bytes. That is a **rendezvous**, and it works: `tests/e2e.sh`
+carries a pubkey session to uid 0 through it, and a 270 KB transfer comes back
+byte for byte.
 
 ## What the relay's own protocol is
 
@@ -35,7 +50,7 @@ next attempt walks into:
 | `ws_read` returns "whatever arrived", not one frame | two frames arriving together became one, and a control message was parsed with session data still attached to it |
 | `decode_available` appended every decoded frame to one buffer | a text control frame followed by a binary data frame reported the binary opcode for both, and a control message was demultiplexed as session bytes |
 | a reader that returns a pointer without consuming it | the same frame was returned forever, and the session was flooded until the client timed out |
-| a peer that frames a leg that the relay frames for it | the relay's two legs are NOT symmetric: it **prepends** the session id on the operator's leg and **strips** it on the node's. A node that omits the prefix has its frames silently dropped; an operator that adds one has it doubled. Both fail with no error, and both look like a relay fault. `docs/reverse-relay.md` has the four-way measurement. |
+| a peer that frames a leg that the relay frames for it | the relay's two legs are NOT symmetric: it **prepends** the session id on the operator's leg and **strips** it on the node's. An operator that adds one has it doubled. ⛔ **CORRECTED 2026-09-28:** this row used to say a node that omits the prefix has its frames "silently dropped ... with no error". Re-measured 3/3 against the live relay, the node socket is closed with **1009 `bad multiplex frame`** and the operator with **1011**. The operator-side mistake is still silent in the sense that nothing arrives, but the node now learns why. `docs/reverse-relay.md` has the four-way measurement and the three closes. |
 | one reader per socket, and it is not a session | N sessions each reading one websocket is a race on its framer buffer, and it mostly works with one session, which is what makes it dangerous |
 | `fork()` copies a TLS context, not just descriptors | a child writing while the parent reads corrupts the record layer, and the child reported `could not write to the relay` on a connection that was fine |
 | a session is a race between "the fork has set its socket" and "the operator's bytes arrived" | the first bytes of the ssh stream were dropped, and the symptom was the same `Exit before auth` |
@@ -71,11 +86,18 @@ One event loop per socket, no threads and no forks on a connection:
 
 ## What is not done
 
-The multiplexed path is not in this release. `dropssh serve` and
-`dropssh connect` work against `dropssh relay` and against a **forward** relay
-such as `tcp.ssh.relay.ajam.dev` (`--mint`, `--path /connect/<host>/<port>`),
-both measured with a real session and exit 0. They do not yet speak the
-multiplexed reverse protocol, so `serve` against that relay needs a
-name-scoped operator token and a node that speaks its framing.
+⛔ **NOTHING IN THE LISTED SHAPE IS MISSING.** The multiplexed reverse path is
+implemented, gated, and measured live. `dropssh serve` and `dropssh connect`
+speak the ajam relay's protocol, and so does `dropssh relay`, so a local relay
+and a remote one take the same command line.
 
-That is the next piece of work, and this page is the design note for it.
+Still open, and in the open list rather than here:
+
+* **R7**, ship the CA bundle in the release (a build-time input, not a
+  transport question).
+* **R9**, a `--passwd-file` patched into dropbear, which would remove the
+  `LD_PRELOAD` shim and the glibc/musl split with it.
+* **R2**, a scheduled CI job that drives a real relay, because R2's gate needs
+  a network and a credential and so cannot run on every commit. The framing
+  rules it would have caught are now in `tests/mux-probe.py`, which does not
+  need a network.

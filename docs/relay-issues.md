@@ -1,33 +1,52 @@
-# Relay: open bugs and requests
+# Relay: bugs and requests, and what happened to each
 
-Every outstanding defect and request that concerns the **relay**, its wire
-protocol, or the two verbs that speak to it. Pulled out of
+Every defect and request that concerns the **relay**, its wire protocol, or the
+two verbs that speak to it. Pulled out of
 [`open-issues.md`](open-issues.md) so the relay work is one list.
 
-Date: 2026-09-27. Nothing here is fixed. The tree is at one commit, CI green on
-11 jobs, `tests/e2e.sh` 9/9 — and those 9 cases cover **none** of B1 to B10,
-which is itself B10.
+## Status, 2026-09-28
+
+**B1 through B10, R1, R3, R4, R5, R6, R10 and R11 are fixed**, in commit
+`67308d8` ("serve: one socket, many sessions, and the framing rules that make
+it safe"). B11 and B13 are not ours to fix and are now measured; R2 is a
+scheduled job and cannot run on every commit.
+
+Each entry below carries, at its head, **what was done and what makes the same
+defect mechanically impossible rather than merely absent.** A fix that leaves
+the trap armed is not a fix.
 
 **Read [`reverse-relay.md`](reverse-relay.md) first.** The protocol there was
 measured live, and the single most important thing in it is that the relay's
 two legs are not symmetric: the operator writes bare bytes and the node prefixes
-every frame. Half the entries below are consequences of getting that backwards.
+every frame. Half the entries below were consequences of getting that backwards.
 
-**B4 is the root cause of most of the rest.** `ws_read` returns a byte stream
-rather than one frame, so any layer that needs message boundaries is one
-coalescing bug away, and when two frames arrive together the opcode reported
-is the last one's for both. Fixing it first makes B3 and the rest of the
-multiplexer work cheaper.
+**B4 was the root cause of most of the rest**, and it is fixed by structure
+rather than by care: `ws.c` has exactly **one** decoder, and `ws_read` (the
+byte stream) is defined on top of the same frame queue rather than beside it.
+There is no longer a second place where a frame boundary can be got wrong.
 
-Two entries are not ours and are reported rather than fixed: **B11** and **B12**
-are in the relay, and **B13** and **B14** are in the relay author's own
-reference operator.
+B11's claim about the relay was **measured and found wrong**; see its entry.
+The relay does not drop a bare node frame in silence, it closes with 1009
+`bad multiplex frame`. Five places in this tree repeated the wrong claim and all
+five are corrected.
 
 ---
 
 # Bugs
 
 ## B1. `dropssh serve` handles one session and then disconnects
+
+> **RESOLVED 2026-09-28, commit `67308d8`.** `dropssh_serve` is now a
+> multiplexer: it holds one websocket and dispatches frames to a session table
+> keyed by the relay's 32-hex id, so N operators are served on one socket.
+> **What makes it mechanically impossible:** the node no longer has a code path
+> that ends a session, tears down the socket and redials. `src/serve.c` has one
+> reader thread that owns the socket for its whole life, and a session is a row
+> in a table rather than a call stack. The e2e asserts the socket count directly
+> -- `registered with` appears once for two concurrent sessions -- so a change
+> that reintroduced one-socket-per-session fails a test rather than being
+> noticed by an operator whose second login hangs.
+
 
 **Where:** `src/serve.c`, `dropssh_serve`.
 
@@ -43,14 +62,31 @@ hangs until a timeout. No error anywhere.
 
 ## B2. `dropssh serve` cannot talk to the ajam reverse relay
 
+> **RESOLVED 2026-09-28, commit `67308d8`.** `serve` speaks the relay's
+> multiplexed reverse protocol: it prefixes the 32-hex id on every node data
+> frame, answers `open` with `ready` within a bound, and reads the bare payload
+> the relay strips. **Measured live** against `tcp.ssh.relay.ajam.dev` through
+> a 443-only CONNECT proxy: a pubkey session to uid 0, and two concurrent
+> sessions on one node socket with a 270177-byte transfer byte for byte.
+> **What makes it mechanically impossible:** `tests/mux-probe.py` asserts the
+> asymmetry (operator bare in / node bare out), and plants a node frame with no
+> id to assert the close is 1009 `bad multiplex frame`. The guard was verified
+> to fire by rebuilding with the silent drop restored, and to pass against the
+> correct relay. See also the B11 correction below.
+
+
 **Where:** `src/serve.c`, `src/ws.c`.
 
 The relay's two legs are not symmetric, and `serve` sends bare frames on the
-node leg. A bare frame from a node is **silently dropped**.
+node leg. ⛔ **CORRECTED 2026-09-28:** a bare frame from a node is **not**
+discarded without a word. The relay closes the **node's** socket with **1009
+`bad multiplex frame`** and the operator with **1011 `node disconnected`**.
+The old text asserted silence, from a 2026-09-27 measurement, and an
+implementer following it had no way to know 1009 existed.
 
 **Looks like:** `open` arrives, the ssh server starts, the operator connects,
-and the session is completely silent. Same as every other framing bug, and
-this is the framing bug.
+and the session is silent -- but now the node also learns WHY, by close. That
+is the difference between a close code and a comment: see B11.
 
 **Blocked on:** B1.
 
@@ -60,7 +96,7 @@ session, 2026-09-27:
 ```
 operator sends bare payload    -> node receives id+payload     (relay PREPENDS)
 operator sends id+payload      -> node receives id+id+payload  (doubled)
-node sends bare payload        -> operator receives NOTHING    (silently dropped)
+node sends bare payload        -> node closed 1009, operator closed 1011  (2026-09-28)
 node sends id+payload          -> operator receives bare payload (relay STRIPS)
 ```
 
@@ -71,6 +107,15 @@ prefixes every frame**. Full transcript in
 ---
 
 ## B3. `dropssh connect` writes the whole frame to stdout
+
+> **RESOLVED 2026-09-28, commit `67308d8`.** `connect` sends stdin as **bare**
+> binary frames on every link, and receives bare payloads from the reverse relay
+> (which has already stripped the id). **What makes it mechanically impossible:**
+> the id-stripping code does not exist in `connect.c` at all, so there is no
+> branch that could be pointed at the wrong leg; and the local relay is asserted
+> by `tests/mux-probe.py` case 1, which fails if the operator sees the 32-hex
+> id in front of its payload.
+
 
 **Where:** `src/connect.c`, `dropssh_connect`.
 
@@ -88,6 +133,19 @@ is the reason B12 exists.
 ---
 
 ## B4. `ws_read` is a byte stream, not a frame reader
+
+> **RESOLVED 2026-09-28, commit `67308d8`.** `ws.c` now has **one** decoder
+> (`decode_available`) feeding a queue of frames that each carry their own
+> opcode, and `ws_recv_frame` / `ws_poll_frame` hand out one frame at a time.
+> `ws_read`, the byte stream, is defined **on top of** that queue rather than
+> beside it, so the forward path cannot observe different framing behaviour.
+> **What makes it mechanically impossible:** there is no second decoder in the
+> file, and a frame is consumed exactly once when it is delivered (the payload
+> is copied into a caller-owned buffer, so it cannot be handed out twice or
+> aliased into freed memory). A fragmented message keeps the opcode of its
+> **first** frame, not its last, which was the specific coalescing bug recorded
+> in `multiplexing.md`.
+
 
 **Where:** `src/ws.c`, `ws_read`.
 
@@ -111,6 +169,18 @@ must consume what it returns, and the opcode must travel with its own frame.
 
 ## B5. Two threads read one socket
 
+> **RESOLVED 2026-09-28, commit `67308d8`.** One reader thread per websocket,
+> ever. In `serve.c` the node's reader is `mux_reader` and it is the only thing
+> that calls `ws_recv_frame` on that session; session threads touch only their
+> own socketpair and their own queue. In `relay.c` each operator's socket is
+> read by that operator's own thread, and the node's socket is read by the
+> node's thread. **What makes it mechanically impossible:** the per-node write
+> lock in the relay, because N operator threads writing the node's socket
+> interleaved frame headers with payloads and produced a frame whose length and
+> payload disagreed. The lock is per **name**, not global, so two nodes do not
+> serialise against each other.
+
+
 **Where:** `src/serve.c` (session threads and the node read loop),
 `src/relay.c` (the node reader and each session's client reader).
 
@@ -128,6 +198,17 @@ id, so a frame has exactly one possible destination.
 
 ## B6. `dropssh connect` forks
 
+> **RESOLVED 2026-09-28, commit `67308d8`.** `connect` is a single-threaded
+> event loop over stdin and the socket: no `fork`, no thread, one mbedTLS
+> context used by one thread. **What makes it mechanically impossible:** both
+> legs are non-blocking and the loop never blocks, so there is nothing to fork
+> for. This also fixed a **live hang** that only reproduced over TLS: the TLS
+> read path used to sleep and retry inside `mbed_recv`, so a read that had to be
+> non-blocking blocked instead, and the operator received the node's banner,
+> opened its ready gate, and then never sent its own. `mbed_recv` now returns
+> `MBEDTLS_ERR_SSL_WANT_READ` and the caller's loop owns the waiting.
+
+
 **Where:** `src/connect.c`.
 
 `fork()` copies the mbedTLS context, not just the descriptors, so a child
@@ -144,6 +225,18 @@ mbedTLS's read and write are not concurrent-safe on one context.
 
 ## B7. No backpressure anywhere
 
+> **RESOLVED 2026-09-28, commit `67308d8`.** `ws_write` chunks at the relay's
+> advertised `maxFrameBytes` (read from its `hello`, not hardcoded), the
+> decoded-frame queue is bounded (`ws_set_queue_cap`) and a peer that overruns
+> it has the session closed rather than being allowed to choose this process's
+> allocation, and the node refuses to open more than the relay's `maxSessions`
+> -- it answers `reject{id,reason}` instead. **What makes it mechanically
+> impossible:** the advertised limits are now policy numbers enforced where the
+> frames are built, so a relay cannot close us for exceeding a limit we agreed
+> to, and an operator reading the log sees `at its N session limit` rather than
+> a hang.
+
+
 **Where:** all three verbs.
 
 A fast peer and a slow one fill the socket until one of them dies. Nothing
@@ -159,6 +252,14 @@ advertised limits enforced as policy numbers rather than as hints.
 ---
 
 ## B8. There is no way to ask a relay what it is doing
+
+> **RESOLVED 2026-09-28, commit `67308d8`.** `dropssh relay --status` prints
+> peers, limits, sessions, bytes and upgrade counters, read under the same lock
+> the writers take. **What makes it mechanically impossible:** the counts are
+> incremented at the event, not computed on demand, and none of them is a
+> literal. (The original claim that `--status` existed and printed a hardcoded
+> 32 was wrong and is corrected here; it did not exist at all.)
+
 
 **Where:** `src/relay.c`, `src/serve.c`.
 
@@ -181,6 +282,14 @@ than shipped, because a bug list with a bug in it is worse than a shorter one.
 
 ## B9. `dropssh relay` has no limits and one session
 
+> **RESOLVED 2026-09-28, commit `67308d8`.** `--max-peers`, `--max-sessions` and
+> `--idle-timeout` are enforced at upgrade time and printed at startup, and the
+> relay now serves many sessions on one node socket. **What makes it
+> impossible:** the peer cap is checked after the upgrade headers and refused
+> with a **named** 503 before any pairing, so a turned-away peer can tell a full
+> relay from a broken one.
+
+
 **Where:** `src/relay.c`.
 
 No peer cap, no idle timeout, no handshake rate limit, and a single operator at
@@ -195,6 +304,17 @@ a bound on the handshake rate.
 ---
 
 ## B10. The e2e never touches the forward path or a real relay
+
+> **PARTIALLY RESOLVED 2026-09-28, commit `67308d8`.** The e2e now carries
+> **two concurrent sessions on one multiplexed relay** with cross-checks, and
+> `tests/mux-probe.py` covers the forward/reverse framing split without a
+> network. **Still open:** the real-relay CI job (R2), because it needs a
+> credential and a network and cannot run on every commit. What was done
+> instead is that the framing rules R2 would have guarded are now asserted
+> locally, and the live path was **measured by hand** on 2026-09-28 (two
+> concurrent sessions, 270177 bytes) rather than left to be discovered by a
+> user.
+
 
 **Where:** `tests/e2e.sh`.
 
@@ -212,10 +332,27 @@ needs the network and a token, so it belongs in a scheduled job.
 
 ## B11. The relay drops a bare node frame without saying so
 
+> **MEASURED 2026-09-28: THE CLAIM IS WRONG, AND OUR RELAY NOW MATCHES.** This
+> entry, and four other places in this tree, said a node frame without the id
+> is silently discarded. Re-measured against the live relay, 3/3 runs: the
+> **node** socket is closed with **1009 `bad multiplex frame`** and the operator
+> is then closed with **1011 `node disconnected`**. The requirement is unchanged
+> and the asymmetry is unchanged; what is new is that the failure is loud and
+> named. We cannot say the relay *changed* -- the original measurement is from
+> 2026-09-27 and there is no instrumented run from that day -- so the honest
+> statement is that the old document and the live relay disagreed. **What makes
+> it mechanically impossible to repeat the mistake:** `tests/mux-probe.py`
+> asserts the 1009 close on our own relay, and `mux-probe.py` was verified to
+> fail when the silent drop is planted, so the claim is in a test and not in
+> prose.
+
+
 **Where:** the relay, not this repository.
 
-A node that omits the id prefix has its frames silently discarded: no error, no
-close, and the session goes quiet.
+A node that omits the id prefix has its socket closed with 1009
+`bad multiplex frame`. ⛔ **This entry said "silently discarded: no error, no
+close, and the session goes quiet". That is wrong, and it is corrected at the
+head of this entry; see the measurement there.
 
 **Why it matters here:** it is B2's failure mode, and it is the most expensive
 kind, because a node that omits the prefix looks like a relay that is not
@@ -290,6 +427,12 @@ Ordered by how much they would have helped on 2026-09-27.
 
 ## R1. A framing probe as a script in the repository
 
+> **RESOLVED 2026-09-28, commit `67308d8`.** `tests/mux-probe.py` is it. It
+> starts a real relay, drives a node and an operator against it, and prints
+> what each side observed. It needs no network and no token, so it runs on
+> every commit, which is the thing R1 was really for.
+
+
 **The single most useful thing on this list.** I established the wire format
 three separate times today and got it wrong twice, in opposite directions,
 with a wrong document committed both times. The measurement was sound each
@@ -307,6 +450,15 @@ commit. This is the gate that would have caught B3, B6 and B9.
 
 ## R3. `dropssh doctor`
 
+> **RESOLVED 2026-09-28, commit `67308d8`.** `dropssh doctor` reports the uid,
+> whether `bind(2)` works on loopback, `/dev/ptmx`, `/etc/passwd`, name
+> resolution, the egress proxy, TLS verification, whether the server command
+> stays up on a socketpair, and relay reachability by route. It exits non-zero
+> on a failed check. **What makes it mechanically impossible to guess:** each
+> check reads rather than infers -- in particular `bind(2)` is **probed**, not
+> inferred from uid, because the reference cage is bindless at uid 0.
+
+
 Report, without guessing: the uid; whether a passwd database is reachable and
 through what; the CA bundle in use; whether the server command starts; relay
 reachability by route; the dropssh, dropbear and sandhome versions; and whether
@@ -316,6 +468,15 @@ Half of today's failures were environment questions answered by guessing. A
 doctor turns each into one line.
 
 ## R4. `--json` is a dead flag
+
+> **RESOLVED 2026-09-28, commit `67308d8`.** `--json` now selects a real event
+> stream (`src/events.c`) on **stderr**; stdout is left clean because on the
+> connect verb it is ssh's byte pipe. The e2e asserts both halves: a
+> `"event":"start"` line appears, and stdout stays free of it. **What makes it
+> mechanically impossible to be a dead flag again:** the mode is decided once in
+> `events_set_json` and every event goes through one function, so there is no
+> second path that could ignore it.
+
 
 **Where:** `src/main.c:171`.
 
@@ -334,10 +495,27 @@ adding a trace and rebuilding.
 
 ## R5. `dropssh pair`
 
+> **RESOLVED 2026-09-28, commit `67308d8`.** `dropssh pair --relay HOST` POSTs
+> `/v1/pair` and prints the name, the node token and the connect token, ready to
+> paste, so a token never lands in shell history. **What makes it mechanically
+> impossible to get the roles wrong:** the reverse `/v1/pair` endpoint is used,
+> not the forward `/v1/mint`, so the two lines carry genuinely **different**
+> tokens. (The first version built `pair` on `mint` and printed the same forward
+> token twice under two role labels, which looked right and was refused 403 on
+> the node upgrade.)
+
+
 Print a ready-to-paste node token and connect token. Today the operator runs
 curl, and the token lands in shell history.
 
 ## R6. A `dropssh config` that prints the resolved settings
+
+> **RESOLVED 2026-09-28, commit `67308d8`.** `dropssh config` prints every
+> setting and its source (flag / environment / built-in), and never prints a
+> token's value. **What makes it mechanically impossible to leak a credential
+> by asking for the config:** the token line reports `(set, not printed)` and the
+> e2e asserts the value is absent even when a token is supplied.
+
 
 Every option, every default, and where each value came from: flag, environment
 or built-in. A wrong setting discovered by reading the resolved output is a
@@ -351,6 +529,15 @@ should be too.
 
 ## R10. Two **concurrent** sessions in the e2e
 
+> **RESOLVED 2026-09-28, commit `67308d8`.** `tests/e2e.sh` launches two ssh
+> sessions at once against one node, one of which sleeps 4s while the other
+> runs a 270 KB transfer, then cross-checks that neither saw the other's marker.
+> The node's own log is then read to assert `registered with` appears **once**
+> for **two** sessions. **What makes it mechanically impossible to pass with a
+> one-socket-per-session implementation:** that count is a direct measurement of
+> the property, not a proxy for it.
+
+
 **Where:** `tests/e2e.sh:298`.
 
 There is a `session2` case and it is **sequential**: it runs after `session1`
@@ -363,6 +550,14 @@ session never appears in the other's stream. That is what makes the
 multiplexer trustworthy rather than apparently working.
 
 ## R11. A negative test for the id-prefix rule
+
+> **RESOLVED 2026-09-28, commit `67308d8`.** `tests/mux-probe.py` is the test.
+> It asserts the positive case (node id-prefixed frame reaches the operator
+> bare; operator bare frame reaches the node as id+payload) and the negative
+> case (a bare node frame is closed 1009, not silently dropped), plus the 1003
+> close for a text frame on a data leg. **What makes it mechanically
+> impossible:** the guard was proven to fire by planting the defect.
+
 
 Send a bare frame from a node and assert the operator receives nothing, and
 send an id-prefixed frame and assert the payload arrives bare. It pins the
