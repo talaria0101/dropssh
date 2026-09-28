@@ -25,3 +25,10 @@ authorized_keys
 token
 *.token
 .env
+
+# ⛔ BYTECODE FROM A TEST THAT IS RUN IN PLACE. tests/mux-probe.py is executed
+# from the repository by tests/e2e.sh, so python3 writes __pycache__ next to it,
+# and a .pyc records an interpreter build and an absolute source path. It is
+# build output, not source, and it changes whenever the file does.
+__pycache__/
+*.pyc

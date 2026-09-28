@@ -710,6 +710,19 @@ int ws_server_peek(Transport *t, WsSession *ws, char *request_path,
     return 0;
 }
 
+/* Tell the peer why the session is ending, from inside the decoder.
+ *
+ * ⛔ A CLOSE FRAME WITH A REASON, SENT FROM THE DECODER, BECAUSE EVERY FAILURE
+ * HERE IS ONE THE PEER CANNOT DIAGNOSE ON ITS OWN. "message too large" with no
+ * frame leaves a client to guess whether it or the relay is at fault, and the
+ * ajam relay's own 1009 "bad multiplex frame" is the precedent: a close that
+ * names the fault is worth a close that does not. */
+static void logf_close(WsSession *ws, int code, const char *reason) {
+    if (ws->t != NULL && !ws->close_sent) {
+        ws_close_with(ws, code, reason);
+    }
+}
+
 int ws_server_accept(WsSession *ws, ws_status *st) {
     char accept[64];
     dropssh_ws_accept(ws->pending_accept_key, accept, sizeof accept);
@@ -1086,6 +1099,24 @@ static int decode_available(WsSession *ws, int *fatal) {
                 ws->closed = 1;
                 return -1;
             }
+            /* ⛔ THE ASSEMBLY IS CAPPED, AND EACH CONTINUATION IS CHECKED
+             * BEFORE IT IS APPENDED. Every individual frame is already bounded
+             * by WS_MAX_FRAME above, but a peer can send any number of
+             * continuations and the ASSEMBLY is what grows -- so without this
+             * check a peer picks the size of the allocation this process
+             * makes on its behalf, one legal 16 MiB frame at a time. The
+             * limit is the same 16 MiB, which is above any message the relay
+             * protocol produces (maxFrameBytes is 65536) and below anything
+             * that would matter.
+             *
+             * The check is on the total BEFORE the append, so the buffer never
+             * reaches the limit rather than reaching it and then failing. */
+            if (ws->frag.len + plen > WS_MAX_FRAME) {
+                logf_close(ws, 1009, "message too large");
+                *fatal = 1;
+                ws->closed = 1;
+                return -1;
+            }
             if (buf_append(&ws->frag, pl, plen) != 0) {
                 *fatal = 1;
                 ws->closed = 1;
@@ -1116,6 +1147,14 @@ static int decode_available(WsSession *ws, int *fatal) {
         /* 0x1 text, 0x2 binary. A non-final data frame opens a fragment
          * sequence whose opcode is remembered; a final one is queued whole. */
         if (!fin) {
+            /* Same cap as the continuation path: the opening frame of a
+             * fragmented message is part of the same assembly. */
+            if (plen > WS_MAX_FRAME) {
+                logf_close(ws, 1009, "message too large");
+                *fatal = 1;
+                ws->closed = 1;
+                return -1;
+            }
             buf_reset(&ws->frag);
             if (buf_append(&ws->frag, pl, plen) != 0) {
                 *fatal = 1;

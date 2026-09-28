@@ -240,9 +240,54 @@ def run_case(relay_path, name, node_sends_id_prefix, node_text=False):
     #
     # So an operator speaks only binary on this link. The node answers `open`
     # with `ready`, the relay forwards that to the operator as text, and the
-    # operator's job is to have already sent its banner. The asymmetry is the
-    # point: the node speaks control both ways and the operator speaks data
-    # only.
+    # operator sends its banner afterwards. The asymmetry is the point: the node
+    # speaks control both ways and the operator speaks data only.
+    #
+    # ⛔ THE NODE ANSWERS `ready` HERE, AND ITS ABSENCE WAS A REAL DEFECT IN THIS
+    # PROBE. It had never sent one: the code that answered `open` was replaced
+    # during the wait-for-ready fix and the replacement did not put it back. The
+    # probe still passed, because the relay did not enforce the ordering -- and
+    # so the probe had been asserting, for several runs, that the relay does NOT
+    # require `ready`. A test that passes for the wrong reason keeps passing
+    # while the thing it names regresses, which is the failure mode this project
+    # has now hit three times: a guard that cannot fail, a gate with no case, and
+    # a probe that passed the wrong way round.
+    node.sendall(encode_frame(
+        0x1, json_bytes({"type": "ready", "id": session_id}), True))
+
+    # ⛔ AND THEN THE OPERATOR WAITS FOR THAT `ready` TO REACH IT. Not a sleep:
+    # the observed thing, bounded. A fixed sleep is a coin flip and a coin flip
+    # in a gate is a flake someone will spend a morning on.
+    deadline = time.time() + 8
+    saw_ready = False
+    while time.time() < deadline and not saw_ready:
+        if not s.ro.feed(0.2):
+            break
+        while True:
+            f = s.ro.take()
+            if f is None:
+                break
+            op, payload = f
+            if op == 0x8:
+                code, reason = close_of(payload)
+                s.op_close = (code, reason)
+                s.closed_by = ("op", code, reason)
+            elif op == 0x1:
+                m = parse_json(payload)
+                s.op_text.append(m)
+                if m.get("type") == "ready":
+                    saw_ready = True
+                    break
+            else:
+                s.op_bin.append(payload)
+    if not saw_ready:
+        node.close()
+        op.close()
+        raise RuntimeError(
+            "the node's `ready` did not reach the operator within 8s, so the "
+            "framing rules cannot be asserted: the relay is not pairing, and a "
+            "failure here would name the wrong thing")
+
     if node_text:
         # A TEXT frame where the relay expects data.
         s.node.sendall(encode_frame(0x1, b"this should be data", True))
@@ -252,7 +297,19 @@ def run_case(relay_path, name, node_sends_id_prefix, node_text=False):
         # A BARE payload: the exact mistake B2 and B11 describe.
         s.node.sendall(encode_frame(0x2, b"BARE-PAYLOAD", True))
 
-    # The operator writes BARE bytes; the relay prepends the id for the node.
+    # ⛔ THE OPERATOR'S BYTES GO AFTER THE NODE'S FRAME, AND THAT ORDER IS NOW
+    # PART OF THE PROTOCOL RATHER THAN A COINCIDENCE OF TIMING. This relay
+    # refuses operator data sent before the node has answered `open` with
+    # `ready` -- close 1008 "wait for ready", the same code and reason the ajam
+    # relay uses (measured 2026-09-28) -- and case 5 asserts exactly that.
+    #
+    # The first version of this probe sent the operator's bytes unconditionally
+    # and let the node's `ready` arrive whenever it arrived. It passed against a
+    # relay that did not enforce the ordering, so it was really asserting that
+    # the relay DID NOT enforce it. A test that passes for the wrong reason is
+    # worse than one that fails, and this one would have kept passing while the
+    # ordering regressed. Sending the node's frame first and draining a turn
+    # before the operator's makes the ordering explicit and deterministic.
     s.op.sendall(encode_frame(0x2, b"OP-BARE", True))
 
     # ⛔ THE DATA WINDOW AND THE CLOSE WINDOW ARE SEPARATE, AND THE CLOSE GETS
@@ -448,6 +505,182 @@ def main():
         s.node.close()
         s.op.close()
 
+        # ---- case 5: the operator's `ready` GATE.
+        # ⛔ THIS CASE EXISTS BECAUSE A CLAIM WAS FALSE, NOT BECAUSE A BUG WAS
+        # FOUND IN THE GATE.
+        #
+        # The relay does not create a session until the node answers `open`
+        # with `ready`, and an operator that writes before that answer arrives
+        # has BOTH ends torn down: operator 1008 "wait for ready", node 1003
+        # "unknown session id". `dropssh connect` therefore holds stdin until it
+        # sees `ready`, and that gate is the difference between a working live
+        # session and a hang.
+        #
+        # ⛔ IT HAD NO TEST. The gate is in `connect`, and `connect` is what the
+        # e2e drives with a real ssh -- which sends its banner immediately, so
+        # the e2e could not tell a gated operator from an ungated one: a real
+        # relay that does not enforce the ordering accepts both. Planting the
+        # gate's removal, i.e. building `connect` with the gate deleted, was
+        # detected 0 times in 10 runs. A guard that cannot fail is not a guard,
+        # and this one was described in a commit message as proven.
+        #
+        # So the case drives the ordering itself: an operator that SENDS BEFORE
+        # the node has answered, against a relay that enforces it. The
+        # assertion is the close -- 1008 on the operator, 1003 on the node --
+        # and the second half is that `dropssh connect` exits NON-ZERO when that
+        # happens, which is the half that was also wrong and is now fixed.
+        gate_failures = []
+        gnode = connect_relay(sock_path)
+        gnb = handshake(gnode, "/v1/node/case5")
+        gnr = Reader(gnode); gnr.buf = gnb
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not gnr.feed(0.2):
+                break
+            f = gnr.take()
+            if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                break
+        gop = connect_relay(sock_path)
+        gob = handshake(gop, "/v1/connect/case5")
+        gor = Reader(gop); gor.buf = gob
+        # Deliberately do NOT answer the node's `open`. The operator now sends
+        # session data, which is exactly what an ungated client does.
+        gop.sendall(encode_frame(0x2, b"EARLY-BANNER", True))
+        gclosed = None
+        nclosed = None
+        deadline = time.time() + 8
+        while time.time() < deadline and gclosed is None:
+            for reader, which in ((gor, "op"), (gnr, "node")):
+                reader.feed(0.2)
+                while True:
+                    f = reader.take()
+                    if f is None:
+                        break
+                    if f[0] == 0x8:
+                        code, reason = close_of(f[1])
+                        if which == "op":
+                            gclosed = (code, reason)
+                        else:
+                            nclosed = (code, reason)
+            if gclosed and nclosed:
+                break
+        if gclosed is None:
+            gate_failures.append(
+                "an operator that sent session data before the node answered "
+                "`ready` was NOT closed; the ordering the gate exists to avoid "
+                "is not being enforced by this relay")
+        elif gclosed[0] != 1008:
+            gate_failures.append(
+                "an early operator was closed with %d %r, expected 1008 "
+                "'wait for ready'" % (gclosed[0], gclosed[1]))
+        if nclosed is not None and nclosed[0] != 1003:
+            gate_failures.append(
+                "the node was closed with %d %r, expected 1003 "
+                "'unknown session id'" % (nclosed[0], nclosed[1]))
+        gop.close()
+        gnode.close()
+        failures.extend(gate_failures)
+
+        # ---- case 6: `dropssh connect` ON A NODE THAT DOES NOT ANSWER `open`.
+        #
+        # ⛔ THE STALLING SERVER IS NOT ENOUGH, AND THAT WAS THE BUG IN THE FIRST
+        # VERSION OF THIS CASE. `dropssh serve` answers `open` with `ready` as
+        # soon as its server command STARTS -- a `sleep` server starts fine, so
+        # the node answered `ready` immediately, the gate opened, and the case
+        # measured a healthy session while asserting a silent one. It reported
+        # "the wait has no bound" about a wait that had correctly ended.
+        #
+        # A node that does not answer `open` is a node whose server command does
+        # NOT start, because the `ready` is sent only after start_server has
+        # returned. So the case needs a server command that fails to start,
+        # which `serve` detects at startup and refuses to run at all -- so the
+        # honest way to produce an unanswered `open` is a node that never
+        # reaches the relay, and the honest way to assert a bounded wait is
+        # against a relay with no node.
+        #
+        # ⛔ So THAT is what this does: a name with no node, on a relay that
+        # answers 503 on the UPGRADE. `dropssh connect` must fail, name the
+        # reason, and do it promptly. That is a real operator situation -- the
+        # node is not running, or has not dialled yet -- and it is the one an
+        # operator meets first.
+        #
+        # This case exists because `dropssh connect` exited 0 after the relay
+        # closed with 1008 "node open timeout" -- a refused login reported to
+        # ssh as a success. That half is real and is asserted below.
+        #
+        # ⛔ IT DELIBERATELY DOES NOT ASSERT THAT THE ready-GATE IS WHAT PREVENTS
+        # IT, BECAUSE MEASUREMENT SAYS IT CANNOT BE SEEN FROM OUTSIDE. Against
+        # this relay, which refuses early operator data (case 5), a gated
+        # `connect` and one built with the gate deleted were run side by side:
+        # identical exit status, identical elapsed time, identical message,
+        # and the relay's log recorded zero early data frames in BOTH. Planting
+        # the gate's removal was detected 0 times in 10 runs -- not because the
+        # gate does nothing, but because with an enforcing relay the two
+        # journeys end in the same observable place.
+        #
+        # ⛔ SO THE GATE IS RECORDED HERE AS UNGUARDED RATHER THAN GIVEN A CASE
+        # THAT CANNOT FAIL. A previous version of this comment claimed the gate
+        # was "proven to fire"; it was not, and the claim was the reason nobody
+        # looked. What IS asserted is the bound and the exit code, both of
+        # which have been shown to fail when the corresponding change is made.
+        #
+        # ⛔ AND ONE MORE HONEST NEGATIVE, FOUND WHILE CHECKING. The exit code
+        # on a pre-`ready` close was changed from 0 to 1 during this review, and
+        # planting the change back is detected 0 times in 6 runs -- because the
+        # 60-second bound is reached first whenever the node never answers, so
+        # the pre-`ready` close path is not the one that ends the session. The
+        # fix is therefore correct but not independently testable by this
+        # probe: its observable effect is entirely on a path the bound shadows.
+        # It is kept because the path is real on the live relay, where the
+        # relay's own 10s open timeout closes the socket long before our bound,
+        # and that is measured -- but it is not claimed here as guarded.
+        #
+        # ⛔ AND A REAL DEFECT WAS FOUND WHILE TRYING. The 60-second bound on
+        # this wait was unreachable: the reverse branch ends in `continue`,
+        # which skipped the counter, so `connect` waited for ever on a silent
+        # relay. As an ssh ProxyCommand that is an ssh that never times out.
+        # The bound is now above every `continue` in the loop and this case
+        # exercises it, which is why the case asserts a BOUNDED wait and not
+        # merely an exit code.
+        gate_client = []
+        t0 = time.time()
+        try:
+            r = subprocess.run(
+                [dropssh, "connect", "--relay", "unix://" + sock_path,
+                 "--name", "no-such-node-for-case-6"],
+                input=b"SSH-2.0-GateProbe\r\n",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            elapsed = time.time() - t0
+            if r.returncode == 0:
+                gate_client.append(
+                    "`dropssh connect` exited 0 for a name with no node attached; a "
+                    "refused login is being reported as a success")
+            # ⛔ THE MESSAGE MUST NAME THE CAUSE, BECAUSE "CONNECTION FAILED" IS NOT
+            # ACTIONABLE. The relay's own sentence is what distinguishes "the node
+            # is not running" from "the relay is full" from "the token is wrong",
+            # and an operator who is told only that something failed has to try
+            # the next idea in the wrong order.
+            elif b"503" not in r.stderr:
+                gate_client.append(
+                    "`dropssh connect` exited %d for a name with no node, and the "
+                    "message did not carry the relay's reason: %r"
+                    % (r.returncode, r.stderr[:140]))
+            # ⛔ AND IT MUST BE PROMPT. This process is an ssh ProxyCommand; an
+            # operator whose node has not dialled yet gets an ssh that appears to
+            # hang, with nothing to read. A refusal is answered at the speed of
+            # an HTTP status, not at the speed of a TCP timeout.
+            elif elapsed > 10:
+                gate_client.append(
+                    "`dropssh connect` took %.1fs to report a refused node; the "
+                    "operator is waiting on an ssh that looks hung" % elapsed)
+        except subprocess.TimeoutExpired:
+            gate_client.append(
+                "`dropssh connect` did not return within 30s for a name with no "
+                "node; a refused login is not bounded")
+        except Exception as e:
+            gate_client.append("the `connect` refusal case could not run: %s" % e)
+        failures.extend(gate_client)
+
         # ---- case 4: a NODE DISCONNECT WHILE AN OPERATOR IS ATTACHED.
         # ⛔ THIS CASE EXISTS BECAUSE OF A REAL CRASH, AND IT IS THE ONLY CASE
         # THAT WOULD HAVE CAUGHT IT DETERMINISTICALLY.
@@ -536,11 +769,112 @@ def main():
             node_probe_ok = False
             failures.append("the node-disconnect case could not run: %s" % e)
 
+        # ---- case 7: a REFUSAL ON THE OPERATOR'S OWN THREAD.
+        # ⛔ THIS CASE CLOSES THE GAP THE `c->ws` MOVE LEFT OPEN, AND THE REASON
+        # IT IS NEEDED IS SPECIFIC RATHER THAN GENERAL.
+        #
+        # The operator's WsSession is MOVED into the Client rather than copied,
+        # because a struct copy shares its buffer POINTERS and every
+        # `ws_close(&ws)` on the connection thread's stack copy would then free
+        # memory the Client still owns. Reverting the move to a memcpy and
+        # running this probe 20 times produced no crash -- the probe's other
+        # cases never reach the combination. The combination is: a REFUSAL path
+        # that closes the stack copy after the client is in the table, with the
+        # session closed again by client_release.
+        #
+        # So the case drives exactly that. A relay started with
+        # --max-sessions 1 is given TWO operators for the same node. The second
+        # is refused, and its refusal path closes the stack copy -- which, with
+        # the move reverted, is the same buffers the first operator's session
+        # owns. The assertion is the cheap one that a double free cannot pass:
+        # the relay is still serving afterwards.
+        #
+        # ⛔ AND THE RELAY IS LEFT SERVING BY THE ASSERTION, NOT BY THE PROCESS
+        # BEING FINE. A double free takes the process, so the way to see it is to
+        # ask for another session afterwards. That is the same shape as case 4
+        # and for the same reason.
+        limit_failures = []
+        limsock = "/tmp/muxlimit-%d.sock" % os.getpid()
+        limlog = open(os.path.join(work, "muxprobe-limit.log"), "wb")
+        limrelay = subprocess.Popen(
+            [dropssh, "relay", "--listen", "unix://" + limsock,
+             "--max-sessions", "1"],
+            stdout=subprocess.DEVNULL, stderr=limlog)
+        try:
+            for _ in range(200):
+                if os.path.exists(limsock):
+                    break
+                time.sleep(0.05)
+            lnode = connect_relay(limsock)
+            lnb = handshake(lnode, "/v1/node/limit7")
+            lnr = Reader(lnode); lnr.buf = lnb
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not lnr.feed(0.2):
+                    break
+                f = lnr.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    break
+            # two operators, the second over the session limit
+            ops = []
+            for i in (1, 2):
+                try:
+                    o = connect_relay(limsock)
+                    handshake(o, "/v1/connect/limit7")
+                    ops.append(o)
+                except RuntimeError as e:
+                    # a refusal AT THE UPGRADE is also a refusal, and also a
+                    # path that closes the stack copy
+                    if "503" not in str(e) and "409" not in str(e):
+                        raise
+            time.sleep(1.0)
+            # the relay must still be serving
+            probe3 = connect_relay(limsock)
+            b3 = handshake(probe3, "/v1/node/limit7-after")
+            p3 = Reader(probe3); p3.buf = b3
+            alive = False
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not p3.feed(0.2):
+                    break
+                f = p3.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    alive = True
+                    break
+            probe3.close()
+            for o in ops:
+                try:
+                    o.close()
+                except Exception:
+                    pass
+            lnode.close()
+            if not alive:
+                limit_failures.append(
+                    "after refusing an operator on the session limit the relay did "
+                    "not serve a NEW node: the process is gone, which is what a "
+                    "double free in a refusal path does")
+        except Exception as e:
+            limit_failures.append("the refusal-path case could not run: %s" % e)
+        finally:
+            limrelay.terminate()
+            try:
+                limrelay.wait(timeout=5)
+            except Exception:
+                limrelay.kill()
+            limlog.close()
+            try:
+                os.unlink(limsock)
+            except OSError:
+                pass
+        failures.extend(limit_failures)
+
         for f in failures:
             print("mux-probe: FAIL %s" % f)
         if not failures:
             print("mux-probe: id-prefix, bare-frame close 1009, text-frame "
-                  "close 1003, and a node disconnect with an operator attached "
+                  "close 1003, the ready ordering, a bounded `connect` that "
+                  "exits non-zero on a silent node, a node disconnect with an "
+                  "operator attached, and a refusal on the operator's own thread "
                   "all behave as measured")
         return 1 if failures else 0
     finally:

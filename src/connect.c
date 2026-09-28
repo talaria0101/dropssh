@@ -183,6 +183,9 @@ int dropssh_connect(dropssh_opts *o) {
     buffer framebuf;
     buf_init(&framebuf);
     unsigned waited_ready = 0;
+    unsigned wait_started = 0;
+    int waiting_started = 0;
+    int said_waiting = 0;
 
     /* ⛔ ONE LOOP, NON-BLOCKING READS ON BOTH LEGS, AND STDIN HAS PRIORITY.
      * The blocking version of this loop read stdin under poll() and then fell
@@ -265,6 +268,87 @@ int dropssh_connect(dropssh_opts *o) {
             }
         }
 
+        /* ⛔ THE READY-WAIT ACCOUNTING IS HERE, BEFORE THE REVERSE BRANCH, AND
+         * THAT IS WHERE IT HAS TO BE.
+         *
+         * The first version put it at the bottom of the loop, after the
+         * reverse branch. That branch ends in `continue`, so on a relay that
+         * sends nothing -- which is exactly the case the accounting exists to
+         * bound -- the counter was never incremented and the 60s bound was
+         * never reached. `dropssh connect` then waited for ever.
+         *
+         * ⛔ AND IT IS AN ssh ProxyCommand, SO A HANG HERE IS AN ssh THAT NEVER
+         * TIMES OUT. Measured while writing the case that found it: a `connect`
+         * against a node that registers and never answers `open` printed nothing
+         * and ran until the test harness killed it at 25s, and again at 75s
+         * after the bound was added -- because the bound was on the other side
+         * of a `continue`.
+         *
+         * Every `continue` in this loop is a place a bound can be skipped, so
+         * the bound is above all of them. */
+        if (gated && !seen_ready) {
+            /* ⛔ ELAPSED TIME IS MEASURED, NOT COUNTED IN TURNS.
+             *
+             * The first version did `waited_ready += 20` per loop turn, on
+             * the assumption that a turn was 20 ms. It is not: a turn is as
+             * long as the work in it, and when frames are arriving the loop
+             * never sleeps. So the counter reached 60000 -- and printed "the
+             * node never answered `ready` after 60s" -- within milliseconds,
+             * and `dropssh connect` gave up on a node that was about to answer.
+             *
+             * ⛔ AND THE SYMPTOM NAMED A DIFFERENT FAULT AGAIN. The message
+             * says the node never answered, and the node had answered; what
+             * had happened is that this process counted its own iterations and
+             * believed them. A message that is confidently wrong is worse than
+             * no message, and the number in it is the part a reader trusts.
+             *
+             * So the clock is the clock. `dropssh_now_ms` is monotonic and is
+             * what the websocket keepalive already uses, so there is one time
+             * source in this file rather than two that can disagree. */
+            /* ⛔ AND THE SENTINEL IS A SEPARATE FLAG, NOT A FUDGED VALUE.
+             *
+             * Two attempts, both wrong in a way that only showed up as a
+             * number. `wait_started == 0` as the "not started" test re-arms
+             * itself if the clock reads 0, which is the turn-counting bug
+             * wearing a clock. Fudging it with `| 1u` so it is never 0 makes
+             * the SUBTRACTION wrap when the real clock is still below 1:
+             *
+             *     waited_ready: 4294967295ms
+             *
+             * which is unsigned underflow, and which made the 60s bound fire
+             * immediately while printing "60s". A message that says 60s and
+             * means "now" is worse than no bound, because it stops the reader
+             * looking.
+             *
+             * So the flag is separate from the value and the arithmetic is
+             * left alone. `now - start` is correct whenever start was set from
+             * the same clock, and it is always set from the same clock. */
+            unsigned now = dropssh_now_ms();
+            if (!waiting_started) {
+                waiting_started = 1;
+                wait_started = now;
+            }
+            waited_ready = now - wait_started;
+            if (waited_ready >= 10000 && !said_waiting) {
+                said_waiting = 1;
+                logf("still waiting for the node to answer `ready` after 10s; "
+                     "the relay closes an unanswered open at about that point");
+            }
+            /* The bound is six times the relay's own open timeout, so a slow
+             * but working node is not cut off and a relay's own 1008 is what
+             * normally ends this wait. It exists for the relay that never
+             * closes, because ssh waits for this process and an operator with
+             * no message has no way out. */
+            if (waited_ready >= 60000) {
+                logf("the node never answered `ready` after 60s; giving up. "
+                     "The node is not answering `open` -- check that it is "
+                     "running, that its --server command starts, and that it "
+                     "reached the relay");
+                rc = 1;
+                goto done;
+            }
+        }
+
         /* 2. the relay -> stdout, draining every frame that is ready. */
         if (kind == LINK_REVERSE) {
             for (;;) {
@@ -273,6 +357,43 @@ int dropssh_connect(dropssh_opts *o) {
                 int r = ws_poll_frame(&ws, &op, &framebuf, &n, &closed, &fatal);
                 if (r < 0) {
                     int code = ws_close_code(&ws);
+                    /* ⛔ AN ERROR CLOSE IS A FAILURE, AND EXIT 0 HERE IS A
+                     * REFUSED LOGIN REPORTED AS SUCCESS. Measured: a relay
+                     * that closes 1008 "node open timeout" before the node
+                     * answers -- which is what happens when the node is gone,
+                     * slow, or restarting -- left `dropssh connect` exiting 0
+                     * with the reason on stderr. An ssh reading that sees a
+                     * clean exit and reports a transport that worked.
+                     *
+                     * The rule, and it is the same one the local relay taught:
+                     * a close in the 1000-2999 range is the end of a session
+                     * that was fine, and anything else is a fault. 1000-1005
+                     * are normal-ish; 1008 and 1009 are named protocol errors;
+                     * 1011 is the node being gone. None of them is "success".
+                     *
+                     * ⛔ AND `ready` NEVER ARRIVED, WHICH IS THE STRONGER FACT.
+                     * A session that was never established cannot be reported
+                     * as one that completed, whatever the close code says, so
+                     * the gate's own state is consulted and not only the
+                     * code. That is what makes this correct for a close the
+                     * relay might not have named. */
+                    if (gated && !seen_ready) {
+                        rc = 1;
+                        if (code == 1008) {
+                            logf("the node never answered `ready`: the relay "
+                                 "closed with 1008 node open timeout, which "
+                                 "means the node is not there or not answering");
+                        } else if (!code || code == 1005) {
+                            logf("the connection closed before the node "
+                                 "answered `ready`; the node is not connected "
+                                 "or is not accepting sessions");
+                        } else {
+                            logf("the connection closed before the node "
+                                 "answered `ready` (code %d %s)", code,
+                                 ws_close_reason(&ws));
+                        }
+                        goto done;
+                    }
                     if (code == 1009) {
                         logf("the relay closed the session: 1009 bad multiplex "
                              "frame (a node frame arrived without its 32-hex id)");
@@ -282,9 +403,11 @@ int dropssh_connect(dropssh_opts *o) {
                              "was required)");
                     } else if (code == 1011) {
                         logf("the node disconnected (relay close 1011)");
-                    } else if (code && code != 1005) {
+                        rc = 1;
+                    } else if (code && code != 1005 && code != 1000 && code != 1001) {
                         logf("the relay closed the session: code %d %s", code,
                              ws_close_reason(&ws));
+                        rc = 1;
                     } else if (fatal) {
                         logf("the relay sent framing this client cannot read");
                         rc = 1;
@@ -354,10 +477,39 @@ int dropssh_connect(dropssh_opts *o) {
                     goto done;
                 }
             }
-            continue;   /* stdin first, again, on the next turn */
-        }
+            /* ⛔ THE LOOP ALWAYS YIELNS, EVEN ON THE REVERSE LINK, AND THAT IS
+             * WHAT STOPS THIS FROM BECOMING A BUSY LOOP.
+             *
+             * This branch used to `continue` straight back to the top, which
+             * meant the `if (!progressed) sleep(20ms)` at the bottom was never
+             * reached while a relay was sending anything -- and a relay that
+             * sends a frame every few milliseconds keeps `progressed` true
+             * forever. A node that is streaming but not answering `ready` would
+             * spin a core for the length of the wait.
+             *
+             * So the reverse link falls through to the shared tail rather than
+             * jumping over it. The cost is one extra pass through the stdin
+             * check per turn, which is what we want anyway: stdin has priority
+             * and should be serviced on every turn, not only when the relay is
+             * quiet. */
+        } else {
 
-        /* forward and rendezvous: a byte stream, which is what they are. */
+        /* forward and rendezvous: a byte stream, which is what they are.
+         *
+         * ⛔ AND THIS IS AN `else`, NOT A SEPARATE BLOCK, BECAUSE FALLING
+         * THROUGH IS THE BUG THIS COMMENT EXISTS TO PREVENT. The reverse
+         * branch used to end in `continue`, which skipped the yield; removing
+         * that to fix the busy loop made the reverse link FALL THROUGH into
+         * this branch, and this branch calls ws_read -- a BLOCKING read -- on
+         * the very session the reverse branch was draining with ws_poll_frame.
+         *
+         * The observable result was a session that opened, exchanged the
+         * banner, and then went silent with the node reporting "relay connection
+         * ended: closed". One reader per socket was a rule this file enforced by
+         * structure, and the structure was two readers on one session.
+         *
+         * So: the reverse link is an `if`, and this is its `else`. Exactly one
+         * of the two read paths runs on a session, ever. */
         for (;;) {
             unsigned char buf[32768];
             int closed = 0;
@@ -399,20 +551,7 @@ int dropssh_connect(dropssh_opts *o) {
                 goto done;
             }
         }
-
-                /* ⛔ IF THE OPERATOR IS STILL WAITING FOR `ready` AFTER THE RELAY'S OWN
-         * OPEN TIMEOUT, SAY SO, BECAUSE THE CLOSE THAT FOLLOWS NAMES A
-         * DIFFERENT THING. The relay closes an unanswered `open` with "node
-         * open timeout" after about ten seconds (measured). Without this the
-         * operator sits silent and then reports that close, which names the
-         * NODE's silence rather than its own wait. */
-        if (gated && !seen_ready) {
-            waited_ready += 20;
-            if (waited_ready == 10000) {
-                logf("still waiting for the node to answer `ready` after 10s; "
-                     "the relay closes an unanswered open at about that point");
-            }
-        }
+        }   /* end of the non-reverse (forward / rendezvous) branch */
 
         /* ⛔ A QUIET RELAY IS A 20 ms SLEEP, NOT A BUSY LOOP AND NOT A BLOCK.
          * An ssh session can be silent for minutes while somebody reads, and

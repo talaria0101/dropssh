@@ -162,7 +162,46 @@ typedef struct Client {
      * paths still send the close frame -- the operator is told why and its
      * socket is shut -- but only one frees. */
     int         ws_released;
+    /* ⛔ WHETHER THE NODE HAS ANSWERED `open` WITH `ready` FOR THIS SESSION.
+     * The ajam relay tears the pair down when the operator writes first:
+     * operator 1008 "wait for ready", node 1003 "unknown session id"
+     * (measured 2026-09-28). Our relay did not, so an operator that wrote
+     * early was forwarded to a node socket on which the id did not exist yet
+     * -- and the node's own reply, 1009 "bad multiplex frame", named the
+     * operator's mistake as the node's.
+     *
+     * ⛔ WHICH IS THE WORTHLESS VERSION OF THIS BUG. Every party reports
+     * something, none of it is the cause, and the one thing that could have
+     * said "you were early" said "your frame was malformed". The gate in
+     * `connect` is what avoids it, and a client that does not have the gate
+     * deserves to be told the truth rather than a symptom.
+     *
+     * This also fixes a race that existed only here: the node's `ready` is
+     * forwarded to the operator from the NODE's thread, and the operator's
+     * data is read in the OPERATOR's thread, so without a flag the two
+     * threads disagreed about whether the session existed. */
+    int         ready_seen;
+    /* ⛔ A REFERENCE COUNT, BECAUSE A POINTER OUT OF THE TABLE IS NOT A
+     * REFERENCE TO THE OBJECT.
+     *
+     * The table lock makes it safe to LOOK a client up; it says nothing about
+     * whether the client is still alive when the lock is dropped. Every path
+     * that takes a pointer out of `ns->clients` and then does something that
+     * can block -- a socket write -- must hold a reference across the gap, or
+     * the operator's own thread can free it and the write lands in freed
+     * memory.
+     *
+     * This is not hypothetical in this file: holding the table lock across the
+     * write instead deadlocked the relay, and dropping the lock without a
+     * reference reintroduces the use-after-free. A refcount is the third
+     * option and the only one that is correct for both.
+     *
+     * `refs` is guarded by `tlock`. The last unref frees, and it does so
+     * outside the lock so a free cannot run under it. */
+    int         refs;
 } Client;
+
+
 
 static void client_release(Client *c, int code, const char *reason) {
     if (c->ws_released) {
@@ -199,6 +238,26 @@ typedef struct NameSlot {
 
 static NameSlot table[RELAY_MAX_NAMES];
 static pthread_mutex_t tlock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ⛔ A REFERENCE IS DROPPED HERE, OUTSIDE ANY LOCK THE CALLER HOLDS, AND THE
+ * FREE HAPPENS ONLY IF IT WAS THE LAST ONE.
+ *
+ * The count is guarded by `tlock` and the free is not under it, because a free
+ * that runs while another thread is taking `tlock` to look something up turns
+ * a use-after-free into a lock-order inversion, and a lock-order inversion is
+ * much harder to read than the bug it replaced. Every path that takes a Client
+ * out of the table and then does something that can block holds a reference
+ * across the gap, and comes back here.
+ */
+static void client_unref(Client *c) {
+    int last;
+    pthread_mutex_lock(&tlock);
+    last = (--c->refs <= 0);
+    pthread_mutex_unlock(&tlock);
+    if (last) {
+        free(c);
+    }
+}
 static const char *only_name = NULL;
 
 /* ⛔ THE LIMITS ARE POLICY NUMBERS, NAMED, AND ENFORCED AT ACCEPT TIME. B9 was
@@ -307,6 +366,95 @@ static void client_thread(Client *c) {
         if (n == 0) {
             continue;
         }
+        /* ⛔ DATA BEFORE `ready` IS REFUSED, AND BOTH ENDS ARE TOLD WHY. The
+         * operator is closed 1008 "wait for ready" -- the same code and the
+         * same reason the ajam relay uses, measured 2026-09-28 -- and the node
+         * is closed 1003 "unknown session id", because from the node's side
+         * that is exactly what arrived: a frame for a session that does not
+         * exist.
+         *
+         * The check and the read of the flag are under the table lock, which
+         * is the same lock the node's thread takes when it sets the flag, so
+         * the two threads cannot disagree. Checking without it would be a race
+         * with a window of exactly the size of the `ready` round trip, which is
+         * the thing being protected. */
+        {
+            int early;
+            pthread_mutex_lock(&tlock);
+            early = !c->ready_seen;
+            pthread_mutex_unlock(&tlock);
+            if (early) {
+                logf("an operator for %s sent session data before the node "
+                     "answered `ready`", c->id);
+                client_release(c, 1008, "wait for ready");
+                NameSlot *ens;
+                WsSession *ews;
+                pthread_mutex_lock(&tlock);
+                ens = slot_locked(c->name, 0);
+                ews = ens ? ens->node : NULL;
+                pthread_mutex_unlock(&tlock);
+                if (ews) {
+                    /* ⛔ THE NODE IS *TOLD*, NOT CLOSED, AND THAT IS THE WHOLE
+                     * POINT.
+                     *
+                     * The first version called ws_close_with on the node's
+                     * session here. That is a double free waiting to happen and
+                     * it is not a maybe: the node's own thread holds the same
+                     * WsSession and closes it in its own `node_done`, and this
+                     * is a second WsSession's worth of buffers freed by two
+                     * paths. Measured on the first run after it was written:
+                     *
+                     *     free(): double free detected in tcache 2
+                     *     Aborted   (the relay)
+                     *     Bus error (the node)
+                     *
+                     * ⛔ AND IT WOULD HAVE TAKEN THE RELAY DOWN, not just the
+                     * node, which is the failure mode this file has now produced
+                     * twice. The node's socket is written to, with a close
+                     * frame, under its write lock -- and the node's thread then
+                     * finishes on its own and closes the same session. Nothing
+                     * about closing another thread's session is safe, and the
+                     * flag that makes it safe for an OPERATOR (`ws_released`)
+                     * does not exist on the node's side because the node's
+                     * session is owned by exactly one thread: the node's.
+                     *
+                     * So the node is sent a close FRAME and nothing else. Its
+                     * thread sees it, ends its own loop, and closes its own
+                     * session -- which is the only place that must happen. A
+                     * `close` control message is also forwarded to every other
+                     * operator attached to that node, because one operator
+                     * arriving early says nothing about the others. */
+                    pthread_mutex_lock(&tlock);
+                    ens = slot_locked(c->name, 0);
+                    WsSession *lock_ws = ens ? ens->node : NULL;
+                    if (ens) {
+                        pthread_mutex_lock(&ens->wlock);
+                    }
+                    pthread_mutex_unlock(&tlock);
+                    if (lock_ws && ens) {
+                        char close_msg[96];
+                        snprintf(close_msg, sizeof close_msg,
+                                 "{\"type\":\"close\",\"id\":\"%s\"}", c->id);
+                        ws_write_text(lock_ws,
+                                      (const unsigned char *)close_msg,
+                                      strlen(close_msg));
+                        /* And the other operators on this node, because the
+                         * node is going away from under all of them. */
+                        for (Client *o = ens->clients; o; o = o->next) {
+                            if (o != c) {
+                                char m2[96];
+                                snprintf(m2, sizeof m2,
+                                         "{\"type\":\"close\",\"id\":\"%s\"}", o->id);
+                                ws_write_text(&o->ws,
+                                              (const unsigned char *)m2, strlen(m2));
+                            }
+                        }
+                        pthread_mutex_unlock(&ens->wlock);
+                    }
+                }
+                break;
+            }
+        }
         /* ⛔ THE ID IS PREPENDED HERE AND ONLY HERE, in the SAME FRAME. The
          * node receives id+payload. If this were two frames the node would
          * read the id as session bytes. */
@@ -410,40 +558,91 @@ static void node_thread(NodeCtx *nc) {
                  * the operator is waiting for, and forwarding it as a binary
                  * frame would hand 40 bytes of JSON to ssh. The operator waits
                  * on it, so dropping it hangs the session with no error. */
-                pthread_mutex_lock(&tlock);
-                NameSlot *ns = slot_locked(name, 0);
+                /* ⛔ THE TABLE LOCK IS *NOT* HELD ACROSS THE WRITE, AND THAT IS A
+                 * DEADLOCK FIX RATHER THAN A STYLE CHOICE.
+                 *
+                 * The first version held `tlock` while writing `ready` to the
+                 * operator's socket, on the reasoning that the pointer must stay
+                 * valid. It does not: `ws_write` can block for up to 30 seconds
+                 * on a full socket buffer (sock_write's POLLOUT wait), and while
+                 * it does, the operator's own connection thread cannot take
+                 * `tlock` to publish itself -- so `ready` waited for a client
+                 * that was waiting for the lock, and the session hung until the
+                 * client's own bound fired.
+                 *
+                 * ⛔ THE SYMPTOM NAMED THE WRONG THING, WHICH IS WHY IT SURVIVED.
+                 * The operator reported "the node never answered `ready`", which
+                 * is exactly what a node that is silent looks like, and the node
+                 * reported "operator opened session (ready sent)", which is
+                 * exactly what a node that answered looks like. Both logs were
+                 * correct. Nothing said "a lock was held across a socket write",
+                 * because nothing in the protocol knows about locks.
+                 *
+                 * So the pointer is made safe rather than kept safe: the
+                 * session is REFCED under the lock and the write happens
+                 * outside it. `ready_seen` is still set BEFORE the write, for
+                 * the separate reason that an operator must not see a `ready`
+                 * that does not correspond to a session it may use -- and that
+                 * ordering needs no lock at all, because the operator's thread
+                 * only learns the flag exists by reading the frame. */
                 Client *target = NULL;
-                if (ns) {
-                    for (Client *c = ns->clients; c; c = c->next) {
-                        if (id[0] && strcmp(c->id, id) == 0) {
-                            target = c;
-                            break;
+                pthread_mutex_lock(&tlock);
+                {
+                    NameSlot *ns = slot_locked(name, 0);
+                    if (ns) {
+                        for (Client *c = ns->clients; c; c = c->next) {
+                            if (id[0] && strcmp(c->id, id) == 0) {
+                                /* Authorise BEFORE the byte goes out, so an
+                                 * operator that can see the `ready` can also
+                                 * send. The write is outside the lock, and
+                                 * this assignment is not: the operator's thread
+                                 * cannot observe the frame until the write
+                                 * below has returned, and the write cannot
+                                 * begin until the lock is released. */
+                                if (strcmp(verb, "ready") == 0) {
+                                    c->ready_seen = 1;
+                                }
+                                c->refs++;
+                                target = c;
+                                break;
+                            }
                         }
                     }
-                }
-                if (target) {
-                    ws_write_text(&target->ws, (const unsigned char *)json, n);
                 }
                 pthread_mutex_unlock(&tlock);
+                if (target) {
+                    ws_write_text(&target->ws, (const unsigned char *)json, n);
+                    client_unref(target);
+                }
             } else if (strcmp(verb, "close") == 0) {
-                pthread_mutex_lock(&tlock);
-                NameSlot *ns = slot_locked(name, 0);
+                /* Same rule as `ready` and the data path: a REFERENCE, not the
+                 * table lock, across writes that can block. `ws_close_with`
+                 * frees the session's buffers, so this path can free memory
+                 * another thread is reading -- which is what client_release's
+                 * `ws_released` flag exists for, and why a reference is taken
+                 * here too. */
                 Client *target = NULL;
-                if (ns) {
-                    for (Client *c = ns->clients; c; c = c->next) {
-                        if (id[0] && strcmp(c->id, id) == 0) {
-                            target = c;
-                            break;
+                pthread_mutex_lock(&tlock);
+                {
+                    NameSlot *ns = slot_locked(name, 0);
+                    if (ns) {
+                        for (Client *c = ns->clients; c; c = c->next) {
+                            if (id[0] && strcmp(c->id, id) == 0) {
+                                c->refs++;
+                                target = c;
+                                break;
+                            }
                         }
                     }
                 }
+                pthread_mutex_unlock(&tlock);
                 if (target) {
                     char msg[96];
                     snprintf(msg, sizeof msg, "{\"type\":\"close\",\"id\":\"%s\"}", id);
                     ws_write_text(&target->ws, (const unsigned char *)msg, strlen(msg));
-                    ws_close_with(&target->ws, 1000, "session closed");
+                    client_release(target, 1000, "session closed");
+                    client_unref(target);
                 }
-                pthread_mutex_unlock(&tlock);
             } else if (strcmp(verb, "bye") == 0) {
                 break;
             } else {
@@ -491,41 +690,80 @@ static void node_thread(NodeCtx *nc) {
         /* ⛔ THE ID IS STRIPPED HERE AND ONLY HERE, in the SAME FRAME. The
          * operator receives BARE bytes. Forwarding the id would put 32 hex
          * characters in front of every ssh packet, which is B3. */
-        pthread_mutex_lock(&tlock);
-        NameSlot *ns = slot_locked(name, 0);
+        /* ⛔ SAME RULE AGAIN: A REFERENCE ACROSS A BLOCKING WRITE, NOT THE
+         * TABLE LOCK. `ws_write` to a slow operator can sit in a 30s POLLOUT
+         * wait, and holding `tlock` through that stops the operator's own
+         * thread from ever finishing -- the deadlock above, on the data path,
+         * where it would have shown up as an ssh that hung under load rather
+         * than on every run. */
         Client *target = NULL;
-        if (ns) {
-            for (Client *c = ns->clients; c; c = c->next) {
-                if (strcmp(c->id, sid) == 0) {
-                    target = c;
-                    break;
+        pthread_mutex_lock(&tlock);
+        {
+            NameSlot *ns = slot_locked(name, 0);
+            if (ns) {
+                for (Client *c = ns->clients; c; c = c->next) {
+                    if (strcmp(c->id, sid) == 0) {
+                        c->refs++;
+                        target = c;
+                        break;
+                    }
                 }
             }
         }
+        pthread_mutex_unlock(&tlock);
         if (target) {
             /* The operator's advertised frame size, not the node's. */
             size_t payload = n - RELAY_ID_LEN;
-                        ws_write(&target->ws, frame.p + RELAY_ID_LEN, payload);
+            ws_write(&target->ws, frame.p + RELAY_ID_LEN, payload);
             stat_bytes_in += payload;
-        } else {
-                    }
-        pthread_mutex_unlock(&tlock);
+            client_unref(target);
+        }
     }
 node_done:
     buf_free(&frame);
-    /* Tell every attached operator the node is gone, by name. */
-    pthread_mutex_lock(&tlock);
+    /* ⛔ THE 1011 SWEEP TAKES A REFERENCE PER OPERATOR, AND THE CLOSE HAPPENS
+     * OUTSIDE THE TABLE LOCK.
+     *
+     * The first version did both inside: it took `tlock`, walked
+     * `ns->clients`, and called `client_release` on each -- which FREES that
+     * operator's websocket buffers -- while an operator's own thread could be
+     * in `client_cleanup` dropping its reference and freeing the Client. Two
+     * threads, one allocation, and the relay died with
+     *
+     *     free(): double free detected in tcache 2
+     *     Aborted   (the relay process)
+     *     Bus error (the node process)
+     *
+     * ⛔ AND IT TOOK DOWN EVERY SESSION ON THE RELAY, not one, which is the
+     * failure mode this file has now produced twice and which is the reason the
+     * rule is written out rather than left to the next edit.
+     *
+     * The rule: a pointer found in a table is not a reference to the object.
+     * Take one under the lock, do the work outside it, drop it. `ws_close_with`
+     * can block for 30 seconds on a full socket, so holding `tlock` across it
+     * is both unsafe and a deadlock. */
     {
-        NameSlot *ns = slot_locked(name, 0);
-        if (ns) {
-            for (Client *c = ns->clients; c; c = c->next) {
-                client_release(c, 1011, "node disconnected");
+        Client *doomed[RELAY_MAX_SESSIONS];
+        int ndoomed = 0;
+        pthread_mutex_lock(&tlock);
+        {
+            NameSlot *ns = slot_locked(name, 0);
+            if (ns) {
+                for (Client *c = ns->clients; c && ndoomed < RELAY_MAX_SESSIONS;
+                     c = c->next) {
+                    c->refs++;
+                    doomed[ndoomed++] = c;
+                }
+                ns->node = NULL;
+                ns->node_dead = 1;
             }
-            ns->node = NULL;
-            ns->node_dead = 1;
+        }
+        pthread_mutex_unlock(&tlock);
+        for (int i = 0; i < ndoomed; i++) {
+            client_release(doomed[i], 1011, "node disconnected");
+            client_unref(doomed[i]);
         }
     }
-    pthread_mutex_unlock(&tlock);
     ws_close(ws);
 }
 
@@ -670,7 +908,14 @@ static void *conn_thread(void *arg) {
             ws_close(&ws);
             return NULL;
         }
-        memcpy(&nc->ws, &ws, sizeof ws);
+        /* Moved, not copied, for the same reason as the operator's session
+         * below: a struct copy shares its buffer POINTERS, so the stack `ws`
+         * and `nc->ws` would own the same allocations and the first close
+         * would free memory the other still points at. The node's session is
+         * closed by exactly one thread -- its own -- and zeroing the stack copy
+         * makes every other `ws_close(&ws)` on this path a no-op. */
+        nc->ws = ws;
+        memset(&ws, 0, sizeof ws);
         nc->fd = fd;
         snprintf(nc->name, sizeof nc->name, "%s", name);
         e->node = &nc->ws;
@@ -732,7 +977,53 @@ static void *conn_thread(void *arg) {
         return NULL;
     }
     c->fd = fd;
-    memcpy(&c->ws, &ws, sizeof ws);
+    /* The table's own reference, dropped in client_cleanup. */
+    c->refs = 1;
+    /* ⛔ THE SESSION IS MOVED, NOT COPIED, AND THAT IS THE THIRD VERSION OF
+     * THIS LINE.
+     *
+     * The first version did `memcpy(&c->ws, &ws, sizeof ws)`, which copies the
+     * struct -- and the struct's buffers are POINTERS. So the stack `ws` and
+     * `c->ws` then own the same four allocations, and closing either one frees
+     * memory the other still points at. Every refusal path further down this
+     * function closes the stack `ws`, the session is also closed by the node's
+     * 1011 sweep or by client_thread, and the relay dies with
+     *
+     *     free(): double free detected in tcache 2
+     *
+     * ⛔ WHICH IS THE THIRD DOUBLE FREE THIS FILE HAS PRODUCED AND THE THIRD
+     * TIME THE SYMPTOM NAMED SOMETHING ELSE. The first was two threads closing
+     * one session; the second was freeing a Client out from under a thread
+     * walking the list; this one is an ALIASED OWNER. All three are the same
+     * mistake -- two names for an object read as two objects -- and all three
+     * took the whole relay down rather than one session, which is why the rule
+     * is written out here.
+     *
+     * The move is by hand rather than `*c->ws = ws` because that is a copy and
+     * a copy is what is being removed. The stack `ws` is zeroed afterwards, so
+     * every `ws_close(&ws)` on the refusal paths below is a no-op on an
+     * already-moved session rather than a second free.
+     *
+     * ⛔ AND WHY THE MOVE IS DEFENCE IN DEPTH RATHER THAN A FIX FOR AN OBSERVED
+     * CRASH, WHICH IS NOT THE CLAIM AN EARLIER DRAFT OF THIS COMMENT MADE.
+     * Reverting it to a `memcpy` and running `tests/mux-probe.py` 20 times
+     * produced no crash, and reading the function now shows why: on the
+     * operator's path every `ws_close(&ws)` -- the peer-cap, full, name, OOM,
+     * no-node and session-limit refusals -- is at or ABOVE this line, so no
+     * close of the stack copy runs after the Client owns the buffers. The two
+     * names never both close the same allocation on the current control flow.
+     *
+     * So the aliasing is not the cause of the `double free detected in tcache 2`
+     * that this line's comment originally claimed. That was the 1011 sweep
+     * closing an operator's session with no reference held, which is fixed and
+     * is a real fix. The move is kept because the property it establishes --
+     * one owner per session, established where the session is stored -- is the
+     * property every one of the three double frees in this file needed and none
+     * of them had, and because a future refusal added BELOW this line would
+     * reintroduce the aliasing silently. That is a change to make the next
+     * edit's failure mode loud, not a fix for a crash measured today. */
+    c->ws = ws;
+    memset(&ws, 0, sizeof ws);
     snprintf(c->name, sizeof c->name, "%s", name);
     random_id(c->id);
     c->next = e->clients;
@@ -782,6 +1073,27 @@ static void *conn_thread(void *arg) {
     client_thread(c);
 
 client_cleanup:
+    /* ⛔ THE TABLE'S REFERENCE IS DROPPED, AND THE FREE HAPPENS ONLY IF THAT WAS
+     * THE LAST ONE -- AND NOT UNDER THE LOCK.
+     *
+     * Three versions of this line have been wrong in three different ways, and
+     * each was found by running the relay rather than by reading it:
+     *
+     *   1. `free(c)` after the unlock. The client is out of the list but still
+     *      reachable by a thread walking it, and the node's 1011 sweep does
+     *      exactly that. Heap corruption, about 1 run in 20.
+     *   2. `free(c)` under the lock. Correct against that race, and wrong the
+     *      other way: a free under a lock another thread takes turns a
+     *      use-after-free into a lock-order inversion, and a Client another
+     *      thread holds a REFERENCE to is freed while it is being used.
+     *   3. this: decrement under the lock, free outside it, and only when the
+     *      count reaches zero. Both races are then covered by one mechanism
+     *      rather than by two rules that have to agree.
+     *
+     * The refcount is not a nicety here. Every path that takes a Client out of
+     * the table and then does something that can block -- and a socket write can
+     * block for 30 seconds -- holds a reference across the gap, and this is
+     * where the table's own reference goes. */
     pthread_mutex_lock(&tlock);
     ns = slot_locked(name, 0);
     if (ns) {
@@ -796,44 +1108,10 @@ client_cleanup:
         }
     }
     peer_count--;
-    /* ⛔ THE Client IS FREED *WHILE THE TABLE LOCK IS STILL HELD*, AND MOVING
-     * THIS FREE OUTSIDE THE LOCK IS WHAT CRASHED THE RELAY.
-     *
-     * The first version unlocked, logged, and only then called free(c). That
-     * leaves a window in which this operator is no longer in `ns->clients` but
-     * its memory is still allocated, and the node thread -- which is walking
-     * that same list to tell every attached operator 1011 "node disconnected"
-     * -- can be inside `client_release(c, ...)` on it while this thread frees
-     * it. The symptom is a heap corruption, not a clean failure:
-     *
-     *     corrupted size vs. prev_size in fastbins
-     *     double free or corruption (fasttop)
-     *
-     * and it took the WHOLE relay process down, so every other node and
-     * operator on it went with it. It reproduced about 1 run in 20, in the
-     * window between one case's node disconnecting and the next case's
-     * operator attaching -- which is the ordinary case of a node restarting
-     * while an operator is still connected.
-     *
-     * Two changes address this and the honest state of the evidence on them:
-     *
-     *   1. `ws_released` on Client, so the SESSION BUFFERS are freed once. Both
-     *      this thread and the node's thread close the same WsSession, and
-     *      ws_close frees its buffers. Measured: this is the change that takes
-     *      the crash rate to zero.
-     *   2. this free under the lock, so the Client STRUCT cannot be freed while
-     *      another thread is walking the list holding a pointer to it.
-     *
-     * ⛔ CHANGE 2 IS NOT YET SHOWN TO BE NECESSARY, AND IS HERE BECAUSE IT IS
-     * CORRECT BY INSPECTION, NOT BECAUSE IT WAS MEASURED. A build with change
-     * 1 and without change 2 was benchmarked and did not crash in 25 runs,
-     * while the pre-fix build crashed in 1 of 25 and 4 of 80. The crash is rare
-     * enough (~5%) that 25 runs cannot separate the two, so change 2 rests on
-     * the argument -- a freed struct reachable through a live list is a
-     * use-after-free whoever happens to be walking it -- and not on a
-     * measurement. It is recorded that way rather than presented as proven. */
-    free(c);
     pthread_mutex_unlock(&tlock);
+
+    client_unref(c);
+
     logf("operator for %s detached (peers %u)", name, peer_count);
     return NULL;
 }

@@ -596,7 +596,7 @@ static void *session_thread(void *arg) {
                 continue;
             }
             if (n == 0) {
-                                /* ⛔ THE SERVER HANGING UP IS ANNOUNCED WITH A `close` CONTROL
+                /* ⛔ THE SERVER HANGING UP IS ANNOUNCED WITH A `close` CONTROL
                  * MESSAGE AND NOTHING ELSE. The exec'd command has already
                  * written its output and the exit status is on the way;
                  * closing the websocket here would race that write and lose
@@ -697,13 +697,21 @@ static void on_control(Mux *m, const char *json) {
         return;
     }
     if (strcmp(verb, "close") == 0) {
+        /* ⛔ `found` IS COPIED OUT WHILE THE LOCK IS HELD AND THE POINTER IS
+         * NEVER TOUCHED AFTERWARDS. The first version did `if (s)` after
+         * unlocking, which re-reads a pointer the session's own thread may
+         * have freed in the window between the unlock and the test -- a
+         * use-after-free read that reads whatever the allocator has put there
+         * and branches on it. A boolean copied under the lock cannot be freed. */
+        int found;
         pthread_mutex_lock(&m->list_lock);
         MuxSession *s = mux_find(m, id);
+        found = (s != NULL);
         if (s) {
             s->stop = 1;
         }
         pthread_mutex_unlock(&m->list_lock);
-        if (s) {
+        if (found) {
             logf("operator closed session %.8s", id);
         }
         return;
@@ -739,6 +747,14 @@ static void on_control(Mux *m, const char *json) {
             }
         }
         pthread_mutex_unlock(&m->list_lock);
+        /* The count above is taken under the lock and the limit is compared
+         * after it, so two simultaneous `open`s can both see room for the
+         * last slot. The limit is a POLICY number rather than a hard
+         * invariant: the relay is the authority on its own maxSessions and a
+         * node that briefly exceeds its own count is refused by the relay,
+         * which is a far better outcome than serialising every `open` behind
+         * a global count. Recorded here so the next reader does not mistake it
+         * for an oversight. */
         if (n >= m->max_sessions) {
             char msg[256];
             snprintf(msg, sizeof msg,
@@ -849,30 +865,63 @@ static void on_data(Mux *m, const unsigned char *pl, size_t len) {
             return;
         }
     }
-        MuxSession *s = mux_find(m, id);
+
+    /* ⛔ THE LOOKUP AND EVERY USE OF THE RESULT ARE UNDER `list_lock`, AND THE
+     * LOCK IS NOT RELEASED IN BETWEEN. The first version called mux_find with
+     * no lock at all, took the session's own lock, and appended to its inbox --
+     * while the session's own thread could be at the end of its teardown,
+     * having already unlinked itself and be about to free() it. That is a
+     * use-after-free on the reader thread, and the window is every session
+     * teardown, which is every session.
+     *
+     * ⛔ IT WAS INVISIBLE BECAUSE NOTHING LOOKED FOR IT. Every test in the
+     * suite passed, because the sessions in the gate are short: the operator
+     * finishes, the reader has already delivered the last frame, and the
+     * teardown happens after the socket has nothing more to deliver. The
+     * window is a frame arriving in the same instant the session dies, which
+     * is what a real operator does when a command exits and it sends the
+     * channel close in the same breath as the last output.
+     *
+     * The rule, stated so a future edit does not have to rediscover it: a
+     * pointer found in a shared table is only valid while the lock that guards
+     * the table is held. `s->lock` protects the session's buffers; it does NOT
+     * keep the session itself alive, and taking it second is too late. */
+    int overflow = 0;
+    pthread_mutex_lock(&m->list_lock);
+    MuxSession *s = mux_find(m, id);
     if (s == NULL) {
         static unsigned long orphan = 0;
         if (++orphan % 64 == 1) {
             logf("data for an unknown session %.8s (total %lu); dropped", id, orphan);
         }
+        pthread_mutex_unlock(&m->list_lock);
         return;
     }
     /* Strip the id; the remainder is the session's ssh bytes. */
     pthread_mutex_lock(&s->lock);
     if (s->dead || s->server_done) {
         pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&m->list_lock);
         return;
     }
     int rc = buf_append(&s->inbox, pl + 32, len - 32);
     if (rc == 0) {
         s->bytes_down += (unsigned long long)(len - 32);
+    } else {
+        overflow = 1;
     }
-        pthread_mutex_unlock(&s->lock);
-    if (rc != 0) {
-        logf("session %.8s: inbox overflow; the operator is sending faster than the server reads", id);
-        pthread_mutex_lock(&s->lock);
-        s->stop = 1;
-        pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&m->list_lock);
+
+    if (overflow) {
+        logf("session %.8s: inbox overflow; the operator is sending faster than "
+             "the server reads", id);
+        pthread_mutex_lock(&m->list_lock);
+        MuxSession *again = mux_find(m, id);
+        if (again) {
+            again->stop = 1;
+        }
+        pthread_mutex_unlock(&m->list_lock);
     }
 }
 
