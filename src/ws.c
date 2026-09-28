@@ -5,6 +5,7 @@
 #include "ws.h"
 #include "tls.h"
 #include "util.h"
+#include <stdlib.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -137,6 +138,172 @@ int dropssh_mint_token(const char *base, const char *extra_headers,
     return 0;
 }
 
+/* ⛔ THE SCAN IS THE SAME BOUNDED SCAN relayproto.c USES, NOT strstr plus
+ * atoi, AND THE SAME LENGTH AND CHARACTER RULES APPLY. A relay that answers
+ *
+ *     {"name":"x","node_token":"<4 KiB of hex>","connect_token":"y"}
+ *
+ * must not be able to make this process allocate, and a value carrying a
+ * newline must not become a header. The scan is position-independent because
+ * the one in relayproto.c was not, and that version read "," for a value and
+ * reported a perfectly good hello as unparseable. */
+static int body_field(const char *body, const char *key, char *out, size_t outlen) {
+    out[0] = 0;
+    const char *k = strstr(body, key);
+    if (k == NULL) {
+        return -1;
+    }
+    k += strlen(key);
+    while (*k == ' ' || *k == '\t' || *k == '\n' || *k == '\r') {
+        k++;
+    }
+    if (*k != ':') {
+        return -1;
+    }
+    k++;
+    while (*k == ' ' || *k == '\t' || *k == '\n' || *k == '\r') {
+        k++;
+    }
+    if (*k != '"') {
+        return -1;
+    }
+    k++;
+    const char *e = k;
+    while (*e && *e != '"') {
+        if (*e == '\\' && e[1]) {
+            e += 2;
+            continue;
+        }
+        e++;
+    }
+    if (*e != '"') {
+        return -1;
+    }
+    size_t n = (size_t)(e - k);
+    if (n == 0 || n >= outlen) {
+        return -1;
+    }
+    memcpy(out, k, n);
+    out[n] = 0;
+    /* ⛔ A CREDENTIAL IS VALIDATED BEFORE IT IS USED, NOT AFTER. These become
+     * header values, and a newline in a header value is a second header. */
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)out[i];
+        if (c < 0x20 || c == 0x7f) {
+            memset(out, 0, outlen);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int dropssh_request_pair(const char *base, RelayPair *out, ws_status *st) {
+    if (out == NULL) {
+        st_set(st, WS_ERR_CONNECT, 0, "no output for the pair");
+        return -1;
+    }
+    memset(out, 0, sizeof *out);
+
+    char host[256] = "";
+    int port = 443;
+    const char *h = base;
+    if (strncmp(h, "https://", 8) == 0) {
+        h += 8;
+    }
+    size_t o = 0;
+    while (h[o] && h[o] != '/' && h[o] != ':' && o < sizeof host - 1) {
+        host[o] = h[o];
+        o++;
+    }
+    host[o] = 0;
+    if (h[o] == ':') {
+        port = atoi(h + o + 1);
+        if (port <= 0) {
+            port = 443;
+        }
+    }
+    char *body = NULL;
+    size_t len = 0;
+    char err[256] = "";
+    const char *ph = dropssh_proxy_host();
+    int pp = dropssh_proxy_port();
+    if (tls_post(host, port, "/v1/pair", "{}", 1, dropssh_insecure(),
+                 ph, pp, &body, &len, err, sizeof err) != 0) {
+        st_set(st, WS_ERR_CONNECT, 0, "%s", err);
+        return -1;
+    }
+    /* ⛔ ALL THREE OF name, node_token and connect_token ARE REQUIRED, AND A
+     * MISSING ONE IS AN ERROR RATHER THAN AN EMPTY STRING. A pair with an
+     * empty node_token is a cage that registers with no credential and an
+     * operator holding "" -- and the symptom is a 403 on one side and a
+     * working session on the other, which is the hardest version of this to
+     * diagnose. Refusing here says which field the relay did not send. */
+    if (body_field(body, "\"name\"", out->name, sizeof out->name) != 0) {
+        free(body);
+        st_set(st, WS_ERR_HTTP, 200, "the relay's pair answer had no name");
+        return -1;
+    }
+    if (body_field(body, "\"node_token\"", out->node_token,
+                   sizeof out->node_token) != 0) {
+        free(body);
+        st_set(st, WS_ERR_HTTP, 200,
+               "the relay's pair answer had no node_token, so a cage could not "
+               "register with it");
+        return -1;
+    }
+    if (body_field(body, "\"connect_token\"", out->connect_token,
+                   sizeof out->connect_token) != 0) {
+        memset(out->node_token, 0, sizeof out->node_token);
+        free(body);
+        st_set(st, WS_ERR_HTTP, 200,
+               "the relay's pair answer had no connect_token, so no operator "
+               "could reach the node with it");
+        return -1;
+    }
+    /* stop_token and expires are optional: a rendezvous relay that issues no
+     * revocable credential is still a working rendezvous. A missing one is
+     * zero, and a caller that prints it says "not issued". */
+    if (body_field(body, "\"stop_token\"", out->stop_token,
+                   sizeof out->stop_token) != 0) {
+        out->stop_token[0] = 0;
+    }
+    {
+        /* ⛔ `expires` IS A BARE NUMBER, NOT A QUOTED STRING, and the field
+         * scan above requires quotes because every credential is quoted. A
+         * quoted-only scan silently finds no expires and the pair prints
+         * without a lifetime, which reads as "this never expires" and is the
+         * opposite of true. So this one field is read as an unquoted value,
+         * with the same bound and the same digit-only rule. */
+        const char *e = strstr(body, "\"expires\"");
+        if (e != NULL) {
+            e = strchr(e, ':');
+            if (e != NULL) {
+                e++;
+                while (*e == ' ' || *e == '\t') {
+                    e++;
+                }
+                char digits[24];
+                size_t n = 0;
+                while (e[n] >= '0' && e[n] <= '9' && n < sizeof digits - 1) {
+                    digits[n] = e[n];
+                    n++;
+                }
+                digits[n] = 0;
+                if (n > 0) {
+                    out->expires_ms = strtoll(digits, NULL, 10);
+                }
+            }
+        }
+    }
+    free(body);
+    if (st) {
+        st->err = WS_OK;
+        st->status = 200;
+        st->detail[0] = 0;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------- handshakes */
 static int check_accept(const char *headers, const char *key, char *err,
                         size_t errlen) {
@@ -175,9 +342,12 @@ int ws_client(Transport *t, const char *host_header, const char *path,
     ws->t = t;
     ws->is_client = 1;
     ws->keepalive_ms = WS_KEEPALIVE_DEFAULT_MS;
+    ws->fq_cap = WS_DEFAULT_QUEUE_BYTES;
+    ws->max_frame = WS_HELLO_DEFAULT_FRAME;
+    ws->max_sessions = WS_HELLO_DEFAULT_SESSIONS;
     buf_init(&ws->rbuf);
-    buf_init(&ws->pending);
     buf_init(&ws->frag);
+    buf_init(&ws->spill);
 
     char key[64];
     dropssh_random_b64(key, sizeof key, 16);
@@ -300,6 +470,61 @@ int ws_client(Transport *t, const char *host_header, const char *path,
 
     int status = http_status(headers);
     if (status != 101) {
+        /* ⛔ THE REFUSAL BODY IS READ, AND IT IS READ AFTER THE STATUS IS
+         * KNOWN. A client that stops at the header break has the number and
+         * not the sentence, and every non-101 from this relay family carries a
+         * sentence that says which of several different problems it is. The
+         * wait is short and bounded: the relay writes the whole refusal in
+         * one write, so the body is already in flight, and a body that never
+         * arrives must not turn a refusal into a hang. */
+        size_t want = 0;
+        const char *cl = strstr(headers, "Content-Length:");
+        if (cl != NULL) {
+            want = (size_t)atol(cl + 15);
+            if (want > 512) {
+                want = 512;
+            }
+        }
+        unsigned bstart = now_ms();
+        while (ws->rbuf.len < want && now_ms() - bstart < 1500) {
+            unsigned char tmp[1024];
+            size_t got = 0;
+            int eof = 0;
+            if (t->read(t, tmp, sizeof tmp, &got, &eof) != 0) {
+                break;
+            }
+            if (got) {
+                buf_append(&ws->rbuf, tmp, got);
+                continue;
+            }
+            if (eof) {
+                break;
+            }
+            dropssh_sleep_ms(20);
+        }
+        /* Whatever arrived after the header break is the body. */
+        size_t bl = ws->rbuf.len;
+        if (bl > 200) {
+            bl = 200;
+        }
+        for (size_t i = 0; i < bl; i++) {
+            if (ws->rbuf.p[i] == '\r' || ws->rbuf.p[i] == '\n') {
+                ws->rbuf.p[i] = ' ';
+            } else if (ws->rbuf.p[i] < 0x20 || ws->rbuf.p[i] == 0x7f) {
+                ws->rbuf.p[i] = '.';
+            }
+        }
+        while (bl > 0 && ws->rbuf.p[bl - 1] == ' ') {
+            bl--;
+        }
+        if (bl > 0) {
+            st->detail[0] = 0;
+            snprintf(st->detail, sizeof st->detail, "%.*s", (int)bl,
+                     (const char *)ws->rbuf.p);
+        }
+        buf_reset(&ws->rbuf);
+    }
+    if (status != 101) {
         /* ⛔ THE RELAY'S OWN STATUS LINE IS PASSED THROUGH, AND 403 AND 502
          * ARE CALLED OUT BY NAME. A 403 means the token is absent or wrong and
          * a 502 means the target would not answer, and those two need opposite
@@ -313,6 +538,29 @@ int ws_client(Transport *t, const char *host_header, const char *path,
             why = ": the relay could not reach the target";
         } else if (status == 401) {
             why = ": the relay wants a credential this client did not send";
+        } else if (status == 503 || status == 409) {
+            /* ⛔ 503 AND 409 ARE PASSED THROUGH WITH THE RELAY'S OWN SENTENCE,
+             * because they have different causes that ask opposite things of
+             * the operator. 503 from a rendezvous is "the node is not
+             * connected" (start it, or wait for it to dial in); 503 from a full
+             * relay is "come back later"; 409 is "that name is taken". The
+             * relay's refusal text was captured just above, so the message
+             * says which one it is instead of collapsing all three into
+             * "refused" and sending the operator to the wrong place. */
+            if (st->detail[0]) {
+                /* ⛔ THE RELAY'S SENTENCE IS COPIED BEFORE st_set FORMATS IT.
+                 * st_set writes the formatted result into the same buffer the
+                 * %s argument points at, which is a read and a write of one
+                 * object with no order between them, and the sentence came out
+                 * empty. The copy is what makes the message say which of the
+                 * several 503 causes this is. */
+                char why_copy[256];
+                snprintf(why_copy, sizeof why_copy, "%s", st->detail);
+                st_set(st, WS_ERR_HTTP, status, "relay refused the upgrade with "
+                       "HTTP %d: %s", status, why_copy);
+                free(headers);
+                return -1;
+            }
         }
         st_set(st, WS_ERR_HTTP, status, "relay refused the upgrade with HTTP %d%s",
                status, why);
@@ -334,15 +582,18 @@ int ws_client(Transport *t, const char *host_header, const char *path,
     return 0;
 }
 
-int ws_server(Transport *t, WsSession *ws, char *request_path,
-              size_t pathlen, ws_status *st) {
+int ws_server_peek(Transport *t, WsSession *ws, char *request_path,
+                   size_t pathlen, ws_status *st) {
     memset(ws, 0, sizeof *ws);
     ws->t = t;
     ws->is_client = 0;
     ws->keepalive_ms = WS_KEEPALIVE_DEFAULT_MS;
+    ws->fq_cap = WS_DEFAULT_QUEUE_BYTES;
+    ws->max_frame = WS_HELLO_DEFAULT_FRAME;
+    ws->max_sessions = WS_HELLO_DEFAULT_SESSIONS;
     buf_init(&ws->rbuf);
-    buf_init(&ws->pending);
     buf_init(&ws->frag);
+    buf_init(&ws->spill);
 
     unsigned start = now_ms(), waited = 0;
     while (ws->rbuf.len < 1 || memmem(ws->rbuf.p, ws->rbuf.len, "\r\n\r\n", 4) == NULL) {
@@ -430,23 +681,12 @@ int ws_server(Transport *t, WsSession *ws, char *request_path,
     }
     key[ki] = 0;
 
-    char accept[64];
-    dropssh_ws_accept(key, accept, sizeof accept);
-    char resp[256];
-    int rn = snprintf(resp, sizeof resp,
-                      "HTTP/1.1 101 Switching Protocols\r\n"
-                      "Upgrade: websocket\r\n"
-                      "Connection: Upgrade\r\n"
-                      "Sec-WebSocket-Accept: %s\r\n\r\n", accept);
+    /* ⛔ THE 101 IS NOT SENT HERE. See ws.h: a relay has to be able to answer
+     * 503 on the upgrade when the node is not connected, and by this point the
+     * request target is known but nothing has been written. ws_server_accept
+     * sends it once the caller has decided. */
+    snprintf(ws->pending_accept_key, sizeof ws->pending_accept_key, "%s", key);
     free(headers);
-    if (rn < 0 || (size_t)rn >= sizeof resp) {
-        st_set(st, WS_ERR_CONNECT, 0, "the 101 response is too long to build");
-        return -1;
-    }
-    if (t->write(t, resp, (size_t)rn) != 0) {
-        st_set(st, WS_ERR_CONNECT, 0, "could not write the 101 response");
-        return -1;
-    }
 
     /* anything after the header block is already-framed bytes */
     size_t rest = ws->rbuf.len - hlen;
@@ -468,6 +708,39 @@ int ws_server(Transport *t, WsSession *ws, char *request_path,
         st->detail[0] = 0;
     }
     return 0;
+}
+
+int ws_server_accept(WsSession *ws, ws_status *st) {
+    char accept[64];
+    dropssh_ws_accept(ws->pending_accept_key, accept, sizeof accept);
+    char resp[256];
+    int rn = snprintf(resp, sizeof resp,
+                      "HTTP/1.1 101 Switching Protocols\r\n"
+                      "Upgrade: websocket\r\n"
+                      "Connection: Upgrade\r\n"
+                      "Sec-WebSocket-Accept: %s\r\n\r\n", accept);
+    if (rn < 0 || (size_t)rn >= sizeof resp) {
+        st_set(st, WS_ERR_CONNECT, 0, "the 101 response is too long to build");
+        return -1;
+    }
+    if (ws->t == NULL || ws->t->write(ws->t, resp, (size_t)rn) != 0) {
+        st_set(st, WS_ERR_CONNECT, 0, "could not write the 101 response");
+        return -1;
+    }
+    ws->pending_accept_key[0] = 0;
+    if (st) {
+        st->err = WS_OK;
+        st->detail[0] = 0;
+    }
+    return 0;
+}
+
+int ws_server(Transport *t, WsSession *ws, char *request_path,
+              size_t pathlen, ws_status *st) {
+    if (ws_server_peek(t, ws, request_path, pathlen, st) != 0) {
+        return -1;
+    }
+    return ws_server_accept(ws, st);
 }
 
 /* ----------------------------------------------------------------- framing */
@@ -529,12 +802,18 @@ int ws_write(WsSession *ws, const unsigned char *buf, size_t len) {
         return -1;
     }
     size_t off = 0;
-    /* ⛔ ONE FRAME PER WRITE, UP TO 64 KiB, NOT ONE FRAME FOR THE WHOLE
-     * STREAM. The relay documents a 64 KiB session cap on frame size and
-     * drops oversized frames, and a 40 MiB scp is one write at the syscall
-     * level. Chunking here means a large transfer is a series of legal
-     * frames instead of one that the far end refuses. */
-    const size_t CHUNK = 65536;
+    /* ⛔ ONE FRAME PER WRITE, UP TO min(64 KiB, the relay's maxFrameBytes), NOT
+     * ONE FRAME FOR THE WHOLE STREAM. The relay states maxFrameBytes: 65536 in
+     * its hello and drops oversized frames, and a 40 MiB scp is one write at
+     * the syscall level. The limit is read from the hello rather than
+     * hardcoded, so a relay that advertises less gets obeyed. */
+    size_t CHUNK = ws->max_frame ? ws->max_frame : WS_HELLO_DEFAULT_FRAME;
+    if (CHUNK > WS_MAX_FRAME) {
+        CHUNK = WS_MAX_FRAME;
+    }
+    if (CHUNK == 0) {
+        CHUNK = WS_HELLO_DEFAULT_FRAME;
+    }
     while (off < len) {
         size_t n = len - off;
         if (n > CHUNK) {
@@ -548,6 +827,13 @@ int ws_write(WsSession *ws, const unsigned char *buf, size_t len) {
     return 0;
 }
 
+int ws_write_text(WsSession *ws, const unsigned char *buf, size_t len) {
+    if (ws->closed) {
+        return -1;
+    }
+    return send_frame(ws, 0x1, buf, len);
+}
+
 /* A half-close: tell the peer this side is done sending, and leave the
  * session readable. Used when the ssh server has exited and its output is on
  * the wire, so the far end sees the end of the stream rather than a cut. */
@@ -558,6 +844,12 @@ void ws_shutdown_tx(WsSession *ws) {
     send_frame(ws, 0x8, NULL, 0);
     ws->close_sent = 1;
 }
+
+/* -------------------------------------------------- forward declarations --
+ * The frame queue and the byte stream are defined below ws_close, which frees
+ * the queue, so the two names it uses are declared first rather than the close
+ * path being moved. */
+static void ws_free_frames(WsSession *ws);
 
 void ws_close(WsSession *ws) {
     if (ws == NULL) {
@@ -571,9 +863,32 @@ void ws_close(WsSession *ws) {
         ws->t->close(ws->t);
         ws->t = NULL;
     }
+    ws_free_frames(ws);
     buf_free(&ws->rbuf);
-    buf_free(&ws->pending);
     buf_free(&ws->frag);
+    buf_free(&ws->spill);
+}
+
+void ws_close_with(WsSession *ws, int code, const char *reason) {
+    if (ws == NULL || ws->t == NULL || ws->close_sent) {
+        ws_close(ws);
+        return;
+    }
+    /* RFC 6455 close payload: 2-byte big-endian code, then the reason, and the
+     * whole control frame must be 125 bytes or fewer. */
+    unsigned char pl[123];
+    size_t rl = reason ? strlen(reason) : 0;
+    if (rl > sizeof pl - 2) {
+        rl = sizeof pl - 2;
+    }
+    pl[0] = (unsigned char)(code >> 8);
+    pl[1] = (unsigned char)(code & 0xff);
+    if (rl) {
+        memcpy(pl + 2, reason, rl);
+    }
+    send_frame(ws, 8, pl, rl + 2);
+    ws->close_sent = 1;
+    ws_close(ws);
 }
 
 static int read_more(WsSession *ws, int *eof) {
@@ -592,9 +907,100 @@ static int read_more(WsSession *ws, int *eof) {
     }
     return 0;
 }
+/* ------------------------------------------------------------------ the
+ * frame queue. Every layer that needs message boundaries reads from here, and
+ * ws_read, the byte-stream path, is defined on top of it. There is ONE
+ * decoder in this file: the byte-stream reader used to have its own, and two
+ * decoders over one buffer is how two of them came to disagree about what had
+ * been consumed.
+ */
+static void ws_free_frames(WsSession *ws) {
+    WsFrame *f = ws->fq_head;
+    while (f) {
+        WsFrame *n = f->next;
+        free(f);
+        f = n;
+    }
+    ws->fq_head = NULL;
+    ws->fq_tail = NULL;
+    ws->fq_count = 0;
+    ws->fq_bytes = 0;
+}
 
-/* Decode as many frames as the buffer holds. Returns 0, or -1 with ws->closed
- * set for a Close frame, or -1 with ws->rbuf poisoned on malformed framing. */
+void ws_set_queue_cap(WsSession *ws, size_t bytes) {
+    ws->fq_cap = bytes ? bytes : WS_DEFAULT_QUEUE_BYTES;
+}
+
+int ws_set_limits(WsSession *ws, unsigned max_frame, unsigned max_sessions) {
+    /* ⛔ THE RELAY'S LIMITS ARE FLOORED, NOT TAKEN VERBATIM. A hello naming
+     * maxFrameBytes: 0 or maxSessions: 0 is a relay saying nothing useful,
+     * and obeying it literally would mean this node refuses to open a session
+     * and refuses to send a byte. The default is used instead, and a limit
+     * below the default is honoured because a relay may legitimately cap
+     * lower. */
+    ws->max_frame = max_frame ? max_frame : WS_HELLO_DEFAULT_FRAME;
+    if (ws->max_frame > WS_MAX_FRAME) {
+        ws->max_frame = WS_HELLO_DEFAULT_FRAME;
+    }
+    ws->max_sessions = max_sessions ? max_sessions : WS_HELLO_DEFAULT_SESSIONS;
+    return 0;
+}
+
+unsigned ws_max_frame(const WsSession *ws)    { return ws->max_frame; }
+unsigned ws_max_sessions(const WsSession *ws) { return ws->max_sessions; }
+int  ws_close_code(const WsSession *ws)       { return ws->close_code; }
+const char *ws_close_reason(const WsSession *ws) { return ws->close_reason; }
+
+/* Queue one decoded message. Returns 0, or -1 when the queue is over its byte
+ * cap, in which case the session is closed rather than grown: a peer that
+ * sends faster than a session drains must not be able to choose this
+ * process's allocation. */
+static int queue_frame(WsSession *ws, int opcode, const unsigned char *pl,
+                       size_t plen) {
+    if (ws->fq_bytes + plen > ws->fq_cap) {
+        return -1;
+    }
+    WsFrame *f = malloc(sizeof *f + plen);
+    if (f == NULL) {
+        return -1;
+    }
+    f->next = NULL;
+    f->opcode = opcode;
+    f->len = plen;
+    if (plen) {
+        memcpy(f->data, pl, plen);
+    }
+    if (ws->fq_tail) {
+        ws->fq_tail->next = f;
+    } else {
+        ws->fq_head = f;
+    }
+    ws->fq_tail = f;
+    ws->fq_count++;
+    ws->fq_bytes += plen;
+    return 0;
+}
+
+/* Record a peer's close, decoding the 2-byte code and the reason when the
+ * frame carried one. A close with no payload is a code of 1005 by
+ * specification; reporting 0 (which the header does, meaning "no close
+ * arrived") would be a lie the operator reads as "the peer vanished". */
+static void note_close(WsSession *ws, const unsigned char *pl, size_t plen) {
+    if (plen >= 2) {
+        ws->close_code = (int)((pl[0] << 8) | pl[1]);
+        size_t rl = plen - 2;
+        if (rl >= sizeof ws->close_reason) {
+            rl = sizeof ws->close_reason - 1;
+        }
+        memcpy(ws->close_reason, pl + 2, rl);
+        ws->close_reason[rl] = 0;
+    } else {
+        ws->close_code = 1005;
+    }
+}
+
+/* Decode every complete message in rbuf, in arrival order. Returns 0, or -1
+ * on a close (ws->closed set) or fatal framing. */
 static int decode_available(WsSession *ws, int *fatal) {
     *fatal = 0;
     for (;;) {
@@ -653,8 +1059,15 @@ static int decode_available(WsSession *ws, int *fatal) {
         }
         size_t plen = (size_t)len;
 
+        /* ⛔ THE PAYLOAD IS UNMASKED IN PLACE AND THEN CONSUMED IMMEDIATELY.
+         * An earlier version returned a pointer into rbuf without consuming
+         * it, so the same frame was returned forever and the peer was flooded
+         * until it gave up. Every branch below either queues the bytes or
+         * drops them, and the consume at the bottom of the loop is the only
+         * place rbuf advances, so a frame has exactly one fate. */
         if (opcode == 0x8) {          /* close */
             buf_consume(&ws->rbuf, idx + plen);
+            note_close(ws, pl, plen);
             ws->closed = 1;
             return -1;
         }
@@ -680,47 +1093,207 @@ static int decode_available(WsSession *ws, int *fatal) {
             }
             buf_consume(&ws->rbuf, idx + plen);
             if (fin) {
-                if (buf_append(&ws->pending, ws->frag.p, ws->frag.len) != 0) {
+                /* ⛔ THE COMPLETED FRAGMENT ASSEMBLY KEEPS THE OPCODE OF THE
+                 * FIRST FRAGMENT, not of the last. A text control message
+                 * split across two continuations must be reported as text; a
+                 * decoder that takes the continuation's opcode (0) or the last
+                 * frame's reports something the multiplexed path would then
+                 * mis-dispatch. This is the same defect as "the opcode
+                 * reported is the last one for both frames", caught at the
+                 * fragmentation boundary. */
+                int rc = queue_frame(ws, ws->frag_opcode, ws->frag.p,
+                                     ws->frag.len);
+                buf_reset(&ws->frag);
+                ws->frag_open = 0;
+                if (rc != 0) {
                     *fatal = 1;
                     ws->closed = 1;
                     return -1;
                 }
-                buf_reset(&ws->frag);
-                ws->frag_open = 0;
             }
             continue;
         }
-        /* 0x1 text, 0x2 binary. ssh bytes are binary; a text frame from this
-         * relay would be a protocol error upstream, and the bytes are passed
-         * through so the ssh layer above reports it in ssh's own terms. */
-        if (!ws->frag_open) {
-            if (buf_append(&ws->pending, pl, plen) != 0) {
-                *fatal = 1;
-                ws->closed = 1;
-                return -1;
-            }
-        } else {
+        /* 0x1 text, 0x2 binary. A non-final data frame opens a fragment
+         * sequence whose opcode is remembered; a final one is queued whole. */
+        if (!fin) {
+            buf_reset(&ws->frag);
             if (buf_append(&ws->frag, pl, plen) != 0) {
                 *fatal = 1;
                 ws->closed = 1;
                 return -1;
             }
+            ws->frag_open = 1;
+            ws->frag_opcode = opcode;
+            buf_consume(&ws->rbuf, idx + plen);
+            continue;
+        }
+        if (queue_frame(ws, opcode, pl, plen) != 0) {
+            /* over the queue cap: refuse rather than grow, and say why. */
+            *fatal = 1;
+            ws->closed = 1;
+            return -1;
         }
         buf_consume(&ws->rbuf, idx + plen);
-        if (fin) {
-            if (ws->frag_open) {
-                if (buf_append(&ws->pending, ws->frag.p, ws->frag.len) != 0) {
-                    *fatal = 1;
-                    ws->closed = 1;
-                    return -1;
-                }
-                buf_reset(&ws->frag);
-                ws->frag_open = 0;
+    }
+}
+
+/* One turn of the keepalive clock, shared by both read paths. */
+static void maybe_keepalive(WsSession *ws) {
+    unsigned now = now_ms();
+    if (ws->keepalive_ms && now - ws->last_tx_ms >= ws->keepalive_ms) {
+        send_frame(ws, 0x9, NULL, 0);
+    }
+}
+
+/* Deliver the head of the frame queue, copying the payload so it outlives the
+ * queue node. The copy is what lets a caller hold a control message across the
+ * next ws_recv_frame call without the pointer dying with the node.
+ *
+ * ⛔ WHY THE COPY IS NOT AN OPTIMISATION BUT A CORRECTNESS REQUIREMENT. The
+ * queue node is freed on delivery, so handing back a pointer into it would be
+ * the "return a pointer without consuming" defect with a different spelling:
+ * the bytes are alive but owned by freed memory. Callers queue the bytes
+ * somewhere else anyway, and a 64 KiB frame is one memcpy against a socket
+ * read that already copied it once. */
+static int deliver(WsSession *ws, int *opcode, buffer *dst, size_t *len,
+                   int *closed, int *fatal) {
+    WsFrame *f = ws->fq_head;
+    ws->fq_head = f->next;
+    if (!ws->fq_head) {
+        ws->fq_tail = NULL;
+    }
+    if (ws->fq_count) {
+        ws->fq_count--;
+    }
+    ws->fq_bytes -= f->len;
+    *opcode = f->opcode;
+    *len = f->len;
+    *closed = 0;
+    int rc = 0;
+    if (f->len) {
+        rc = buf_append(dst, f->data, f->len);
+    }
+    free(f);
+    if (rc != 0) {
+        ws->closed = 1;
+        *closed = 1;
+        if (fatal) {
+            *fatal = 1;
+        }
+        return -1;
+    }
+    return 1;
+}
+
+int ws_recv_frame(WsSession *ws, int *opcode, buffer *dst, size_t *len,
+                  int *closed, int *fatal) {
+    *closed = 0;
+    if (fatal) {
+        *fatal = 0;
+    }
+    buf_reset(dst);
+    for (;;) {
+        if (ws->fq_head) {
+            return deliver(ws, opcode, dst, len, closed, fatal);
+        }
+        if (ws->closed) {
+            *closed = 1;
+            return -1;
+        }
+        int f = 0;
+        if (decode_available(ws, &f) != 0) {
+            *closed = 1;
+            if (fatal) {
+                *fatal = f;
             }
-        } else {
-            ws->frag_open = 1;
+            return -1;
+        }
+        if (ws->fq_head) {
+            continue;
+        }
+        int eof = 0;
+        if (read_more(ws, &eof) != 0) {
+            ws->closed = 1;
+            *closed = 1;
+            if (fatal) {
+                *fatal = 1;
+            }
+            return -1;
+        }
+        if (eof) {
+            ws->closed = 1;
+            *closed = 1;
+            return -1;
+        }
+        /* ⛔ SILENCE IS NOT AN ERROR AND IS NOT A CLOSE. The relay sends a
+         * keepalive every 25 s and an ssh session can go quiet for minutes
+         * while someone reads. Reporting either as "connection lost" kills a
+         * working session, so the loop yields and retries, and the keepalive
+         * below is what stops an intermediate cutting a quiet one. */
+        maybe_keepalive(ws);
+        dropssh_sleep_ms(20);
+    }
+}
+
+int ws_poll_frame(WsSession *ws, int *opcode, buffer *dst, size_t *len,
+                  int *closed, int *fatal) {
+    *closed = 0;
+    if (fatal) {
+        *fatal = 0;
+    }
+    buf_reset(dst);
+    if (ws->fq_head) {
+        return deliver(ws, opcode, dst, len, closed, fatal);
+    }
+    if (ws->closed) {
+        *closed = 1;
+        return -1;
+    }
+    int f = 0;
+    if (decode_available(ws, &f) != 0) {
+        *closed = 1;
+        if (fatal) {
+            *fatal = f;
+        }
+        return -1;
+    }
+    if (ws->fq_head) {
+        return deliver(ws, opcode, dst, len, closed, fatal);
+    }
+    /* ⛔ THE TRANSPORT IS POLLED, NOT BLOCKING-READ. A non-blocking read that
+     * returns 0 bytes and no EOF means "nothing right now", and the caller
+     * comes back. The first version read the transport only when the decode
+     * buffer ALREADY held bytes, so on a fresh connection nothing was ever
+     * fetched: the relay's 514-byte banner sat in the socket, ws_poll_frame
+     * returned 0 forever, and the operator read nothing at all while every
+     * log line said the pair was up.
+     *
+     * The read is safe against blocking because the transport's read already
+     * returns 0 with eof=0 rather than waiting -- that is the contract
+     * transport.h states and ws_recv_frame's loop relies on. So this reads
+     * whatever has arrived and returns immediately either way. */
+    {
+        int eof = 0;
+        if (read_more(ws, &eof) != 0) {
+            ws->closed = 1;
+            *closed = 1;
+            if (fatal) {
+                *fatal = 1;
+            }
+            return -1;
+        }
+        if (decode_available(ws, &f) != 0) {
+            *closed = 1;
+            if (fatal) {
+                *fatal = f;
+            }
+            return -1;
+        }
+        if (ws->fq_head) {
+            return deliver(ws, opcode, dst, len, closed, fatal);
         }
     }
+    return 0;
 }
 
 int ws_read(WsSession *ws, unsigned char *buf, size_t len, int *closed) {
@@ -728,52 +1301,26 @@ int ws_read(WsSession *ws, unsigned char *buf, size_t len, int *closed) {
     if (len == 0) {
         return 0;
     }
-    for (;;) {
-        if (ws->pending.len > ws->pending_at) {
-            size_t n = ws->pending.len - ws->pending_at;
-            if (n > len) {
-                n = len;
-            }
-            memcpy(buf, ws->pending.p + ws->pending_at, n);
-            buf_consume(&ws->pending, n);
-            return (int)n;
-        }
-        if (ws->closed) {
+    /* ⛔ THE BYTE STREAM IS DEFINED ON TOP OF THE FRAME QUEUE, NOT BESIDE IT.
+     * A second decoder over the same buffer is how the two came to disagree
+     * about what had been consumed. This one takes whole frames, copies out
+     * what the caller asked for, and keeps the REST in the session so a
+     * 64 KiB frame read through a 32 KiB buffer arrives whole rather than
+     * being split at whatever size the caller happened to pass. */
+    while (ws->spill.len == 0) {
+        int op = 0, cl = 0, f = 0;
+        size_t n = 0;
+        int r = ws_recv_frame(ws, &op, &ws->spill, &n, &cl, &f);
+        if (r < 0) {
             *closed = 1;
-            return 0;
+            return f ? -1 : 0;
         }
-        int fatal = 0;
-        if (decode_available(ws, &fatal) != 0) {
-            *closed = 1;
-            if (fatal) {
-                return -1;
-            }
-            return 0;
-        }
-        if (ws->pending.len > ws->pending_at) {
+        if (n == 0 && !cl) {
             continue;
         }
-        int eof = 0;
-        if (read_more(ws, &eof) != 0) {
-            ws->closed = 1;
-            *closed = 1;
-            return -1;
-        }
-        if (eof) {
-            ws->closed = 1;
-            *closed = 1;
-            return 0;
-        }
-        /* ⛔ SILENCE IS NOT AN ERROR AND IS NOT A CLOSE. The relay sends a
-         * zero-length keepalive every 25 s and an ssh session can go quiet
-         * for minutes while someone reads. Reporting either as "connection
-         * lost" kills a working session, so the loop yields and retries, and
-         * the keepalive below is what stops an intermediate from cutting a
-         * quiet one instead. */
-        unsigned now = now_ms();
-        if (ws->keepalive_ms && now - ws->last_tx_ms >= ws->keepalive_ms) {
-            send_frame(ws, 0x9, NULL, 0);
-        }
-        dropssh_sleep_ms(20);
     }
+    size_t take = ws->spill.len < len ? ws->spill.len : len;
+    memcpy(buf, ws->spill.p, take);
+    buf_consume(&ws->spill, take);
+    return (int)take;
 }

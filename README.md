@@ -49,6 +49,28 @@ That is the whole thing. `dropssh connect` is an ssh `ProxyCommand`: it mints
 its own relay token, opens the websocket, and carries the ssh bytes. No token
 to obtain, no configuration to write, no `~/.ssh/config` stanza to get right.
 
+**Many operators, one node socket.** The node dials out once and holds that
+websocket; each operator gets a session on it, told apart by a 32-hex id the
+relay puts in front of every frame and strips on the way back. Measured
+2026-09-28 against `tcp.ssh.relay.ajam.dev` through a 443-only CONNECT proxy:
+two concurrent pubkey sessions on one node socket, one sleeping while the other
+transferred 270177 bytes back byte for byte.
+
+## Before anything else
+
+```sh
+./dropssh doctor      # what this machine can actually do, read not guessed
+./dropssh pair        # a node token and a connect token, ready to paste
+./dropssh config      # every setting, and whether it came from a flag or the env
+```
+
+`doctor` **probes** rather than infers. In particular it tries `bind(2)` on
+loopback, because a cage can be bindless *at uid 0* and "am I root" does not
+answer that. It exits non-zero if a check failed. `pair` exists so a token
+never lands in shell history, and it prints the node and operator credentials
+separately because they are different credentials and swapping them produces a
+403 that says "no token, or the wrong token".
+
 ## Reach a public ssh gateway through a relay
 
 No node of your own, no config:

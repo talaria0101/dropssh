@@ -90,10 +90,21 @@ operator sends <id> + b"OPID"    (38 bytes)
   -> node receives 68 bytes:  <real id> + <id> + b"OPID"  <- relay PREPENDS AGAIN
 
 node      sends b"NDBARE"         (6 bytes, no id)
-  -> operator receives NOTHING                             <- relay DROPS it
+  -> NODE SOCKET CLOSED: 1009 "bad multiplex frame"
+     operator then closed 1011 "node disconnected"     <- was "NOTHING", 2026-09-28
 node      sends <id> + b"NDID"   (38 bytes)
   -> operator receives 4 bytes: b"NDID"                    <- relay STRIPS the id
 ```
+
+⛔ **THE BARE-NODE-FRAME ROW WAS CORRECTED ON 2026-09-28.** The old row said
+the operator receives nothing at all, with no error and no close, and gave that
+as a 2026-09-27 measurement. Re-measured against the live relay, 3/3 runs: the
+node socket is closed with **1009 `bad multiplex frame`** and the operator is
+then closed with **1011**. The requirement is unchanged and the four-way
+asymmetry still holds; what changed is that the failure is loud and named.
+Five places in this tree carried the old claim (`reverse-relay.md`,
+`relay-issues.md` B2 twice and B11, and `multiplexing.md`) and all five now say
+this.
 
 So, stated as rules:
 
@@ -106,11 +117,27 @@ So, stated as rules:
 bytes and the relay frames them. This is exactly what the reference operator in
 `docs/08-reverse.md` does: `ws.send(b)` on stdin with no framing at all.
 
-⛔ **THE NODE MUST PREFIX THE ID.** A bare payload from the node is **silently
-dropped**: the operator receives nothing, no error, no close, and the session
-just goes quiet. Measured above. This is the failure mode that will cost an
-afternoon, because a node that omits the prefix looks like a relay problem and
-is not one.
+⛔ **THE NODE MUST PREFIX THE ID, AND THE FAILURE IS A NAMED CLOSE, NOT
+SILENCE.** A bare payload from the node does not go quiet: the relay closes
+the **node's** socket with **code 1009, reason `bad multiplex frame`**, and
+then closes the **operator's** with **1011 `node disconnected`**.
+
+**Corrected 2026-09-28, measured 3/3 against this relay.** An earlier revision
+of this file, and four other places in this tree, said the frame was silently
+dropped with "no error, no close". That was wrong, and an implementer
+following it had no way to know 1009 existed, which is the code they actually
+see. The requirement is unchanged; the failure is louder and named.
+
+> We cannot say the relay *changed*: the measurement the old text rested on is
+> from 2026-09-27 and there is no instrumented run from that day. The honest
+> statement is that this document and the live relay disagree, and the live
+> relay is what an implementer meets. Our own relay now closes 1009 too, and
+> `tests/mux-probe.py` asserts it, so the behaviour is pinned on both sides.
+
+1009 and 1011 are **different closes on different sockets** and an
+implementation should log them distinctly: 1009 is the diagnosis and 1011 is
+its consequence on the operator. A client that reports only "connection
+closed" cannot tell its own framing bug from the relay being down.
 
 ⛔ **A BOGUS ID FROM THE OPERATOR IS REWRITTEN, NOT REJECTED.** Sending
 `"f"*32 + b"XXXX"` from the operator arrives at the node as
@@ -143,11 +170,16 @@ the node then receives `close` for a session that never ran.
    the relay's limits, and the node's own limits should not exceed them.
 4. For each `{"type":"open","id":I}`: start a local ssh server on a socketpair,
    and **immediately** answer `{"type":"ready","id":I}` as a text frame, or
-   `{"type":"reject","id":I,"reason":"..."}`.
+   `{"type":"reject","id":I,"reason":"..."}`. ⛔ **THE OPERATOR SENDS NOTHING
+   UNTIL IT SEES THAT `ready`.** Measured 2026-09-28: an operator that writes
+   its ssh banner first has both ends closed (operator 1008 `wait for ready`,
+   node 1003 `unknown session id`), because the relay has not created the
+   session yet. Holding stdin until `ready` costs one round trip that the ssh
+   banner exchange was going to pay anyway.
 5. For each **binary** frame you receive: the payload is **bare**, with no id to
    parse. Write it to the session's socket. For each binary frame you **send**:
-   prefix the 32-character id, or the relay drops it and the operator receives
-   nothing at all.
+   prefix the 32-character id, **in the same frame**, or the relay closes the
+   node socket with 1009 `bad multiplex frame` and the operator sees 1011.
 6. For each `{"type":"close","id":I}`: tear down that session only. Other
    sessions are on the same socket and must survive.
 7. On disconnect, redial with exponential backoff and jitter, capped. The
@@ -178,8 +210,18 @@ curl -sS -X POST "https://tcp.ssh.relay.ajam.dev/v1/stop/$NAME" -H "X-Relay-Toke
 | --- | --- |
 | `403` on the node or connect upgrade | absent or wrong token for that role |
 | `503` on the connect upgrade | the node was not connected when the operator arrived |
+| `409` on the node upgrade | a node with that name is already connected |
 | Close `node open timeout` | the node did not answer `open` in time |
-| Close `binary frames required` | a text frame was sent where a data frame was required |
+| Close `binary frames required` (1003) | a text frame was sent where a data frame was required |
+| ⛔ Close `bad multiplex frame` (1009) | **a node data frame carried no 32-hex id.** Measured 2026-09-28, 3/3. The operator is then closed 1011 `node disconnected`. |
+| ⛔ Close `wait for ready` (1008) on the operator | **the operator wrote session data before the node answered `open` with `ready`.** Measured 2026-09-28: the session is torn down and the node is closed 1003 `unknown session id`. |
+
+**The three closes an implementer meets first are 1003, 1008 and 1009, and
+they are three different bugs.** 1003 is a text frame where data was
+required, 1008 is data sent before `ready`, and 1009 is a data frame with no
+session id. In C the opcode is chosen by the frame writer, so a client that
+logs all three as "framing error" cannot tell which one it has, and each has a
+different fix.
 
 ## Audit of the relay's published reference operator
 

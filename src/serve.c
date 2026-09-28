@@ -258,19 +258,192 @@ static int pump_session(WsSession *ws, int sock, int *server_done) {
 
 /* One operator session: accept the paired websocket, start the ssh server on
  * a socketpair, and pump until either side ends. */
+
+/* ============================================================================
+ * THE MULTIPLEXED REVERSE PATH.
+ *
+ * THE THREE RULES THIS IMPLEMENTS, EACH FROM docs/reverse-relay.md, EACH
+ * MEASURED LIVE AGAINST tcp.ssh.relay.ajam.dev ON 2026-09-28:
+ *
+ *   operator -> node   the operator writes BARE ssh bytes; the relay PREPENDS
+ *                      the 32-hex id, so the node receives id+payload.
+ *   node -> operator   the node prefixes the 32-hex id itself; the relay
+ *                      STRIPS it, so the operator receives bare bytes. A node
+ *                      frame WITHOUT the prefix is closed by the relay with
+ *                      code 1009 "bad multiplex frame" (measured, 3/3), which
+ *                      is the loud failure B11's documentation said did not
+ *                      exist.
+ *   control            TEXT frames with no id: hello, open{id}, close{id} out;
+ *                      ready{id} / reject{id,reason} back. A TEXT frame where
+ *                      data was required is closed 1003 "binary frames
+ *                      required" (measured).
+ *
+ * ⛔ ONE READER PER WEBSOCKET, AND THE REASON IS B5. Two threads calling
+ * ws_recv_frame on one session race on its framer buffer, so one session can
+ * be handed another's bytes. It works perfectly with one session, which is
+ * exactly what makes it dangerous. The reader below is the ONLY thread that
+ * touches the websocket's read side; it dispatches whole frames to a queue per
+ * session id, so a frame has exactly one possible destination.
+ *
+ * ⛔ ONE WRITER, SERIALISED, AND THE REASON IS ALSO A FRAMING BUG. A
+ * websocket frame is a header and a payload that must arrive together; a node
+ * sending id+payload is a second send_frame, so two threads interleaving
+ * produce a frame whose length and payload disagree, and the far end
+ * desynchronises on the NEXT frame, which is another session's bytes read as
+ * an id. So every outbound frame goes through ws_write_locked, which holds one
+ * mutex for the whole id+payload send.
+ */
+
+#define MUX_MAX_SESSIONS 256
+
 static const char *server_passwd = NULL;
 static const char *server_preload = NULL;
 
-static int do_session(WsSession *ws, const char *servercmd,
-                      const unsigned char *initial, size_t initiallen) {
+/* ⛔ THE SERVER COMMAND IS ONE PROCESS-WIDE STRING, NOT A PER-SESSION ARGUMENT
+ * AND NOT A PARAMETER OF on_control. Every session runs the same `dropbear -i`
+ * on a fresh socketpair; nothing in the relay's protocol chooses a different
+ * server per session, and threading a per-session command through would be an
+ * option nothing sets. It is a function so both start_server and the session
+ * teardown read the same value without a global the compiler cannot check. */
+static const char *g_servercmd = NULL;
+static const char *server_cmd_for_sessions(void) {
+    return g_servercmd ? g_servercmd : "dropbear -i -E -F";
+}
+
+/* One session: the ssh server's socket, the bytes waiting for it, and the
+ * mutex that makes the id+payload send one frame. */
+typedef struct MuxSession {
+    struct MuxSession *next;
+    char        id[33];        /* the relay's 32 hex characters, NUL-terminated */
+    int         sock;          /* our end of the socketpair to `dropbear -i` */
+    pid_t       pid;
+    buffer      inbox;         /* ⛔ bytes that arrived before the server did */
+    size_t      inbox_at;
+    pthread_mutex_t lock;      /* the single writer for this session */
+    int         dead;
+    int         started;
+    int         stop;          /* set to ask the session thread to finish */
+    pthread_cond_t cv;
+    int         server_done;   /* the server hung up: half-close, do not read */
+    unsigned long long bytes_up, bytes_down;
+} MuxSession;
+
+typedef struct {
+    WsSession  *ws;
+    MuxSession *sessions;
+    pthread_mutex_t list_lock;   /* guards `sessions` and the table below */
+    pthread_mutex_t wlock;       /* ⛔ the ONE writer mutex for the websocket */
+    MuxSession *by_id[MUX_MAX_SESSIONS];
+    unsigned    max_sessions;    /* ⛔ the relay's advertised maxSessions */
+    int         closing;
+} Mux;
+
+/* The relay's ids are 32 hex characters. A bucket is the first two of them
+ * parsed as a number, which is a hash with no allocation and no table resize,
+ * because the id is fixed-length and validated before it gets here. */
+static unsigned id_bucket(const char *id) {
+    unsigned h = 0;
+    for (int i = 0; i < 2 && id[i]; i++) {
+        char c = id[i];
+        unsigned v = (c >= '0' && c <= '9') ? (unsigned)(c - '0')
+                   : (c >= 'a' && c <= 'f') ? (unsigned)(c - 'a' + 10)
+                   : (c >= 'A' && c <= 'F') ? (unsigned)(c - 'A' + 10)
+                   : 0u;
+        h = (h << 4) | v;
+    }
+    return h % MUX_MAX_SESSIONS;
+}
+
+static MuxSession *mux_find(Mux *m, const char *id) {
+    if (!id || !id[0]) {
+        return NULL;
+    }
+    for (MuxSession *s = m->by_id[id_bucket(id)]; s; s = s->next) {
+        if (strcmp(s->id, id) == 0) {
+            return s;
+        }
+    }
+    return NULL;
+}
+
+/* ⛔ EVERY WRITE TO THE WEBSOCKET TAKES ONE MUTEX, AND A MUX'S WRITES NEVER
+ * INTERLEAVE. Two threads writing a header and a payload between them produce
+ * a frame whose length and payload disagree, and the far end then reads the
+ * next frame's length from this one's bytes. The id prefix is copied into a
+ * local and the whole thing goes out under the lock, so it is one frame. */
+static int mux_send_binary(Mux *m, const char *id, const unsigned char *pl,
+                           size_t len) {
+    int rc;
+    pthread_mutex_lock(&m->wlock);
+    if (id != NULL) {
+        /* ⛔ THE ID PREFIX IS PART OF THE FRAME, NOT A SECOND FRAME. The
+         * relay strips the first 32 characters of a node data frame. Sending
+         * the id and the payload as two frames delivers the id as session
+         * data to the operator and the payload with no id, which the relay
+         * closes 1009. So this builds ONE frame with the id in front. */
+        if (len > (size_t)ws_max_frame(m->ws)) {
+            len = ws_max_frame(m->ws);
+        }
+        if (len + 32 > WS_MAX_FRAME) {
+            pthread_mutex_unlock(&m->wlock);
+            return -1;
+        }
+        unsigned char *framed = malloc(len + 32);
+        if (framed == NULL) {
+            pthread_mutex_unlock(&m->wlock);
+            return -1;
+        }
+        memcpy(framed, id, 32);
+        if (len) {
+            memcpy(framed + 32, pl, len);
+        }
+        rc = ws_write(m->ws, framed, len + 32);
+        free(framed);
+    } else {
+        rc = ws_write(m->ws, pl, len);
+    }
+    pthread_mutex_unlock(&m->wlock);
+    return rc;
+}
+
+/* ⛔ CONTROL MESSAGES ARE TEXT AND CARRY NO ID, AND THAT IS A PROTOCOL RULE
+ * NOT A STYLE CHOICE. A control message sent as a binary frame is read by the
+ * far end as data; a data frame sent as text is closed 1003 "binary frames
+ * required". The build is explicit so a future edit cannot get it wrong by
+ * sending the JSON through ws_write. */
+static int mux_send_text(Mux *m, const char *json) {
+    int rc;
+    pthread_mutex_lock(&m->wlock);
+    rc = ws_write_text(m->ws, (const unsigned char *)json, strlen(json));
+    pthread_mutex_unlock(&m->wlock);
+    return rc;
+}
+
+/* Start `dropbear -i` on a socketpair for this session, set the server's cage
+ * environment on the CHILD only, and hand back the fd. */
+static int start_server(const char *servercmd, int *sock_out, pid_t *pid_out,
+                        char *why, size_t whylen);
+
+/* The per-session thread: relay frames in, server bytes out, until either
+ * ends. Two things it deliberately does NOT do: it does not read the
+ * websocket (the one reader does), and it does not run the ssh server (the
+ * child process does). It owns exactly one session's socket and its queues. */
+typedef struct {
+    Mux         *mux;
+    MuxSession  *s;
+    const char  *servercmd;
+} sess_arg;
+
+static int start_server(const char *servercmd, int *sock_out, pid_t *pid_out,
+                        char *why, size_t whylen) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        logf("socketpair: %s", strerror(errno));
+        snprintf(why, whylen, "socketpair: %s", strerror(errno));
         return -1;
     }
     pid_t pid = fork();
     if (pid < 0) {
-        logf("fork: %s", strerror(errno));
+        snprintf(why, whylen, "fork: %s", strerror(errno));
         close(sv[0]); close(sv[1]);
         return -1;
     }
@@ -285,8 +458,8 @@ static int do_session(WsSession *ws, const char *servercmd,
          *   - A cage has no /etc/passwd, so `dropbear -i` looks up root and
          *     finds nothing, and logs "Login attempt for nonexistent user" for
          *     a user that is there. The passwd shim fixes that, and the shim
-         *     reads its database from $SANDHOME_PASSWD, so the server has to be
-         *     told which file.
+         *     reads its database from $SANDHOME_PASSWD, so the server has to
+         *     be told which file.
          *   - A statically linked server cannot be reached by LD_PRELOAD at
          *     all, so the shim is only usable against a dynamic one. That is
          *     the builder's job, and --preload is how the operator points the
@@ -294,8 +467,7 @@ static int do_session(WsSession *ws, const char *servercmd,
          *
          * Both are set on the child only. Setting them process-wide would put
          * a shim in front of dropssh's own TLS, which is a different program
-         * with a different set of symbols, for no reason.
-         */
+         * with a different set of symbols, for no reason. */
         if (server_passwd && server_passwd[0]) {
             setenv("SANDHOME_PASSWD", server_passwd, 1);
         }
@@ -311,45 +483,453 @@ static int do_session(WsSession *ws, const char *servercmd,
     if (fl >= 0) {
         fcntl(sv[0], F_SETFL, fl | O_NONBLOCK);
     }
-    /* ⛔ THE BYTES ALREADY READ ARE THE SERVER'S FIRST INPUT AND ARE WRITTEN
-     * BEFORE THE PUMP STARTS. The node's read loop had to read far enough to
-     * notice that a session had begun, and that read consumed the start of
-     * the ssh version string. Dropping it makes dropbear see an empty stream
-     * and log "Exit before auth", which names an authentication problem and
-     * is a framing one. This is the same class of bug as a lost marker prefix
-     * in a line protocol, and it is invisible until the very first exchange. */
-    if (initial && initiallen) {
-        size_t off = 0;
-        while (off < initiallen) {
-            ssize_t w = write(sv[0], initial + off, initiallen - off);
-            if (w <= 0) {
-                if (errno == EINTR) {
+    *sock_out = sv[0];
+    *pid_out = pid;
+    return 0;
+}
+
+static void *session_thread(void *arg) {
+    sess_arg *a = arg;
+    Mux *m = a->mux;
+    MuxSession *s = a->s;
+
+    for (;;) {
+        /* 1. drain the inbox into the server socket. Bytes that arrived
+         *    between `open` and this thread's first turn are in s->inbox and
+         *    are written here; they are NOT dropped, which is the "first
+         *    bytes of the ssh stream lost -> Exit before auth" defect. */
+        pthread_mutex_lock(&s->lock);
+        if (s->dead) {
+            pthread_mutex_unlock(&s->lock);
+            break;
+        }
+        if (s->inbox.len > s->inbox_at && !s->server_done) {
+            /* ⛔ THE LOCK IS HELD ACROSS THE WRITE, AND THAT IS THE WHOLE
+             * FIX. The first version read the offset and length under the
+             * lock, RELEASED it, wrote to the socket, then re-locked to
+             * consume. buf_reserve compacts the buffer whenever the read
+             * cursor has moved, which moves the live bytes to the front of
+             * the allocation -- so a frame that arrived in the gap
+             * reallocated the buffer, and the write then went to the OLD
+             * pointer. The bytes were not lost by the socket and not rejected
+             * by dropbear; they were written into freed memory.
+             *
+             * The symptom was a session that authenticated, started dropbear,
+             * went silent, and ended with "Exit before auth" while every log
+             * line said the write succeeded and reported the full length. A
+             * replay of a recorded 3658-byte client stream delivered 2000
+             * bytes, which is where the truncation first became visible: not
+             * in a log, but as a byte count.
+             *
+             * The write cannot block indefinitely because the socket is
+             * O_NONBLOCK, so holding the lock across it cannot stall the
+             * reader for long, and the reader here is the only writer to this
+             * session's inbox anyway. */
+            size_t off = s->inbox_at;
+            size_t n = s->inbox.len - off;
+            size_t wrote = 0;
+            int broken = 0;
+            while (wrote < n) {
+                ssize_t w = write(s->sock, s->inbox.p + off + wrote, n - wrote);
+                if (w > 0) {
+                    wrote += (size_t)w;
                     continue;
                 }
-                struct pollfd pw = { .fd = sv[0], .events = POLLOUT };
-                poll(&pw, 1, 5000);
+                if (w < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    struct pollfd pw = { .fd = s->sock, .events = POLLOUT };
+                    pthread_mutex_unlock(&s->lock);
+                    poll(&pw, 1, 200);
+                    pthread_mutex_lock(&s->lock);
+                    /* ⛔ THE BUFFER MAY HAVE MOVED WHILE THE LOCK WAS GIVEN
+                     * UP, so the pointer is RE-TAKEN from the cursor rather
+                     * than carried across the unlock. The offset is a cursor,
+                     * not an address, and only the cursor survives a
+                     * compaction. */
+                    off = s->inbox_at;
+                    n = s->inbox.len - off;
+                    continue;
+                }
+                broken = 1;
+                break;  /* the server hung up */
+            }
+            if (wrote) {
+                buf_consume(&s->inbox, wrote);
+            }
+            if (broken) {
+                s->server_done = 1;
+            }
+            pthread_mutex_unlock(&s->lock);
+            if (broken) {
+                char msg[96];
+                snprintf(msg, sizeof msg, "{\"type\":\"close\",\"id\":\"%s\"}", s->id);
+                mux_send_text(m, msg);
+                break;
+            }
+            continue;
+        }
+        int stopping = s->stop;
+        int done = s->server_done;
+        pthread_mutex_unlock(&s->lock);
+        if (stopping || (done && s->inbox.len == s->inbox_at)) {
+            break;
+        }
+
+        /* 2. the server's output -> the relay, id-prefixed. */
+        struct pollfd pf = { .fd = s->sock, .events = POLLIN };
+        int r = poll(&pf, 1, 50);
+        if (r > 0 && (pf.revents & (POLLIN | POLLHUP | POLLERR))) {
+            unsigned char buf[32768];
+            ssize_t n = read(s->sock, buf, sizeof buf);
+            if (n > 0) {
+                if (mux_send_binary(m, s->id, buf, (size_t)n) != 0) {
+                    pthread_mutex_lock(&s->lock);
+                    s->dead = 1;
+                    pthread_mutex_unlock(&s->lock);
+                    break;
+                }
+                pthread_mutex_lock(&s->lock);
+                s->bytes_up += (unsigned long long)n;
+                pthread_mutex_unlock(&s->lock);
                 continue;
             }
-            off += (size_t)w;
+            if (n == 0) {
+                                /* ⛔ THE SERVER HANGING UP IS ANNOUNCED WITH A `close` CONTROL
+                 * MESSAGE AND NOTHING ELSE. The exec'd command has already
+                 * written its output and the exit status is on the way;
+                 * closing the websocket here would race that write and lose
+                 * it, which is how a command that ran to completion reported
+                 * nothing. On the multiplexed socket a Close frame would also
+                 * kill every OTHER session, so this sends one JSON control
+                 * frame and returns, and the socket stays up for the rest. */
+                pthread_mutex_lock(&s->lock);
+                s->server_done = 1;
+                pthread_mutex_unlock(&s->lock);
+                char msg[96];
+                snprintf(msg, sizeof msg, "{\"type\":\"close\",\"id\":\"%s\"}", s->id);
+                mux_send_text(m, msg);
+                break;
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                break;
+            }
         }
     }
-    logf("session open; ssh server: %s", servercmd);
-    int server_done = 0;
-    pump_session(ws, sv[0], &server_done);
-    close(sv[0]);
-    int st = 0;
-    if (server_done) {
-        waitpid(pid, &st, 0);
-    } else {
-        kill(pid, SIGTERM);
-        dropssh_sleep_ms(100);
-        if (waitpid(pid, &st, WNOHANG) != pid) {
-            kill(pid, SIGKILL);
-            waitpid(pid, &st, 0);
+    /* Tear the session down: reap the server, free the socket, and unlink it
+     * so a late frame for this id is dropped rather than delivered to a
+     * reused one. */
+    pthread_mutex_lock(&s->lock);
+    s->dead = 1;
+    pthread_mutex_unlock(&s->lock);
+    if (s->pid > 0) {
+        int st = 0;
+        if (s->server_done) {
+            waitpid(s->pid, &st, 0);
+        } else {
+            kill(s->pid, SIGTERM);
+            dropssh_sleep_ms(80);
+            if (waitpid(s->pid, &st, WNOHANG) != s->pid) {
+                kill(s->pid, SIGKILL);
+                waitpid(s->pid, &st, 0);
+            }
         }
     }
-    logf("session closed");
-    return 0;
+    if (s->sock >= 0) {
+        close(s->sock);
+        s->sock = -1;
+    }
+    /* Remove from the table so the reader stops routing to it. The id is
+     * carried into the unlink so a session is never removed twice. */
+    pthread_mutex_lock(&m->list_lock);
+    for (MuxSession **pp = &m->by_id[id_bucket(s->id)]; *pp; pp = &(*pp)->next) {
+        if (*pp == s) {
+            *pp = s->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&m->list_lock);
+    buf_free(&s->inbox);
+    pthread_mutex_destroy(&s->lock);
+    pthread_cond_destroy(&s->cv);
+    free(s);
+    return NULL;
+}
+
+/* Handle one control message. This is where `open` becomes a session. The
+ * `ready`/`reject` handshake is a borrowed mechanism: a node that does not
+ * answer `open` promptly is closed with "node open timeout" by the relay
+ * (measured), and a node that answers nothing is indistinguishable from a
+ * node that is not there. So every `open` is answered, always, and the answer
+ * is `ready` once the server socket exists or `reject` with a reason. */
+static void on_control(Mux *m, const char *json) {
+    char verb[64] = "", id[128] = "";
+    if (relay_parse_control(json, verb, sizeof verb, id, sizeof id) != 0) {
+        logf("relay sent a control message dropssh could not parse: %.80s", json);
+        return;
+    }
+    if (strcmp(verb, "hello") == 0) {
+        /* The hello states the relay's limits. They are recorded and enforced
+         * (maxFrameBytes bounds every frame written; maxSessions bounds how
+         * many sessions are opened), because honouring a limit we advertise
+         * to be under is what keeps the relay from closing us. ⛔ BOTH ARE
+         * READ WITH THE SAME BOUNDED SCAN THE VERB CAME FROM, not with a
+         * strstr plus atoi, which is how the first version read them and which
+         * would happily read "maxSessions: -1" as a huge number. */
+        unsigned mf = 0, ms = 0;
+        if (relay_parse_uint(json, "\"maxFrameBytes\"", &mf) == 0) {
+            ws_set_limits(m->ws, mf, ws_max_sessions(m->ws));
+        }
+        if (relay_parse_uint(json, "\"maxSessions\"", &ms) == 0) {
+            ws_set_limits(m->ws, ws_max_frame(m->ws), ms);
+            m->max_sessions = ms;
+        }
+        logf("relay hello: maxFrameBytes=%u maxSessions=%u",
+             ws_max_frame(m->ws), m->max_sessions);
+        return;
+    }
+    if (strcmp(verb, "bye") == 0) {
+        logf("relay said bye");
+        pthread_mutex_lock(&m->list_lock);
+        m->closing = 1;
+        pthread_mutex_unlock(&m->list_lock);
+        return;
+    }
+    if (strcmp(verb, "close") == 0) {
+        pthread_mutex_lock(&m->list_lock);
+        MuxSession *s = mux_find(m, id);
+        if (s) {
+            s->stop = 1;
+        }
+        pthread_mutex_unlock(&m->list_lock);
+        if (s) {
+            logf("operator closed session %.8s", id);
+        }
+        return;
+    }
+    if (strcmp(verb, "open") != 0) {
+        logf("relay said: %.120s", json);
+        return;
+    }
+
+    /* `open`. A 32-hex id is required. Anything else is refused, because the
+     * id is how every later frame finds this session and a malformed one
+     * would be a session that can never be addressed. */
+    if (strlen(id) != 32) {
+        char msg[320];
+        snprintf(msg, sizeof msg,
+                 "{\"type\":\"reject\",\"id\":\"%.32s\",\"reason\":\"id is not 32 hex characters\"}", id);
+        mux_send_text(m, msg);
+        logf("refused a session with a malformed id: %.32s", id);
+        return;
+    }
+    {
+        /* ⛔ THE SESSION CAP IS THE RELAY'S OWN, COUNTED BEFORE ANY ALLOCATION
+         * FOR THE NEW SESSION. maxSessions is a promise the relay made in its
+         * hello and one the node keeps, so a node cannot be closed for
+         * exceeding a limit it was told. The count is taken under the same
+         * lock that publishes sessions, so two simultaneous `open`s cannot
+         * both see room for the last slot. */
+        unsigned n = 0;
+        pthread_mutex_lock(&m->list_lock);
+        for (int b = 0; b < MUX_MAX_SESSIONS; b++) {
+            for (MuxSession *s = m->by_id[b]; s; s = s->next) {
+                n++;
+            }
+        }
+        pthread_mutex_unlock(&m->list_lock);
+        if (n >= m->max_sessions) {
+            char msg[256];
+            snprintf(msg, sizeof msg,
+                     "{\"type\":\"reject\",\"id\":\"%.32s\",\"reason\":\"this node is at its %u session limit\"}",
+                     id, m->max_sessions);
+            mux_send_text(m, msg);
+            logf("refused session %.8s: at the %u session limit", id, m->max_sessions);
+            return;
+        }
+    }
+
+    MuxSession *s = calloc(1, sizeof *s);
+    if (s == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof msg,
+                 "{\"type\":\"reject\",\"id\":\"%.32s\",\"reason\":\"out of memory\"}", id);
+        mux_send_text(m, msg);
+        return;
+    }
+    snprintf(s->id, sizeof s->id, "%s", id);
+    s->sock = -1;
+    s->pid = -1;
+    buf_init(&s->inbox);
+    pthread_mutex_init(&s->lock, NULL);
+    pthread_cond_init(&s->cv, NULL);
+
+    char why[512] = "";
+    if (start_server(server_cmd_for_sessions(), &s->sock, &s->pid, why,
+                     sizeof why) != 0) {
+        /* The server command is per-process (probe already validated it), so
+         * a failure here is a resource failure, not a config one. */
+        char msg[512];
+        snprintf(msg, sizeof msg,
+                 "{\"type\":\"reject\",\"id\":\"%.32s\",\"reason\":\"%.200s\"}", id, why);
+        mux_send_text(m, msg);
+        logf("could not start a server for %.8s: %s", id, why);
+        buf_free(&s->inbox);
+        pthread_mutex_destroy(&s->lock);
+        pthread_cond_destroy(&s->cv);
+        free(s);
+        return;
+    }
+
+    /* Publish the session BEFORE sending `ready`, so a data frame that
+     * arrives in the same instant as the `ready` finds a session to land in.
+     * Publishing after would race, and the frame would be dropped. */
+    pthread_mutex_lock(&m->list_lock);
+    unsigned b = id_bucket(s->id);
+    s->next = m->by_id[b];
+    m->by_id[b] = s;
+    pthread_mutex_unlock(&m->list_lock);
+
+    char ready[96];
+    snprintf(ready, sizeof ready, "{\"type\":\"ready\",\"id\":\"%s\"}", s->id);
+    if (mux_send_text(m, ready) != 0) {
+        /* The relay went away between `open` and `ready`. Mark it and let the
+         * thread's teardown reap the server. */
+        pthread_mutex_lock(&s->lock);
+        s->stop = 1;
+        pthread_mutex_unlock(&s->lock);
+    }
+
+    sess_arg *a = calloc(1, sizeof *a);
+    if (a == NULL) {
+        pthread_mutex_lock(&s->lock);
+        s->stop = 1;
+        pthread_mutex_unlock(&s->lock);
+        return;
+    }
+    a->mux = m;
+    a->s = s;
+    a->servercmd = server_cmd_for_sessions();
+    pthread_t th;
+    if (pthread_create(&th, NULL, session_thread, a) != 0) {
+        pthread_mutex_lock(&s->lock);
+        s->stop = 1;
+        pthread_mutex_unlock(&s->lock);
+        free(a);
+        return;
+    }
+    pthread_detach(th);
+    logf("operator opened session %.8s (ready sent)", s->id);
+}
+
+/* Route ONE data frame to its session, or refuse it.
+ *
+ * ⛔ A FRAME FOR AN ID THAT IS NOT OPEN IS DROPPED AND COUNTED, NOT
+ * DELIVERED. Two things depend on that: a frame for a session that has been
+ * torn down must not be delivered to a REUSED id (a reused id would leak one
+ * session's bytes into another), and the count is the only signal that the
+ * relay and this node disagree about which sessions are open. The count is
+ * logged when it is nonzero rather than every frame. */
+static void on_data(Mux *m, const unsigned char *pl, size_t len) {
+    if (len < 32) {
+        /* A node-leg data frame shorter than the id is a relay already put
+         * id+payload there, so this should not happen; count and ignore. */
+        logf("a data frame of %zu bytes is shorter than a session id; ignored", len);
+        return;
+    }
+    char id[33];
+    memcpy(id, pl, 32);
+    id[32] = 0;
+    for (int i = 0; i < 32; i++) {
+        char c = id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) {
+            logf("a data frame carried an id that is not 32 hex; ignored");
+            return;
+        }
+    }
+        MuxSession *s = mux_find(m, id);
+    if (s == NULL) {
+        static unsigned long orphan = 0;
+        if (++orphan % 64 == 1) {
+            logf("data for an unknown session %.8s (total %lu); dropped", id, orphan);
+        }
+        return;
+    }
+    /* Strip the id; the remainder is the session's ssh bytes. */
+    pthread_mutex_lock(&s->lock);
+    if (s->dead || s->server_done) {
+        pthread_mutex_unlock(&s->lock);
+        return;
+    }
+    int rc = buf_append(&s->inbox, pl + 32, len - 32);
+    if (rc == 0) {
+        s->bytes_down += (unsigned long long)(len - 32);
+    }
+        pthread_mutex_unlock(&s->lock);
+    if (rc != 0) {
+        logf("session %.8s: inbox overflow; the operator is sending faster than the server reads", id);
+        pthread_mutex_lock(&s->lock);
+        s->stop = 1;
+        pthread_mutex_unlock(&s->lock);
+    }
+}
+
+/* The single reader. It reads WHOLE FRAMES, tells text from binary by the
+ * frame's own opcode, and hands each to on_control or on_data. It is the only
+ * thread that calls ws_recv_frame on this websocket. */
+static void *mux_reader(void *arg) {
+    Mux *m = arg;
+    buffer frame;
+    buf_init(&frame);
+    for (;;) {
+        int op = 0, closed = 0, fatal = 0;
+        size_t n = 0;
+        int r = ws_recv_frame(m->ws, &op, &frame, &n, &closed, &fatal);
+        if (r < 0) {
+            if (m->ws->closed && ws_close_code(m->ws)) {
+                logf("relay closed the node socket: code %d %s",
+                     ws_close_code(m->ws), ws_close_reason(m->ws));
+            } else if (fatal) {
+                logf("the relay sent framing dropssh cannot read; closing");
+            } else {
+                const char *le = dropssh_tls_lasterror();
+                logf("relay connection ended: %s", le ? le : "closed");
+            }
+            pthread_mutex_lock(&m->list_lock);
+            m->closing = 1;
+            /* Stop every session so the process can exit; each thread reaps
+             * its own server on the way out. */
+            for (int b = 0; b < MUX_MAX_SESSIONS; b++) {
+                for (MuxSession *s = m->by_id[b]; s; s = s->next) {
+                    s->stop = 1;
+                }
+            }
+            pthread_mutex_unlock(&m->list_lock);
+            break;
+        }
+        if (op == 0x1) {   /* text: control */
+            /* NUL-terminate a copy: the JSON is not NUL-terminated on the
+             * wire and a scanner reading past it would read adjacent frame
+             * bytes. */
+            char *json = malloc(n + 1);
+            if (json == NULL) {
+                continue;
+            }
+            memcpy(json, frame.p, n);
+            json[n] = 0;
+            on_control(m, json);
+            free(json);
+            continue;
+        }
+        if (op == 0x2) {   /* binary: session data */
+            on_data(m, frame.p, n);
+            continue;
+        }
+    }
+    buf_free(&frame);
+    return NULL;
 }
 
 /* ---------------------------------------------------------------- the node */
@@ -378,6 +958,7 @@ int dropssh_serve(dropssh_opts *o) {
         return 3;
     }
     logf("ssh server ok: %s", servercmd);
+    g_servercmd = servercmd;
 
     unsigned backoff = 1;
     int sessions = 0;
@@ -433,52 +1014,31 @@ int dropssh_serve(dropssh_opts *o) {
              o->name ? o->name : "(forward)", path);
         backoff = 1;
 
-        /* The relay's control messages, and the sessions it opens. */
-        for (;;) {
-            unsigned char msg[512];
-            int closed = 0;
-            int r = ws_read(&ws, msg, sizeof msg, &closed);
-            if (r < 0 || (r == 0 && closed)) {
-                const char *le = dropssh_tls_lasterror();
-                logf("relay connection ended: %s", le ? le : "closed");
-                break;
-            }
-            if (r == 0) {
-                continue;
-            }
-            /* A control message is a JSON object the relay sends before any
-             * session bytes. A session's first bytes are the ssh version
-             * string, which starts with "SSH-", so the two are told apart by
-             * their first byte rather than by a heuristic on content. */
-            if (msg[0] == '{') {
-                char sid[80] = "";
-                char verb[64] = "";
-                relay_parse_control((const char *)msg, verb, sizeof verb,
-                                    sid, sizeof sid);
-                if (strcmp(verb, "open") == 0) {
-                    logf("operator opened session %s", sid);
-                } else if (strcmp(verb, "close") == 0) {
-                    logf("operator closed session %s", sid);
-                } else {
-                    logf("relay said: %.*s", 120, (const char *)msg);
-                }
-                continue;
-            }
-            /* Not a control message: the session has begun. The bytes in
-             * hand are the start of it, and they are the server's first
-             * input, so they are handed over rather than discarded. */
-            do_session(&ws, servercmd, msg, (size_t)r);
-            sessions++;
-            if (o->once) {
-                ws_close(&ws);
-                logf("session count %d; exiting because --once was given", sessions);
-                return 0;
-            }
-            break;   /* the session consumed the socket; redial */
+        Mux m;
+        memset(&m, 0, sizeof m);
+        m.ws = &ws;
+        m.max_sessions = WS_HELLO_DEFAULT_SESSIONS;
+        pthread_mutex_init(&m.list_lock, NULL);
+        pthread_mutex_init(&m.wlock, NULL);
+        /* ⛔ THE READER IS ONE THREAD AND IT IS THE ONLY ONE THAT TOUCHES THE
+         * WEBSOCKET'S READ SIDE. Everything else either writes (under wlock)
+         * or talks to its own socketpair. This is the B5 fix, and it is a
+         * structure rather than a flag: there is no API by which a session
+         * thread could call ws_recv_frame. */
+        pthread_t reader;
+        if (pthread_create(&reader, NULL, mux_reader, &m) != 0) {
+            logf("could not start the node's reader thread");
+            ws_close(&ws);
+            t->close(t);
+            goto wait_and_retry;
         }
+        pthread_join(reader, NULL);
+        pthread_mutex_destroy(&m.list_lock);
+        pthread_mutex_destroy(&m.wlock);
         ws_close(&ws);
+        t->close(t);
         if (o->once) {
-            return 0;
+            return sessions > 0 ? 0 : 1;
         }
 wait_and_retry:
         if (o->once) {

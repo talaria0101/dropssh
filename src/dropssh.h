@@ -14,6 +14,13 @@
  *                    network.
  *   dropssh keygen   a host key, in dropbear's own format, so the server
  *                    side has no second key implementation.
+ *   dropssh doctor   what this machine can actually do, read rather than
+ *                    guessed. Exits non-zero if a check failed.
+ *   dropssh pair     a node token and a connect token, ready to paste, so the
+ *                    operator never runs curl and puts a token in shell
+ *                    history.
+ *   dropssh config   every setting and where it came from: flag, environment
+ *                    or built-in.
  *   dropssh version  what this binary is, including which TLS it carries and
  *                    which dropbear it was built beside.
  *
@@ -61,5 +68,8 @@ int dropssh_connect(dropssh_opts *o);
 int dropssh_relay_main(int argc, char **argv);
 int dropssh_keygen(const char *type, const char *file, int bits);
 int dropssh_version_cmd(void);
+int dropssh_doctor(dropssh_opts *o);
+int dropssh_pair(dropssh_opts *o);
+int dropssh_config(dropssh_opts *o);
 
 #endif /* DROPSSH_DROPSSH_H */

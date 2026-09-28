@@ -65,10 +65,11 @@ Full measurements: [`docs/decisions-tls.md`](docs/decisions-tls.md).
    the thing to know first.
 4. [`docs/multiplexing.md`](docs/multiplexing.md) — the eight framing defects
    found while attempting the multiplexed reverse path, and the shape that does
-   not have them.
-5. **[`docs/relay-issues.md`](docs/relay-issues.md) — every open bug and every
+   not have them. **The path is implemented now**; this page is why it is not
+   trivially so.
+5. **[`docs/relay-issues.md`](docs/relay-issues.md) — every bug and every
    request concerning the relay, its protocol and the two verbs that speak to
-   it. Start here to pick up that work.**
+   it, and what happened to each. Start here.**
 6. [`README.md`](README.md) — usage and the full option list.
 
 ## Building
@@ -109,7 +110,7 @@ anyone in is the failure this project exists to prevent**, and `dropbear -t`,
 `file` and a green `make` are all incapable of seeing it: it appears at login,
 on a machine with no `/etc/passwd`, as a message that names the wrong thing.
 
-Nine cases, green on a CI runner at uid 1001 and in a cage at uid 0:
+**Nineteen** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
 
 * dropbear is dynamically linked, so the shim can reach it
 * `dropbear -i` stays up on a **socketpair** waiting for a session
@@ -120,12 +121,22 @@ Nine cases, green on a CI runner at uid 1001 and in a cage at uid 0:
 * a login with a shell that does **not** exist is refused, and says which shell
 * connecting to a name no node is using exits non-zero
 * the binary reports its TLS backend
+* **two concurrent sessions on one node socket**, each receiving only its own
+  bytes, and the node's own log showing one registration for two sessions
+* the relay's framing rules (via `tests/mux-probe.py`): the id asymmetry, the
+  1009 close for a bare node frame, the 1003 close for a text data frame
+* `doctor` reports the environment and exits non-zero on a failed check
+* `config` prints every setting with its source, and never a token's value
+* `--json` produces a parseable event on stderr and leaves stdout clean
 
 Two things about how to read it:
 
 * **Every guard is proven to fire.** A check that has only ever passed is not
   evidence. Planting a static-pie dropbear turns the suite red on two checks,
-  and CI has a job that asserts a musl dropbear is **refused**.
+  and CI has a job that asserts a musl dropbear is **refused**. The same rule
+  was applied to the multiplexer: `tests/mux-probe.py` was rebuilt against a
+  relay with the silent drop restored and against one with the id strip
+  removed, and it failed both times.
 * **The suite logs in as whatever uid it runs as**, and says so on the first
   line. dropbear refuses a login whose uid differs from the server's, so a
   suite that assumes it runs as root is a test of a different machine.
@@ -147,6 +158,10 @@ src/            the C.
 scripts/        build.sh, build-dropbear.sh, build-mbedtls.sh
 patches/        three diffs against dropbear; no dropbear code is copied
 tests/e2e.sh    the gate
+tests/mux-probe.py
+                the relay's framing rules as a gate: the prepend/strip
+                asymmetry, the 1009 close for a bare node frame, the 1003
+                close for a text frame on a data leg. No network, no token.
 docs/           the measurements, which are the real documentation
 vendor/         does not exist, on purpose: inputs are fetched and pinned
 ```
@@ -184,18 +199,49 @@ vendor/         does not exist, on purpose: inputs are fetched and pinned
 Each of these is measured in `docs/decisions-tls.md` with the command that
 produced the number.
 
-## Not implemented, and said so rather than implied
+## The multiplexed reverse path, and what is still not implemented
 
-The relay's **multiplexed reverse path**: one long-lived node socket carrying
-many sessions, told apart by a 32-hex id on every frame. `dropssh serve` treats
-its socket as one session and sends bare frames, so it cannot speak to that
-relay yet. The protocol is in `docs/reverse-relay.md`, the design is in
-`docs/multiplexing.md`, and the outstanding defects are numbered **B1** to
-**B14** in `docs/relay-issues.md`.
+**The multiplexed reverse path is implemented and measured live.** One
+long-lived node socket carries many sessions, told apart by a 32-hex id on
+every frame. Measured 2026-09-28 against `tcp.ssh.relay.ajam.dev` through a
+443-only CONNECT proxy: two concurrent pubkey sessions on **one** node socket,
+one sleeping while the other transferred 270177 bytes back byte for byte.
 
 The **forward** path and the **rendezvous** path are both implemented and both
 are proven with real sessions. The forward path is proven by hand, not by the
-gate: see **B10** in `docs/relay-issues.md`.
+gate: see **B10**.
+
+Still open, and named in `docs/relay-issues.md`:
+
+* **R2** — a scheduled CI job that drives a real relay. It needs a network and
+  a credential, so it cannot run on every commit. The framing rules it would
+  have guarded are asserted locally by `tests/mux-probe.py` instead.
+* **R8** — fetch the relay's own reference operator, pinned, so protocol drift
+  is visible rather than discovered.
+* **B12**–**B14** — defects in the relay and in its reference operator. Reported,
+  not fixed here; B12's consequence is documented because a client must not
+  treat the id in an operator frame as addressing.
+
+## Traps added since the multiplexer shipped
+
+* ⛔ **A TEXT FRAME ON A DATA LEG IS CLOSE 1003, A BARE NODE FRAME IS CLOSE
+  1009, AND DATA SENT BEFORE `ready` IS CLOSE 1008.** Three different bugs,
+  three different closes, and in C the opcode is chosen by the frame writer. A
+  client that logs all three as "framing error" cannot tell which it has.
+* ⛔ **THE OPERATOR SENDS NOTHING UNTIL IT SEES `ready`.** Writing the ssh
+  banner first is torn down (operator 1008 `wait for ready`, node 1003
+  `unknown session id`). `connect` holds stdin.
+* ⛔ **STDIN EOF IS NOT "SESSION OVER".** ssh writes its whole conversation and
+  then closes stdin, but the reply is still coming. A websocket Close there
+  tells the relay to tear the session down, and the operator exits having read
+  nothing.
+* ⛔ **EVERY SOCKET IS NON-BLOCKING, AND `wrap_fd` IS WHERE THAT IS SET.** Three
+  of the four constructors bypassed it, so the local relay and every socket the
+  relay accepted were blocking. The old blocking `ws_read` hid it; a loop that
+  must also service another leg cannot.
+* ⛔ **THE TLS BIO IS NON-BLOCKING.** `mbed_recv` returns
+  `MBEDTLS_ERR_SSL_WANT_READ` rather than sleeping and retrying. A blocking BIO
+  is correct for a blocking caller and a hang for a multiplexed one.
 
 ## Related work
 

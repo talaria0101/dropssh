@@ -10,6 +10,7 @@
 #include "tls.h"
 #include "util.h"
 #include "ws.h"
+#include "events.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,9 @@ static void usage(FILE *f) {
 "  dropssh connect [options]               operator side; ssh ProxyCommand target\n"
 "  dropssh relay   [--listen ADDR] [--name N]\n"
 "  dropssh keygen  -t TYPE -f FILE\n"
+"  dropssh doctor  [options]               what this machine can do, measured\n"
+"  dropssh pair    [options]               node + connect tokens, ready to paste\n"
+"  dropssh config  [options]               every setting and where it came from\n"
 "  dropssh version\n"
 "\n"
 "WHAT EACH VERB IS FOR\n"
@@ -36,6 +40,14 @@ static void usage(FILE *f) {
 "  relay     a rendezvous relay, for a deployment that does not want to use\n"
 "            someone else's.\n"
 "  keygen    a host key in dropbear's format.\n"
+"  doctor    the environment questions, answered by reading rather than by\n"
+"            guessing: uid, passwd database, CA bundle, whether the server\n"
+"            command starts here, and relay reachability by which route.\n"
+"            Exits non-zero if a check failed.\n"
+"  pair      a node token and a connect token, ready to paste, so a token\n"
+"            never lands in shell history.\n"
+"  config    every setting and where it came from: flag, environment, or\n"
+"            built-in. Answers 'it ignored my flag'.\n"
 "\n"
 "COMMON OPTIONS\n"
 "  --relay HOST        the relay host (default %s)\n"
@@ -54,6 +66,8 @@ static void usage(FILE *f) {
 "  --preload PATH      LD_PRELOAD for the server, e.g. the passwd shim.\n"
 "                      A STATIC server cannot be preloaded at all.\n"
 "  --once              serve one session and exit\n"
+"  --json              machine-readable events, on stderr. stdout stays a\n"
+"                      clean byte pipe because it is ssh's.\n"
 "  -v, --verbose       say what is happening, on stderr\n"
 "\n"
 "EXAMPLES\n"
@@ -64,7 +78,16 @@ static void usage(FILE *f) {
 "  dropssh serve --name mycage --server 'dropbear -i -E -F'\n"
 "\n"
 "  # a one-shot to a public ssh gateway over the relay\n"
-"  ssh -o ProxyCommand='dropssh connect --mint' root@railway.new\n",
+"  ssh -o ProxyCommand='dropssh connect --mint' root@railway.new\n"
+"\n"
+"  # before anything else, on a machine you do not know\n"
+"  dropssh doctor\n"
+"\n"
+"  # tokens without putting one in shell history\n"
+"  dropssh pair --relay relay.example:443 --name mybox\n"
+"\n"
+"  # why did it not use my flag\n"
+"  dropssh config --relay relay.example:443 --insecure\n",
         DROPSSH_DEFAULT_RELAY);
 }
 
@@ -121,6 +144,13 @@ int main(int argc, char **argv) {
     if (strcmp(verb, "relay") == 0) {
         return dropssh_relay_main(argc, argv);
     }
+
+    /* ⛔ doctor, pair and config ARE ROUTED AFTER THE PARSER AND BEFORE THE
+     * VERB DISPATCH, because they take the same options as the verbs that
+     * talk to a relay and an operator needs `dropssh config --relay X` to
+     * report the resolved relay rather than the default. The parser below
+     * fills the same struct the transport verbs use, so there is one option
+     * table and no way for `config` to describe a setting `serve` ignores. */
 
     dropssh_opts o;
     memset(&o, 0, sizeof o);
@@ -190,11 +220,30 @@ int main(int argc, char **argv) {
         #undef NEXT
     }
     dropssh_set_insecure(o.insecure);
+    /* ⛔ --json IS HONOURED OR REFUSED, NEVER ACCEPTED AND IGNORED. It was
+     * accepted, set a field, and nothing read it, which is worse than refusing
+     * it: an operator who passed it believed they had machine-readable output
+     * and did not. Now it selects a real event stream on stderr. */
+    dropssh_events_set_json(o.json);
 
+    if (strcmp(verb, "doctor") == 0) {
+        dropssh_events_banner("doctor");
+        return dropssh_doctor(&o);
+    }
+    if (strcmp(verb, "pair") == 0) {
+        dropssh_events_banner("pair");
+        return dropssh_pair(&o);
+    }
+    if (strcmp(verb, "config") == 0) {
+        dropssh_events_banner("config");
+        return dropssh_config(&o);
+    }
     if (strcmp(verb, "connect") == 0) {
+        dropssh_events_banner("connect");
         return dropssh_connect(&o);
     }
     if (strcmp(verb, "serve") == 0) {
+        dropssh_events_banner("serve");
         return dropssh_serve(&o);
     }
     if (strcmp(verb, "keygen") == 0) {

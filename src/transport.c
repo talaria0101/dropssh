@@ -190,6 +190,23 @@ static Transport *wrap_fd(int fd, const char *name, int family) {
         close(fd);
         return NULL;
     }
+    /* ⛔ EVERY SOCKET IS NON-BLOCKING, AND IT IS DONE HERE, ONCE, IN THE ONE
+     * PLACE A TRANSPORT IS BUILT. Three of the four constructors bypassed it:
+     * transport_tcp_unix and transport_from_fd called wrap_fd directly, and
+     * only dial_one set the flag. So a unix-socket relay and every socket the
+     * relay accepted were BLOCKING, and sock_read's contract ("return 0 bytes
+     * and eof=0 rather than waiting") was a lie for them: read() simply sat
+     * there.
+     *
+     * The blocking `ws_read` hid this, because it was written to wait. The
+     * multiplexed operator cannot wait: it has to service stdin while waiting
+     * for the node's reply, and a socket that blocks in read() starves stdin
+     * for as long as the peer is quiet. Measured: the operator read 1000 bytes
+     * of a 3658-byte stream and then stopped, with every log line correct.
+     *
+     * So the property is established where the object is created rather than
+     * at each call site, because a call site that forgets it is invisible. */
+    sock_nonblock(fd);
     s->fd = fd;
     t->name = name;
     t->state = s;
@@ -198,6 +215,7 @@ static Transport *wrap_fd(int fd, const char *name, int family) {
     t->close = sock_close;
     t->is_tls = 0;
     t->family = family;
+    t->read_can_block = 0;
     return t;
 }
 
