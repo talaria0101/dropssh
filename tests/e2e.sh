@@ -652,6 +652,58 @@ else
     bad "docs/reverse-relay.md's error table does not name close 1009"
 fi
 
+# ⛔ THE OPEN-TIMEOUT PAIR, WHICH COST US THREE WRONG NUMBERS ONCE.
+#
+# Our files said an unanswered `open` closes 1008 after 10 s. Measured against
+# the live relay at r11 it is 1013 after 15 s. The numbers were wrong in the
+# code AND in the docs, and nothing in the gate could see it, because a doc
+# check that only guards the one claim somebody remembered to be wrong is a
+# guard for that claim and not for the class.
+#
+# So this asserts the two facts that were wrong, in the place an implementer
+# looks. A correction line is allowed to mention the old value, because a
+# document that records its own history is the point; a line that ASSERTS the
+# old value is the defect.
+#
+# ⛔ AND "A CORRECTION" IS RECOGNISED BY ITS CONTENT, NOT BY A KEYWORD. The
+# first version of this guard exempted only CORRECTED / previously / used to,
+# and it went red on the very rows that FIX the claim: the table row that says
+# "**1013** ... our own files said 1008", and the U1 entry that records the old
+# 1008/10 s pair as history. A guard that fails on its own fix is worse than no
+# guard, because the next person removes the correction rather than the defect
+# and the wrong claim comes straight back.
+#
+# So a line is exempt when it names the CORRECT code anywhere. A row that says
+# "1013 ... previously 1008" passes; a row that says only "1008" fails.
+timeout_drift=""
+for f in docs/reverse-relay.md docs/relay-issues.md docs/multiplexing.md; do
+    [ -f "$ROOT/$f" ] || continue
+    while IFS= read -r line; do
+        case "$line" in
+            *">"*|*"1013"*|*CORRECTED*|*previously*|*"used to"*|*"used say"*|*wrong*)
+                continue ;;
+        esac
+        case "$line" in
+            *"1008"*"node open timeout"*|*"node open timeout"*1008*)
+                timeout_drift="$timeout_drift; $f: $line" ;;
+        esac
+    done <<EOF
+$(grep -n "" "$ROOT/$f" 2>/dev/null)
+EOF
+done
+if [ -z "$timeout_drift" ]; then
+    ok "no document asserts close 1008 for a node open timeout"
+else
+    bad "a document names 1008 as the open-timeout close, which is 1013:$timeout_drift"
+fi
+# ⛔ AND THE POSITIVE HALF OF THE SAME FACT, so the correction cannot be
+# "delete the row" rather than "fix the row".
+if grep -q "1013" "$ROOT/docs/reverse-relay.md" 2>/dev/null; then
+    ok "the error table names close 1013 node open timeout"
+else
+    bad "docs/reverse-relay.md's error table does not name close 1013"
+fi
+
 head_ "a name no node is using is refused, not silently accepted"
 # ⛔ "COULD NOT RUN MUST NEVER READ AS DENIED" IS ALSO TRUE IN THE OTHER
 # DIRECTION. A relay that pairs a client with nothing produces a session that

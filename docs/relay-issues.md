@@ -11,6 +11,25 @@ two verbs that speak to it. Pulled out of
 it safe"). B11 and B13 are not ours to fix and are now measured; R2 is a
 scheduled job and cannot run on every commit.
 
+### The relay answered issue #9, and three of our numbers were wrong
+
+The relay's author replied on 2026-09-28 against a deployed tree at version
+`2026-09-28-r11`, having read our measurements. That reply fixed A1 on their
+side and answered the open questions, and re-reading it against the live relay
+found **three claims in this tree that r11 falsifies**. All three are corrected
+in place and the corrections are measured, not taken from the comment:
+
+| our claim | r11 | what we did |
+| --- | --- | --- |
+| an unanswered `open` closes **1008** at **10 s** | ⛔ **1013 `node open timeout` at 15 s** | measured 15.3 s against the live relay; `src/connect.c` now handles 1013 and 1008 as **different** faults, and `tests/mux-probe.py` case 8 asserts the distinction rather than substring-matching "1008" |
+| "the relay's keepalive arrives every 25 s" on the operator leg | ⛔ **there is no application keepalive on the reverse path at all**; 25 s is the FORWARD path's zero-length frame. Quiet is healthy. | a comment in `src/connect.c` corrected; nothing in the code depended on it |
+| the operator leg was a "bare byte pipe" with no control frames to parse | the operator **receives** text control frames, including a node's `reject{id,reason}` (A1, new in r11) | `dropssh connect` now **reads** `reject` and reports the node's own reason, exit non-zero. Measured live: `the node refused the session: this node is at its 64 session limit` in 0.4 s. Before this, a refused node gave an open, idle session and no explanation — the exact gap we asked r11 to close on their side, and it is ours to close on ours. |
+
+Two further answers need **no code change** because our reading was already
+right, which is worth recording: `maxFrameBytes` does **not** count the 32-hex
+prefix (node wire ≤ 65568), which is what `src/serve.c` already enforces; and
+B12's id-rewrite is confirmed as an intended contract, not a defect.
+
 Each entry below carries, at its head, **what was done and what makes the same
 defect mechanically impossible rather than merely absent.** A fix that leaves
 the trap armed is not a fix.
@@ -362,6 +381,14 @@ working. A close frame carrying a reason would turn an afternoon into a minute.
 
 ## B12. The relay rewrites a bogus operator id instead of rejecting it
 
+> **CONFIRMED AS INTENDED, 2026-09-28 (relay r11), and the consequence for a
+> client is unchanged.** The relay's author states the behaviour in its own
+> published protocol: *"An id an operator sends is rewritten, not honoured, so a
+> client must never treat a 32-byte prefix as addressing."* It is a contract,
+> not a defect, and `dropssh connect` already obeys it by writing **bare**
+> frames on the operator leg. No code change; this entry stays because the
+> consequence is the part a future implementer needs.
+
 **Where:** the relay.
 
 An operator frame carrying `"f"*32 + payload` arrives at the node as
@@ -377,6 +404,18 @@ wrong in a way that only shows up when a second session exists.
 ---
 
 ## B13. The reference operator inverts text and binary
+
+> **PARTLY ANSWERED, 2026-09-28 (relay r11).** Our side asked for the RULE to be
+> stated (issue #9, item A2) and the relay now publishes it in the protocol: the
+> operator receives text control frames and sends binary data frames only, and
+> an operator text frame closes the socket 1003. The author's reply also
+> corrects our reading of the pasted file: the reference doc describes the
+> **node** sending `ready`, not the operator, and a node's `ready` is never
+> silently ignored. ⛔ **We have not re-read `docs/08-reverse.md` in r11, so
+> whether the two fatal defects below are fixed in the file is NOT established
+> here.** B14 in particular is a syntax error in a paste, and only running the
+> current file answers it. Treat both as open until someone runs the published
+> client.
 
 **Where:** `docs/08-reverse.md` in the relay's repository, as pasted on
 2026-09-27.
@@ -623,7 +662,9 @@ working one by reading its output.
 correctly: not that the bound is unreachable, but that **this** relay is
 unreachable *for* the bound. `dropssh relay` answers 503 on the upgrade for a
 name with no node, and the live ajam relay holds the operator and then closes
-1008 `node open timeout` at about ten seconds. Both end the session long before
+an unanswered session with **1013 `node open timeout` after 15 s** (measured
+2026-09-28 at r11; this entry previously said 1008 at ten seconds, which was
+wrong in both numbers). Both end the session long before
 a 60 s client-side bound, so both measure the RELAY's patience, not the
 CLIENT's. The bound exists for the relay that never closes, so the fixture has
 to be one that never closes: `SilentNodeRelay` in `tests/mux-probe.py`

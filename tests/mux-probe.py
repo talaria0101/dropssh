@@ -382,11 +382,13 @@ class SilentNodeRelay(threading.Thread):
 
     ⛔ THE BUG IT WAS BUILT FOR IS REAL AND WAS MEASURED. The first version of
     this case ran against `dropssh relay` with no node attached. That relay
-    holds the operator on the upgrade and closes with 1008 `node open timeout`
-    after about ten seconds, so the client exited well inside its own bound and
-    the case was green for the wrong reason: it was asserting the RELAY's
-    timeout, not the CLIENT's. Both paths are now asserted, and the one with the
-    stub below is the one that reaches the bound.
+    holds the operator on the upgrade and closes an unanswered session with
+    1013 `node open timeout` after 15 s (measured 2026-09-28 at r11; this
+    comment previously said 1008 at about ten seconds, which was wrong in both
+    numbers), so the client exited well inside its own bound and the case was
+    green for the wrong reason: it was asserting the RELAY's timeout, not the
+    CLIENT's. Both paths are now asserted, and the one with the stub below is
+    the one that reaches the bound.
     """
 
     def __init__(self, path):
@@ -732,8 +734,9 @@ def main():
         # operator meets first.
         #
         # This case exists because `dropssh connect` exited 0 after the relay
-        # closed with 1008 "node open timeout" -- a refused login reported to
-        # ssh as a success. That half is real and is asserted below.
+        # closed with an open timeout (1013 `node open timeout`, measured at
+        # r11; this comment previously said 1008) -- a refused login reported
+        # to ssh as a success. That half is real and is asserted below.
         #
         # ⛔ IT DELIBERATELY DOES NOT ASSERT THAT THE ready-GATE IS WHAT PREVENTS
         # IT, BECAUSE MEASUREMENT SAYS IT CANNOT BE SEEN FROM OUTSIDE. Against
@@ -922,11 +925,36 @@ def main():
                     "the message for a silent node did not name `ready`, so an "
                     "operator cannot tell it from a refused upgrade: %r"
                     % r.stderr[:200])
-            if b"1008" in r.stderr or b"node open timeout" in r.stderr:
+            # ⛔ THE RELAY'S OWN CLOSE MUST NOT BE WHAT ENDED THIS, AND THE
+            # CHECK IS ON THE SENTENCE THAT CLAIMS TO BE THE DIAGNOSIS RATHER
+            # THAN ON THE WORD "1008" ANYWHERE.
+            #
+            # The first version of this was `b"1008" in r.stderr or
+            # b"node open timeout" in r.stderr`, which is a substring test over
+            # the whole log. It went red the moment the message was corrected,
+            # because the corrected progress line MENTIONS 1008 while
+            # explaining that it is not what happened here. The test was
+            # asserting a word, not the behaviour, and it failed for a
+            # reason that had nothing to do with the bound.
+            #
+            # ⛔ AND NOTE THAT THE RELAY'S REAL CLOSE FOR THIS IS NOT 1008. It
+            # was measured against tcp.ssh.relay.ajam.dev on 2026-09-28: an
+            # unanswered `open` is closed **1013 `node open timeout` at 15 s**.
+            # So a substring test for the wrong code was passing for the wrong
+            # reason twice over.
+            #
+            # What is asserted now is the one that cannot be faked: this stub
+            # never closes the socket, so the ONLY thing that can end the
+            # session is the client's own bound, and the message it prints on
+            # that path names its own bound rather than a relay close. The
+            # elapsed-time assertions below already prove the bound fired.
+            if b"relay closed with 1013" in r.stderr or \
+               b"relay closed with 1008" in r.stderr or \
+               b"connection closed before the node answered" in r.stderr:
                 ready_bound_failures.append(
-                    "the silent-node path reported 1008 node open timeout, which "
-                    "is the RELAY's message and cannot be the one this stub "
-                    "produces: %r" % r.stderr[:200])
+                    "the silent-node session ended on a RELAY close rather than "
+                    "on this client's own bound, so the bound under test was "
+                    "never exercised: %r" % r.stderr[:200])
             if after_text == 0:
                 # ⛔ A BOUND OF 0 IS A BUILD WITH NO BOUND, AND THE CASE FAILS IT.
                 # This branch is not a second opinion on a working build; it is

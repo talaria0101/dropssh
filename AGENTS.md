@@ -225,13 +225,20 @@ Still open, and named in `docs/relay-issues.md`:
 ## Traps added since the multiplexer shipped
 
 * ⛔ **A TEXT FRAME ON A DATA LEG IS CLOSE 1003, A BARE NODE FRAME IS CLOSE
-  1009, AND DATA SENT BEFORE `ready` IS CLOSE 1008.** Three different bugs,
-  three different closes, and in C the opcode is chosen by the frame writer. A
-  client that logs all three as "framing error" cannot tell which it has.
+  1009, DATA SENT BEFORE `ready` IS CLOSE 1008, AND A NODE THAT NEVER ANSWERS
+  `open` IS CLOSE 1013 AFTER 15 s.** Four different bugs, four different
+  closes, and in C the opcode is chosen by the frame writer. A client that
+  logs them all as "framing error" cannot tell which it has.
 * ⛔ **THE OPERATOR SENDS NOTHING UNTIL IT SEES `ready`.** Writing the ssh
   banner first is torn down (operator 1008 `wait for ready`, node 1003
   `unknown session id`). `connect` holds stdin.
-* ⛔ **STDIN EOF IS NOT "SESSION OVER".** ssh writes its whole conversation and
+* ⛔ **A NODE'S `reject` IS A REFUSAL YOU MUST READ.** A node that refuses a
+  session has its `reject{id,reason}` forwarded to the operator as a **text**
+  frame and then the operator is closed 1011 carrying the same reason. A client
+  that only handles `ready` and `close` has an open, idle session and no
+  explanation, and this process is an ssh `ProxyCommand` whose only channel is
+  stderr. Measured 2026-09-28 at relay r11.
+* ⛔ **THE STDIN EOF IS NOT "SESSION OVER".** ssh writes its whole conversation and
   then closes stdin, but the reply is still coming. A websocket Close there
   tells the relay to tear the session down, and the operator exits having read
   nothing.

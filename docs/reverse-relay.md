@@ -73,11 +73,20 @@ format and the measurements above agree with it.
 | relay -> node | `{"type":"open","id":"<32 hex>"}` | an operator has arrived |
 | node -> relay | `{"type":"ready","id":"<32 hex>"}` | the local ssh server is up |
 | node -> relay | `{"type":"reject","id":"<32 hex>","reason":"..."}` | it could not be started |
+| relay -> operator | `{"type":"reject","id":"<32 hex>","reason":"..."}` | ⛔ **SINCE r11 (2026-09-28).** The relay FORWARDS the node's `reject` to the operator as a text frame, then closes the operator's socket. Measured: the operator receives the node's full reason and a 1011 close carrying it. Before r11 an operator whose node refused had an open, idle session and no explanation at all. This is what our side of issue #9 asked for (item A1), and it is now ours to READ. |
 | relay -> node | `{"type":"close","id":"<32 hex>"}` | the session is over |
 | either | `{"type":"bye"}` | that side is finished |
 
 The field is `type`, not `verb`. An earlier reading of the docs said `verb`,
 and code that parses `verb` sees no control message at all.
+
+⛔ **THE OPERATOR'S LEG IS DATA-ONLY, AND THIS IS NOW STATED BY THE RELAY.**
+Since r11 the protocol is documented in this exact form: *"the operator receives
+text control frames and sends binary data frames only — an operator text frame
+closes the socket `1003`."* Our own comment on issue #9 asked for that one line
+(item A2) so a reader would not rediscover it, and the relay's reference
+operator still does not obey it. Re-measured 2/2 by us: an operator sending a
+text `ready` is closed **1003 `binary frames required`**.
 
 **Data frames are BINARY (opcode 0x2), and the two directions are NOT
 symmetric.** This was measured four ways in one session, and the asymmetry is the
@@ -158,9 +167,31 @@ convention: the node's `ready` is forwarded to the operator as a **text** frame
 and the operator parses it, so a client that only reads binary frames on that
 socket will sit waiting for data that has already arrived as text.
 
-**The node must answer `open` promptly.** Measured: an operator whose `open`
-goes unanswered is closed with a Close frame carrying `node open timeout`, and
-the node then receives `close` for a session that never ran.
+**⛔ THE NODE MUST ANSWER `open` PROMPTLY, AND THE RELAY'S OWN WINDOW IS 15 s,
+NOT 10.** Measured 2026-09-28 against `tcp.ssh.relay.ajam.dev` at version
+`2026-09-28-r11`, with a node that registers, answers `hello`, and then says
+nothing:
+
+```
+operator closed  1013 "node open timeout"   at 15.3 s
+node then received {"type":"close","id":"<the session that never ran>"}
+```
+
+⛔ **THIS CORRECTS A NUMBER THIS DOCUMENT HAD WRONG.** It previously said an
+unanswered `open` closes with a frame carrying `node open timeout` and, by
+implication, shared our client's 10 s figure. The code is **1013**, not 1008,
+and the window is **15 s**, not 10. The 10 s in `src/connect.c` had been
+carried down from an earlier measurement and had never been re-measured against
+this relay; it was five seconds short, so it told an operator to stop looking
+before the relay had finished waiting.
+
+⛔ **AND 1008 IS NOT THE SAME FAULT.** On the reverse leg r11 uses 1008 for two
+other things: `unknown role`, and `wait for ready` on the operator. So a 1008
+during a wait for a node's `ready` is an OPERATOR-side protocol error and not a
+slow node, and code that reports it as "the node is not answering" sends an
+operator to look at the wrong process. `dropssh connect` now handles 1013 and
+1008 as different faults, and the distinction is asserted in `tests/mux-probe.py`
+case 8 rather than held in a comment.
 
 ## What a node must do, in order
 
@@ -206,20 +237,27 @@ curl -sS -X POST "https://tcp.ssh.relay.ajam.dev/v1/stop/$NAME" -H "X-Relay-Toke
 
 ## Errors observed
 
+**Read the relay's own close table before this one.** Since r11 the relay
+publishes 23 fixed (code, reason) pairs with the observing side, at
+`https://tcp.ssh.relay.ajam.dev/index.md`, generated from its source and
+checked by a gate. It is the authority. The table below is ours, is the subset
+we have actually met, and **the 1008 rows here are the ones that were wrong.**
+
 | message | meaning |
 | --- | --- |
 | `403` on the node or connect upgrade | absent or wrong token for that role |
-| `503` on the connect upgrade | the node was not connected when the operator arrived |
+| `503` on the connect upgrade | the node was not connected when the operator arrived. **Measured 2026-09-28 at r11:** a pair with no node attached is refused with `503 reverse: node offline`, in ~10 s, and `dropssh connect` exits non-zero naming the reason. |
 | `409` on the node upgrade | a node with that name is already connected |
-| Close `node open timeout` | the node did not answer `open` in time |
+| ⛔ Close `node open timeout` (**1013**) | the node did not answer `open` within the relay's **15 s** window. **Measured 2026-09-28, r11.** This is the correct code and the correct interval; our own files said 1008 and 10 s until this measurement. |
 | Close `binary frames required` (1003) | a text frame was sent where a data frame was required |
 | ⛔ Close `bad multiplex frame` (1009) | **a node data frame carried no 32-hex id.** Measured 2026-09-28, 3/3. The operator is then closed 1011 `node disconnected`. |
-| ⛔ Close `wait for ready` (1008) on the operator | **the operator wrote session data before the node answered `open` with `ready`.** Measured 2026-09-28: the session is torn down and the node is closed 1003 `unknown session id`. |
+| ⛔ Close `wait for ready` (1008) on the operator | **the operator wrote session data before the node answered `open` with `ready`.** Measured 2026-09-28: the session is torn down and the node is closed 1003 `unknown session id`. **Not the same fault as the row above**, which is why one code is not enough to name either. |
+| ⛔ `reject{id,reason}` as a **text** frame, then close | **a node refused the session.** Measured 2026-09-28 against r11: the relay forwards the node's full reason to the operator as text, then closes. On the operator socket the close is **1011 carrying the node's own reason**, and r11 states the reason is truncated to 100 chars. Parse the reason, not the code. `dropssh connect` reports it and exits non-zero, measured: `the node refused the session: this node is at its 64 session limit` in 0.4 s, where a client that ignores `reject` has an open, idle session and no explanation. |
 
-**The three closes an implementer meets first are 1003, 1008 and 1009, and
-they are three different bugs.** 1003 is a text frame where data was
-required, 1008 is data sent before `ready`, and 1009 is a data frame with no
-session id. In C the opcode is chosen by the frame writer, so a client that
+**The closes an implementer meets first are 1003, 1008, 1009 and 1013, and
+they are four different bugs.** 1003 is a text frame where data was
+required, 1008 is data sent before `ready`, 1009 is a data frame with no
+session id, and 1013 is a node that did not answer `open` in 15 s. In C the opcode is chosen by the frame writer, so a client that
 logs all three as "framing error" cannot tell which one it has, and each has a
 different fix.
 
@@ -337,7 +375,25 @@ target.
 
 ## Sources
 
-* <https://tcp.ssh.relay.ajam.dev/llms.txt> (version `2026-09-27-r2`)
-* <https://tcp.ssh.relay.ajam.dev/index.md>
+* <https://tcp.ssh.relay.ajam.dev/llms.txt> and `llms-full.txt` (version
+  `2026-09-28-r11`, re-read 2026-09-28)
+* <https://tcp.ssh.relay.ajam.dev/index.md> — the relay's own close table,
+  23 fixed (code, reason) pairs with the observing side, generated from
+  `worker/src/reverse.js` and checked by a gate. It is the authority on close
+  codes; this file is the subset we have met.
+* Issue #9 on this repository, and the reply on it, which is where r11's
+  behaviour was answered item by item rather than discovered.
 * The original podssh work, which this reimplements in C:
   <https://github.com/Azathothas/podbox/pull/67>
+
+## ⛔ THREE QUESTIONS THE RELAY HAS NOW ANSWERED, WHICH WERE OPEN HERE
+
+Measured or stated at r11, 2026-09-28. Each of these was a question this
+repository had open, and each is now closed by the relay's own statement plus
+our measurement.
+
+| was open | answer | what it changed here |
+| --- | --- | --- |
+| **the keepalive interval** (our B1) | ⛔ **there is none on the reverse path.** The server never sends application keepalives on reverse — unlike forward's zero-length frame every 25 s — and quiet is healthy. A client's own ws pings are fine and do not wake the object. | A comment in `src/connect.c` said "the relay's keepalive arrives every 25 s", which was the FORWARD path's behaviour carried onto a path it does not describe. **Corrected.** Nothing in the code depended on it; the comment would have sent the next reader looking for something that never arrives. |
+| **does `maxFrameBytes` count the 32-hex prefix** (our B2) | ⛔ **it does not.** Operator payload ≤ 65536; node wire ≤ 65568 (payload + 32-byte id). | Our reading — clamp the whole frame, then prepend — was **right**, and `src/serve.c` already does it: payload clamped to `ws_max_frame`, then `+ 32` for the id, giving ≤ 65568. **Confirmed against the stated numbers, no code change.** A client that clamped the payload and then prepended would be over the cap by exactly 32, which is the failure this question existed to prevent. |
+| **a node's `ready` that never comes** | ⛔ **1013 `node open timeout` at 15 s.** | Our code and docs said 1008 at 10 s. **Both were wrong.** Measured against the live relay; see the corrected entry in the protocol section and the new `connect.c` branches. |

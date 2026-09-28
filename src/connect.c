@@ -331,8 +331,20 @@ int dropssh_connect(dropssh_opts *o) {
             waited_ready = now - wait_started;
             if (waited_ready >= 10000 && !said_waiting) {
                 said_waiting = 1;
+                /* ⛔ CORRECTED 2026-09-28 BY MEASUREMENT AGAINST THE LIVE
+                 * RELAY. This said "the relay closes an unanswered open at
+                 * about that point", naming 10 s. The relay's own published
+                 * deadline is **15 s** and the close is **1013**, and measuring
+                 * it gave 15.3 s -- so the old sentence told an operator to
+                 * stop looking five seconds before the relay had finished
+                 * waiting, and named a close code the relay does not send.
+                 *
+                 * The number below is deliberately not a prediction of when the
+                 * RELAY will close: our own 60 s bound is the outer limit, and
+                 * this line is a progress note so a 15 s wait is not a hang. */
                 logf("still waiting for the node to answer `ready` after 10s; "
-                     "the relay closes an unanswered open at about that point");
+                     "the relay closes an unanswered open at about 15s with "
+                     "1013 node open timeout");
             }
             /* The bound is six times the relay's own open timeout, so a slow
              * but working node is not cut off and a relay's own 1008 is what
@@ -391,10 +403,40 @@ int dropssh_connect(dropssh_opts *o) {
                      * relay might not have named. */
                     if (gated && !seen_ready) {
                         rc = 1;
-                        if (code == 1008) {
+                        /* ⛔ MEASURED AGAINST tcp.ssh.relay.ajam.dev, 2026-09-28,
+                         * AND IT CORRECTED A NUMBER THIS FILE HAD WRONG.
+                         *
+                         * The code for an unanswered `open` is **1013**, not
+                         * 1008, and the relay's deadline is **15 s**, not 10.
+                         * Measured: a node that registers, answers `hello`, and
+                         * never answers `open`; the operator was closed with
+                         *
+                         *     1013 node open timeout        at 15.3s
+                         *
+                         * and the node then received `close` for the session
+                         * that never ran. 1008 is still real and still ours to
+                         * understand -- r11 uses it for "unknown role" and for
+                         * "wait for ready", the second of which is an OPERATOR
+                         * sending data before `ready` -- so both codes are
+                         * handled and neither is assumed.
+                         *
+                         * ⛔ AND THE OLD TEXT NAMED 1008 IN TWO PLACES THAT
+                         * WOULD HAVE PRINTED THE WRONG DIAGNOSIS. A close of
+                         * 1008 during this wait is an operator-side protocol
+                         * error, not a slow node, and saying "the node is not
+                         * answering" about it sends an operator to look at the
+                         * wrong process. */
+                        if (code == 1013) {
                             logf("the node never answered `ready`: the relay "
-                                 "closed with 1008 node open timeout, which "
-                                 "means the node is not there or not answering");
+                                 "closed with 1013 node open timeout after 15s, "
+                                 "which means the node is not there, is not "
+                                 "answering `open`, or could not start its "
+                                 "--server command");
+                        } else if (code == 1008) {
+                            logf("the connection closed before the node "
+                                 "answered `ready`, with 1008 -- on the reverse "
+                                 "leg that is a protocol error rather than a "
+                                 "slow node");
                         } else if (!code || code == 1005) {
                             logf("the connection closed before the node "
                                  "answered `ready`; the node is not connected "
@@ -414,7 +456,30 @@ int dropssh_connect(dropssh_opts *o) {
                              "required (a text frame was sent where session data "
                              "was required)");
                     } else if (code == 1011) {
-                        logf("the node disconnected (relay close 1011)");
+                        /* ⛔ 1011 IS NOT ONE THING. r11 uses it for at least
+                         * four distinct conditions on this leg, and the reason
+                         * string is what tells them apart:
+                         *
+                         *   "node disconnected"  the node socket ended
+                         *   "relay backpressure"  >1 MiB queued for a slow peer
+                         *   "node unavailable"    the `open` could not be queued
+                         *   "node offline"        operator data, no node
+                         *
+                         * A node's `reject` also arrives as 1011 carrying the
+                         * NODE's own reason (see the `reject` branch above, which
+                         * reports that before the close is read). So the reason
+                         * is printed rather than a fixed sentence, and a slow
+                         * receiver is not reported as a node going away. */
+                        logf("the relay closed the session: 1011 %s",
+                             ws_close_reason(&ws) && ws_close_reason(&ws)[0]
+                                 ? ws_close_reason(&ws) : "node disconnected");
+                        rc = 1;
+                    } else if (code == 1013) {
+                        /* The node's `open` was not answered in the relay's
+                         * window. This is the post-`ready` arrival of the same
+                         * fault the pre-`ready` branch above names. */
+                        logf("the node did not answer `open` within the "
+                             "relay's 15s window (1013 node open timeout)");
                         rc = 1;
                     } else if (code && code != 1005 && code != 1000 && code != 1001) {
                         logf("the relay closed the session: code %d %s", code,
@@ -448,6 +513,72 @@ int dropssh_connect(dropssh_opts *o) {
                             logf("node is ready");
                         }
                         seen_ready = 1;
+                    } else if (strcmp(verb, "reject") == 0) {
+                        /* ⛔ A NODE THAT SAYS `reject` IS A REFUSED LOGIN, AND IT
+                         * IS REPORTED AS ONE. The relay's author implemented
+                         * this on their side in r11 (issue #9, A1): a node's
+                         * `reject{id,reason}` is forwarded to the operator as a
+                         * text frame and then the operator is closed 1011.
+                         *
+                         * Before that, and on the version of the relay measured
+                         * here, an operator whose node refused to start sat
+                         * there with an open, idle session and NO EXPLANATION
+                         * AT ALL. That is the worst possible failure for this
+                         * process specifically: it is an ssh ProxyCommand, so
+                         * stderr is its only channel and it has no other way to
+                         * say anything. The operator's own comment on #9 asked
+                         * for exactly this, and the answer was "yes, and here
+                         * is the reference implementation" -- so reading the
+                         * frame is the part that is ours to do.
+                         *
+                         * ⛔ AND THE REASON IS EXTRACTED, NOT LOGGED RAW. It
+                         * comes from the network and it goes to a human on
+                         * stderr, so it is length-bounded and a control
+                         * character in it cannot move a cursor or invent a
+                         * line. The full reason is what makes this useful: "the
+                         * node is at its 64 session limit" tells an operator
+                         * what to do, and "refused" does not.
+                         *
+                         * `rc = 1` because a session that was refused was not
+                         * established, and exit 0 here is the "refused login
+                         * reported as success" defect this file has already
+                         * fixed once for the 1008 path. */
+                        char reason[256] = "";
+                        {
+                            const char *q = strstr(json, "\"reason\"");
+                            if (q) {
+                                q += strlen("\"reason\"");
+                                while (*q == ' ' || *q == '\t' || *q == ':') {
+                                    q++;
+                                }
+                                if (*q == '"') {
+                                    q++;
+                                    size_t k = 0;
+                                    while (*q && *q != '"' && k < sizeof reason - 1) {
+                                        /* ⛔ A CONTROL CHARACTER IN A REASON
+                                         * FROM THE NETWORK IS DROPPED, not
+                                         * passed through: stderr is a terminal
+                                         * and a reason is a sentence about a
+                                         * node, not a way to paint one. */
+                                        if ((unsigned char)*q >= 0x20 || *q == ' ') {
+                                            reason[k++] = *q;
+                                        }
+                                        q++;
+                                    }
+                                    reason[k] = 0;
+                                }
+                            }
+                        }
+                        if (reason[0]) {
+                            logf("the node refused the session: %s", reason);
+                        } else {
+                            logf("the node refused the session and sent no "
+                                 "reason; its --server command is the first "
+                                 "thing to check");
+                        }
+                        rc = 1;
+                        free(json);
+                        goto done;
                     } else if (strcmp(verb, "close") == 0) {
                         if (o->verbose) {
                             logf("the node closed the session");
@@ -566,10 +697,20 @@ int dropssh_connect(dropssh_opts *o) {
         }   /* end of the non-reverse (forward / rendezvous) branch */
 
         /* ⛔ A QUIET RELAY IS A 20 ms SLEEP, NOT A BUSY LOOP AND NOT A BLOCK.
-         * An ssh session can be silent for minutes while somebody reads, and
-         * the relay's keepalive arrives every 25 s. A busy loop would burn a
-         * core for the length of a reading session; a blocking read is the
-         * starvation above. */
+         * An ssh session can be silent for minutes while somebody reads. A
+         * busy loop would burn a core for the length of a reading session; a
+         * blocking read is the starvation above.
+         *
+         * ⛔ CORRECTED 2026-09-28, FROM ISSUE #9. This comment said "the relay's
+         * keepalive arrives every 25 s", which was the FORWARD path's behaviour
+         * carried over to a path it does not describe. The relay's own author
+         * states in r11 that the reverse path never sends application
+         * keepalives, unlike forward's zero-length frame every 25 s, and that
+         * quiet is healthy there. So on the leg this loop drives, a quiet relay
+         * is a RELAY THAT IS WORKING, and the only thing that ends a session is
+         * the relay closing the socket or this process's own bound. Nothing
+         * below depends on a keepalive arriving, and the sleep is here because a
+         * busy loop burns a core, not because something is expected. */
         if (!progressed) {
             dropssh_sleep_ms(20);
         }
