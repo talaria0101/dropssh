@@ -28,6 +28,7 @@
  * to be told the session is over and then closes its own copy.
  */
 #include "dropssh.h"
+#include "token.h"
 #include "transport.h"
 #include "ws.h"
 #include "util.h"
@@ -95,6 +96,62 @@ static void refuse(Transport *t, int status, const char *why) {
 
 #define RELAY_MAX_NAMES 32
 #define RELAY_NAME_MAX  64
+
+/* ⛔ THE RELAY'S TOKEN STATE, AND IT IS READ-ONCE, PROCESS-WIDE, AND OPTIONAL.
+ *
+ * A relay with no key ACCEPTS EVERY TOKEN, and that is the compatibility rule
+ * rather than an oversight: `dropssh relay` has always taken no token, serves
+ * every session, and a change that began refusing unconfigured peers would
+ * break every existing deployment on the first upgrade. A deployment that
+ * wants role separation configures a key, and the startup banner and
+ * `--status` both say which of the two this process is, because a relay that
+ * silently accepted everything while appearing to verify would be worse than
+ * either. */
+static dropssh_key relay_key;
+static unsigned long long relay_pairs_issued = 0;
+static unsigned long long relay_tokens_refused = 0;
+static unsigned RELAY_PAIR_TTL = 86400;   /* a day; the pair says when it ends */
+
+/* A JSON string value from a body, copied out. ⛔ The bound is the point: this
+ * reads a network body into a fixed buffer, and the only field it is ever
+ * asked for is a name. */
+static int json_field(const char *body, const char *key, char *out,
+                      size_t outlen) {
+    if (body == NULL || key == NULL || out == NULL || outlen == 0) {
+        return -1;
+    }
+    char pat[64];
+    int pn = snprintf(pat, sizeof pat, "\"%s\"", key);
+    if (pn <= 0 || (size_t)pn >= sizeof pat) {
+        return -1;
+    }
+    const char *p = strstr(body, pat);
+    if (p == NULL) {
+        return -1;
+    }
+    p += pn;
+    while (*p == ' ' || *p == '\t' || *p == ':') {
+        p++;
+    }
+    if (*p != '"') {
+        return -1;
+    }
+    p++;
+    size_t o = 0;
+    while (*p && *p != '"' && o < outlen - 1) {
+        /* ⛔ A BACKSLASH IS SKIPPED, NOT EXPANDED. The one field read here is a
+         * node name, and a name with a backslash is not a name this relay
+         * would ever have issued. Expanding escapes would let a body encode a
+         * character the issuer never put in, and the whole claim of the token
+         * is that the RELAY chose the name. */
+        if (*p == '\\' && p[1]) {
+            p++;
+        }
+        out[o++] = *p++;
+    }
+    out[o] = 0;
+    return o ? 0 : -1;
+}
 
 /* ============================================================================
  * THE MULTIPLEXED REVERSE RELAY.
@@ -269,6 +326,10 @@ static void client_unref(Client *c) {
     }
 }
 static const char *only_name = NULL;
+/* ⛔ THE TOKEN KEY IS A PASSPHRASE, AND IT IS NOT KEPT IN THE OPTION STRUCT OR
+ * PRINTED ANYWHERE. The flag is read into a local and turned immediately into
+ * a SHA-256 digest; see token.h for why the raw value is not retained. */
+static const char *token_key_arg = NULL;
 
 /* ⛔ THE LIMITS ARE POLICY NUMBERS, NAMED, AND ENFORCED AT ACCEPT TIME. B9 was
  * "no peer cap, no idle timeout, no handshake rate limit", and each of those is
@@ -916,6 +977,192 @@ node_done:
     ws_close(ws);
 }
 
+/* ⛔ `POST /v1/pair` IS THE ANSWER TO ISSUE #13 STEP 1, AND IT IS AN HTTP
+ * ENDPOINT ON THIS RELAY RATHER THAN A SUBCOMMAND BECAUSE THE CLIENT THAT
+ * CONSUMES IT IS `dropssh pair`, WHICH ALREADY POSTS TO ONE.
+ *
+ * The protocol is the ajam relay's, measured, and `dropssh_request_pair` in
+ * `ws.c` already reads `{name, node_token, connect_token, stop_token,
+ * expires}` out of the answer. So the shape was fixed before this was written
+ * and writing anything else would have made `dropssh pair` fail against our own
+ * relay, which is the definition of the wrong end of the ladder.
+ *
+ * ⛔ IT REQUIRES A CONFIGURED KEY AND ANSWERS 403 WITHOUT ONE, RATHER THAN
+ * ISSUING TOKENS NOBODY CAN VERIFY. A relay that mints pairs but holds no key
+ * would hand out two credentials that any relay accepts and that protect
+ * nothing, and the operator would believe they had configured something. The
+ * refusal names the flag, because "it did not work" is not actionable and
+ * "this relay has no key" is the whole answer.
+ *
+ * ⛔ AND THE NAME IS ECHOED BACK, NOT INVENTED, BUT IT IS VALIDATED FIRST: a
+ * name with a path separator or a newline in it is refused, because the name
+ * becomes a PATH SEGMENT on both /v1/node/ and /v1/connect/, and a name
+ * carrying a separator would let the issuer choose which endpoint the pair is
+ * used against. */
+static void serve_pair(Transport *t, const char *body) {
+    if (!dropssh_key_configured(&relay_key)) {
+        refuse(t, 403, "this relay has no token key, so it issues nothing. "
+                      "Start it with --token-key or DROPSSH_RELAY_KEY.\n");
+        return;
+    }
+    char name[128] = "";
+    /* ⛔ THE RELAY INVENTS THE NAME WHEN THE BODY DOES NOT CARRY ONE, AND THAT
+     * IS THE NORMAL CASE RATHER THAN AN ERROR. `dropssh pair` is documented as
+     * POSTing `/v1/pair` and printing the name, and it cannot know a name to
+     * ask for -- inventing one is the entire point of asking a relay for a
+     * pair. Refusing a nameless POST would have made `dropssh pair` fail
+     * against our own relay while working against the ajam one, which is the
+     * exact half-built shape this whole change exists to avoid.
+     *
+     * A caller that DOES name it gets that name, which is what makes a pair
+     * reproducible across a relay restart and across two relays: re-POSTing the
+     * same name against the same key mints the same two tokens. */
+    if (body == NULL || json_field(body, "name", name, sizeof name) != 0) {
+        char raw[9];
+        dropssh_random_b64(raw, sizeof raw, 6);
+        snprintf(name, sizeof name, "box-%s", raw);
+    }
+    if (name[0] == 0) {
+        refuse(t, 400, "a pair needs a name\n");
+        return;
+    }
+    if (name[0] == '/' || strchr(name, '/') != NULL || strchr(name, '\\') != NULL ||
+        strchr(name, '?') != NULL || strchr(name, '#') != NULL ||
+        strchr(name, ' ') != NULL || strchr(name, '\r') != NULL ||
+        strchr(name, '\n') != NULL || strchr(name, '|') != NULL) {
+        refuse(t, 400, "a node name may not contain a path separator, a "
+                       "space, a newline or the token field separator\n");
+        return;
+    }
+    if (strlen(name) >= RELAY_NAME_MAX) {
+        refuse(t, 400, "a node name must be shorter than 64 characters\n");
+        return;
+    }
+    char node_tok[600], conn_tok[600];
+    long long now = (long long)dropssh_now_ms();
+    if (dropssh_token_issue(&relay_key, name, DROPSSH_ROLE_NODE,
+                            RELAY_PAIR_TTL, now, node_tok,
+                            sizeof node_tok) != 0 ||
+        dropssh_token_issue(&relay_key, name, DROPSSH_ROLE_CONNECT,
+                            RELAY_PAIR_TTL, now, conn_tok,
+                            sizeof conn_tok) != 0) {
+        refuse(t, 500, "this relay could not issue a pair\n");
+        return;
+    }
+    long long exp = now + (long long)RELAY_PAIR_TTL * 1000;
+    char body_out[2048];
+    /* ⛔ THE TWO TOKENS ARE PRINTED ONCE, IN ONE BODY, AND THE BODY IS NOT
+     * LOGGED. A relay log is a thing that gets pasted into a bug report, and
+     * the two lines above are a node's entire credential. The name, the expiry
+     * and the two tokens go to the caller and nowhere else. */
+    int bn = snprintf(body_out, sizeof body_out,
+        "{\"name\":\"%s\",\"node_token\":\"%s\",\"connect_token\":\"%s\","
+        "\"expires\":%lld}\n", name, node_tok, conn_tok, exp);
+    if (bn <= 0 || (size_t)bn >= sizeof body_out) {
+        refuse(t, 500, "the pair did not fit\n");
+        memset(node_tok, 0, sizeof node_tok);
+        memset(conn_tok, 0, sizeof conn_tok);
+        return;
+    }
+    char resp[2048 + 256];
+    int rn = snprintf(resp, sizeof resp,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s", (size_t)bn, body_out);
+    if (rn > 0 && (size_t)rn < sizeof resp) {
+        t->write(t, resp, (size_t)rn);
+    }
+    relay_pairs_issued++;
+    logf("issued a pair for %s (expires in %us)", name, RELAY_PAIR_TTL);
+    /* ⛔ ZEROED AFTER THE WRITE, because this is a long-lived process and a
+     * credential left on a stack frame is a credential in a core dump. */
+    memset(node_tok, 0, sizeof node_tok);
+    memset(conn_tok, 0, sizeof conn_tok);
+    memset(body_out, 0, sizeof body_out);
+}
+
+/* ⛔ AN UPGRADE IS AUTHENTICATED HERE, AT THE ONE POINT WHERE THE REQUEST HEAD
+ * ARE STILL IN HAND, AND NOT AFTER THE 101 HAS GONE OUT.
+ *
+ * The relay already answers 503 on the UPGRADE for an absent node, precisely so
+ * a refusal can be an HTTP status rather than a 101 followed by a Close. A
+ * token check placed after the accept would put it back on the wrong side of
+ * that split: the peer would have been told "yes" and the only honest answer
+ * left would be a Close frame, which an operator's tooling reads as "accepted,
+ * then the node hung up" and which this relay's own connect verb once turned
+ * into exit 0. So the check runs with the request still un-answered.
+ *
+ * ⛔ AND IT IS A 403 WITH THE REASON, BECAUSE "NO TOKEN, OR THE WRONG TOKEN" IS
+ * NOT AN ANSWER. The four reasons a token is refused are separable and three of
+ * them are the operator's to fix: `wrong-role` is the two tokens from one pair
+ * being swapped, `expired` is a pair that aged out, and `bad-mac` is a pair from
+ * a different relay. Saying which turns a support question into a one-line fix,
+ * and the reason is safe to send because it describes the failure and never
+ * echoes any part of the credential. */
+static int check_token(const char *token, dropssh_role role, const char *name,
+                       char *whybuf, size_t whylen) {
+    /* An unconfigured relay accepts everything, and says so. */
+    if (!dropssh_key_configured(&relay_key)) {
+        return 0;
+    }
+    dropssh_claims c;
+    const char *why = "malformed";
+    if (dropssh_token_verify(&relay_key, token, role,
+                             (long long)dropssh_now_ms(), &c, &why) != 0) {
+        relay_tokens_refused++;
+        const char *said = NULL;
+        if (strcmp(why, "wrong-role") == 0) {
+            said = "";
+            if (role == DROPSSH_ROLE_NODE) {
+                snprintf(whybuf, whylen,
+                         "%sthe two tokens from one pair are different: this "
+                         "endpoint wants the NODE token, which is the `serve` "
+                         "line that `dropssh pair` printed", said);
+            } else {
+                snprintf(whybuf, whylen,
+                         "%sthe two tokens from one pair are different: this "
+                         "endpoint wants the CONNECT token, which is the "
+                         "`connect` line that `dropssh pair` printed", said);
+            }
+        } else if (strcmp(why, "expired") == 0) {
+            snprintf(whybuf, whylen,
+                     "this token expired. Issue a new pair with `dropssh "
+                     "pair --relay %s`.", name);
+        } else if (strcmp(why, "bad-mac") == 0) {
+            snprintf(whybuf, whylen,
+                     "this token was not issued by a relay holding this key, "
+                     "or it has been altered. It may belong to a different "
+                     "relay.");
+        } else {
+            snprintf(whybuf, whylen, "this token is not a token this relay "
+                                     "issued, or it is truncated");
+        }
+        logf("refused a %s for %s: %s",
+             role == DROPSSH_ROLE_NODE ? "node" : "operator", name, why);
+        return -1;
+    }
+    /* ⛔ AND THE NAME IN THE TOKEN MUST MATCH THE NAME IN THE PATH. The token
+     * is a bearer credential, so without this a node's token would open a
+     * session on ANY name this relay serves -- and the whole point of pairing
+     * is that the two halves of a pair are bound to each other. This is the one
+     * check that is about what the token SAYS rather than whether it is
+     * genuine, and skipping it would make every role separation in this file
+     * decorative. */
+    if (c.name[0] && strcmp(c.name, name) != 0) {
+        relay_tokens_refused++;
+        snprintf(whybuf, whylen,
+                 "this token is for the name '%s', not for '%s'. A pair is "
+                 "two credentials for ONE name, and this one does not match.",
+                 c.name, name);
+        logf("refused a token for %s that was issued for %s", name, c.name);
+        return -1;
+    }
+    return 0;
+}
+
 static void *conn_thread(void *arg) {
     int fd = (int)(intptr_t)arg;
     Transport *t = transport_from_fd(fd, "relay");
@@ -927,20 +1174,101 @@ static void *conn_thread(void *arg) {
     ws_status st;
     memset(&st, 0, sizeof st);
     char path[512] = "";
-    /* ⛔ THE UPGRADE IS ANSWERED IN TWO STEPS, AND THE RELAY CHECKS ITS STATE
-     * BETWEEN THEM. The request is read without a 101 going out, the relay
-     * decides, and only then does the 101 -- or a refusal -- reach the peer.
+    char token_hdr[1024] = "";
+    char why[320] = "";
+    /* ⛔ ONE READER FOR BOTH DOORS, AND THE PAIR DOOR IS THE UPGRADE READER
+     * REFUSING ITS INPUT RATHER THAN A SECOND READ.
      *
-     * The reason is measured. The ajam relay answers `503 the node is not
-     * connected` on the UPGRADE when an operator arrives before the node
-     * (2026-09-28), and a client can act on that. A relay that sent the 101
-     * first and then closed has already told the peer "yes" and can only
-     * follow it with a Close frame, which an operator's tooling reads as
-     * "accepted, then the node hung up" and which this relay's own connect
-     * verb turned into exit 0 -- a refused login reported as success. */
-    if (ws_server_peek(t, &ws, path, sizeof path, &st) != 0) {
+     * `ws_server_peek` reads the whole request (headers + body) into `rbuf`,
+     * parses the target, and returns -1 when there is no `Sec-WebSocket-Key` --
+     * which is exactly what a plain `POST /v1/pair` looks like. At that point
+     * `rbuf` still holds the entire request, because the buffer is only reset
+     * once the key is found. So the body of a pair request is already in hand
+     * and a second read would be a second parse of a stream that cannot be
+     * rewound.
+     *
+     * The first version peeked four bytes to choose the door and could not
+     * un-consume them, which on a stream loses the start of a GET upgrade. The
+     * lesson is the one this file keeps making: read once, and let the reader
+     * that already has the bytes decide.
+     */
+    if (ws_server_peek_tok(t, &ws, path, sizeof path, token_hdr,
+                           sizeof token_hdr, &st) != 0) {
+        /* No WebSocket key. Either it was a pair POST, or it was junk. The
+         * request is still in rbuf, so the pair handler can read it. */
+        int is_pair = 0;
+        if (ws.rbuf.p != NULL && ws.rbuf.len > 0) {
+            if ((ws.rbuf.len >= 5 && memcmp(ws.rbuf.p, "POST ", 5) == 0) ||
+                (ws.rbuf.len >= 4 && memcmp(ws.rbuf.p, "POST", 4) == 0)) {
+                is_pair = 1;
+            }
+        }
+        if (is_pair) {
+            /* the body is everything after the header block, and the target is
+             * the second word of the request line */
+            char req_path[512] = "";
+            {
+                const char *sp = (const char *)memchr(ws.rbuf.p, ' ', ws.rbuf.len);
+                if (sp != NULL) {
+                    const char *sp2 = (const char *)memchr(sp + 1, ' ',
+                                             ws.rbuf.len - (size_t)(sp + 1 - (const char *)ws.rbuf.p));
+                    if (sp2 != NULL) {
+                        size_t n = (size_t)(sp2 - sp - 1);
+                        if (n >= sizeof req_path) { n = sizeof req_path - 1; }
+                        memcpy(req_path, sp + 1, n);
+                        req_path[n] = 0;
+                    }
+                }
+            }
+            unsigned char *brk = memmem(ws.rbuf.p, ws.rbuf.len, "\r\n\r\n", 4);
+            char body[2048] = "";
+            if (brk != NULL) {
+                size_t hlen = (size_t)(brk - ws.rbuf.p) + 4;
+                size_t bl = ws.rbuf.len - hlen;
+                if (bl >= sizeof body) { bl = sizeof body - 1; }
+                memcpy(body, ws.rbuf.p + hlen, bl);
+                body[bl] = 0;
+            }
+            /* ⛔ THE RESPONSE GOES OUT BEFORE ANY CLOSE, IN THIS ORDER, AND
+             * REVERSING THEM IS A SILENT FAILURE RATHER THAN A CRASH.
+             *
+             * `ws_close` sends a WebSocket Close frame and then shuts the
+             * transport. This request is plain HTTP and the peer is reading an
+             * HTTP response. The first version closed first, so the peer
+             * received `\x88\x00` -- a WebSocket close -- and then nothing: the
+             * answer had been written to a socket that was already shut. The
+             * relay stayed alive, it logged nothing, and the symptom was a
+             * two-byte reply to every single pair request.
+             *
+             * A peer that sent a POST and received a WebSocket Close has told
+             * this relay it is not a WebSocket peer, and the right answer to
+             * that is an HTTP status, not a frame from a protocol the peer did
+             * not ask for. */
+            if (strcmp(req_path, "/v1/pair") == 0) {
+                serve_pair(t, body);
+            } else {
+                refuse(t, 404, "this relay serves POST /v1/pair, GET "
+                               "/v1/node/<name> and GET /v1/connect/<name>\n");
+            }
+            memset(body, 0, sizeof body);
+            /* The transport is shut by the transport's own owner below; the
+             * WsSession here never had a 101 sent, so it has nothing of its
+             * own to close. */
+            buf_free(&ws.rbuf);
+            return NULL;
+        }
         stat_handshakes_refused++;
         logf("upgrade refused: %s", ws_strerror(&st));
+        ws_close(&ws);
+        return NULL;
+    }
+    if (strcmp(path, "/v1/pair") == 0) {
+        refuse(t, 400, "/v1/pair is a POST, not a GET\n");
+        ws_close(&ws);
+        return NULL;
+    }
+    if (strcmp(path, "/v1/pair") == 0) {
+        refuse(t, 400, "/v1/pair is a POST, not a GET\n");
         ws_close(&ws);
         return NULL;
     }
@@ -965,8 +1293,51 @@ static void *conn_thread(void *arg) {
     } else if (strncmp(path, "/connect/", 9) == 0) {
         name = path + 9;
     } else {
-        refuse(t, 404, "unknown path: this relay serves /v1/node/<name> and "
-                      "/v1/connect/<name>\n");
+        refuse(t, 404, "unknown path: this relay serves /v1/node/<name>, "
+                      "/v1/connect/<name> and POST /v1/pair\n");
+        ws_close(&ws);
+        return NULL;
+    }
+    /* ⛔ THE TOKEN IS CHECKED HERE, ON THE UPGRADE, WITH THE 101 NOT YET SENT.
+     * Everything about where this sits was argued at check_token: a check after
+     * the accept leaves only a Close frame to answer with, and a client reads
+     * that as "accepted, then the node hung up". A refusal here is an HTTP
+     * status, which is what an operator's tooling can act on.
+     *
+     * A peer that sent NO token at all is refused with the same 403 and a
+     * reason that says so, rather than being let through: a relay that has a
+     * key has been told to check, and "check" that accepts an absent token is
+     * how an unauthenticated path gets shipped by accident. */
+    if (dropssh_key_configured(&relay_key) && token_hdr[0] == 0) {
+        /* ⛔ GATED ON THE KEY BEING CONFIGURED, WHICH LOOKS REDUNDANT BECAUSE
+         * `check_token` ALSO RETURNS EARLY WHEN IT IS NOT, AND IT IS NOT.
+         *
+         * The first version refused an absent token before asking `check_token`
+         * anything, so a relay with NO key -- which is every relay anyone has
+         * run until this change -- refused every peer with "no token was sent"
+         * while its own banner said "ACCEPTED as anything". The banner and the
+         * behaviour were two different claims about the same process, and the
+         * gate that broke the existing suites was this line.
+         *
+         * The order that is correct is: ask whether this relay verifies at all,
+         * and only then decide what an absent token means. An unconfigured
+         * relay has no opinion about tokens, so an absent one is not a fault. */
+        stat_handshakes_refused++;
+        relay_tokens_refused++;
+        snprintf(why, sizeof why,
+                 "no token was sent. This relay is configured with a token "
+                 "key, so every peer must present the token `dropssh pair` "
+                 "printed for its role.");
+        logf("refused a %s for %s: no token",
+             is_node ? "node" : "operator", name);
+        refuse(t, 403, why);
+        ws_close(&ws);
+        return NULL;
+    }
+    if (check_token(token_hdr, is_node ? DROPSSH_ROLE_NODE : DROPSSH_ROLE_CONNECT,
+                    name, why, sizeof why) != 0) {
+        stat_handshakes_refused++;
+        refuse(t, 403, why);
         ws_close(&ws);
         return NULL;
     }
@@ -1348,6 +1719,15 @@ static void print_status(void) {
     printf("upgrades_ok %lu\n", hok);
     printf("upgrades_refused %lu\n", hrefused);
     printf("idle_timeout_ms %u\n", RELAY_IDLE_TIMEOUT_MS);
+    /* ⛔ AND IT SAYS WHETHER IT IS CHECKING TOKENS, BECAUSE "WHETHER THIS RELAY
+     * ENFORCES ANYTHING" IS THE FIRST QUESTION AND TODAY IT HAS NO ANSWER. The
+     * line is the whole answer in one word, and it is deliberately not the
+     * absence of a line. */
+    printf("token_key %s\n", dropssh_key_configured(&relay_key)
+           ? "configured" : "unset (every token is accepted)");
+    printf("pairs_issued %llu\n", relay_pairs_issued);
+    printf("tokens_refused %llu\n", relay_tokens_refused);
+    printf("pair_ttl_s %u\n", RELAY_PAIR_TTL);
     fflush(stdout);
 }
 
@@ -1389,6 +1769,25 @@ int dropssh_relay_main(int argc, char **argv) {
             RELAY_MAX_SESSIONS = (unsigned)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--idle-timeout") == 0 && i + 1 < argc) {
             RELAY_IDLE_TIMEOUT_MS = (unsigned)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--token-key") == 0 && i + 1 < argc) {
+            token_key_arg = argv[++i];
+        } else if (strcmp(argv[i], "--pair-ttl") == 0 && i + 1 < argc) {
+            /* ⛔ PARSED WITH strtol AND THE END POINTER CHECKED, for the reason
+             * review 1 found for `--bound-ms`: `atoi`'s answer to a non-numeric
+             * string is 0, and 0 here would mean a pair that expires the
+             * instant it is issued. A flag whose invalid input silently
+             * produces the worst value is worse than one that refuses. */
+            {
+                char *end = NULL;
+                long v = strtol(argv[++i], &end, 10);
+                if (end == argv[i] || (end && *end) || v <= 0 || v > 31536000L) {
+                    fprintf(stderr, "dropssh relay: --pair-ttl wants a number of "
+                            "seconds in 1..31536000. '%s' is not one.\n",
+                            argv[i]);
+                    return 2;
+                }
+                RELAY_PAIR_TTL = (unsigned)v;
+            }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             fprintf(stderr,
 "dropssh relay - a rendezvous relay (rendezvous, not forward)\n"
@@ -1400,6 +1799,11 @@ int dropssh_relay_main(int argc, char **argv) {
 "  --max-peers N                refuse an upgrade above N connected peers\n"
 "  --max-sessions N             refuse an operator above N sessions on a node\n"
 "  --idle-timeout MS            drop a peer silent for this long\n"
+"  --token-key PASSPHRASE       verify peers' tokens, and serve POST /v1/pair.\n"
+"                              Without it this relay accepts every token and\n"
+"                              issues nothing, which is what it has always\n"
+"                              done. DROPSSH_RELAY_KEY does the same.\n"
+"  --pair-ttl SECONDS           how long an issued pair is good for (86400)\n"
 "  --status                     print what this process is doing, and exit\n"
 "\n"
 "TESTING\n"
@@ -1427,6 +1831,29 @@ int dropssh_relay_main(int argc, char **argv) {
 "proxy: it cannot reach a target on a client's behalf. Use `connect --path\n"
 "/connect/<host>/<port>` against a forward relay for that.\n");
             return 0;
+        }
+    }
+    /* ⛔ THE KEY IS APPLIED BEFORE `--status` IS ANSWERED, because `--status` has
+     * to be able to say whether this process verifies or accepts everything, and
+     * a `--status` that ran first would always answer about an unconfigured
+     * relay no matter what the environment said. */
+    {
+        const char *k = token_key_arg;
+        if (k == NULL) {
+            k = getenv("DROPSSH_RELAY_KEY");
+        }
+        dropssh_key_from_passphrase(&relay_key, k);
+        if (k != NULL && !dropssh_key_configured(&relay_key)) {
+            /* ⛔ A KEY THAT DID NOT LOAD IS FATAL RATHER THAN "UNSET", because
+             * the only way `dropssh_key_from_passphrase` leaves the key
+             * unconfigured given a non-empty passphrase is a build with no
+             * SHA-256, and continuing would mean a relay that was told to
+             * verify and does not. */
+            fprintf(stderr, "dropssh relay: a token key was given but this "
+                    "build could not hash it, so this relay cannot verify "
+                    "anything. Refusing to start rather than accepting "
+                    "every peer.\n");
+            return 2;
         }
     }
     if (status_mode) {
@@ -1457,6 +1884,16 @@ int dropssh_relay_main(int argc, char **argv) {
         }
         chmod(path, 0600);
         logf("listening on unix://%s (rendezvous, multiplexed)", path);
+        /* ⛔ AND THE SECOND BANNER LINE SAYS WHETHER TOKENS ARE CHECKED. A relay
+         * that accepts every peer while an operator believes it is enforcing
+         * role separation is the worst of the two available states, and the
+         * only thing that prevents it is saying so here rather than leaving
+         * the operator to infer it from a refusal that never comes. */
+        logf("tokens: %s", dropssh_key_configured(&relay_key)
+             ? "VERIFIED against this relay's key, and POST /v1/pair issues pairs"
+             : "ACCEPTED as anything (no --token-key, no DROPSSH_RELAY_KEY). "
+               "This is the historical behaviour; configure a key to enforce "
+               "roles and to issue pairs.");
     } else {
         char host[128];
         int port = 8443;

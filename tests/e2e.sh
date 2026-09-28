@@ -519,6 +519,73 @@ else
     bad "tests/mux-probe.py is missing, so the id-prefix rule is unasserted"
 fi
 
+head_ "relay tokens: a pair issued here works here, and the two roles differ"
+# ⛔ ISSUE #13 STEP 1 IS "A PAIR ISSUED BY OUR RELAY WORKS AGAINST IT", and a
+# signer with no round-trip test is a signer nobody has run. So this drives the
+# WHOLE path, not the module: `POST /v1/pair` on a real relay over a real unix
+# socket, then six upgrades against the answer it gave.
+#
+# ⛔ AND THE CASES THAT MATTER ARE ALL REFUSALS, because a pair that round-trips
+# proves only that the encoder and the decoder share a bug. What has to hold is
+# that a NODE token is refused where a CONNECT token belongs (otherwise reading
+# the cage's token opens a session), that a token for another name is refused
+# (otherwise a pair is two credentials for any name), and that a relay with no
+# key accepts everything, which is the behaviour every existing deployment has.
+relay_sock="$WORK/token-relay.sock"
+tlog="$WORK/token-relay.log"
+rm -f "$relay_sock"
+"$DROPSSH" relay --listen "unix://$relay_sock" --token-key "e2e key" >"$tlog" 2>&1 &
+relay_pid=$!
+tok_ok=0
+for _ in $(seq 1 60); do [ -S "$relay_sock" ] && break; sleep 0.1; done
+# ⛔ A SECOND RELAY WITH THE SAME KEY, because "a session migrates between two
+# relays without being re-created" is a claim about TWO processes and cannot be
+# checked against one. A token that is a handle into the issuing relay's table
+# passes every other case in this section and fails exactly this one, which is
+# why the second relay exists rather than a second call to the first.
+peer_sock="$WORK/token-peer.sock"
+plog="$WORK/token-peer.log"
+rm -f "$peer_sock"
+"$DROPSSH" relay --listen "unix://$peer_sock" --token-key "e2e key" >"$plog" 2>&1 &
+peer_pid=$!
+for _ in $(seq 1 60); do [ -S "$peer_sock" ] && break; sleep 0.1; done
+if [ ! -S "$relay_sock" ]; then
+    bad "the token relay never bound $relay_sock (see $tlog)"
+else
+    if python3 "$HERE/token-check.py" "$relay_sock" --peer="$peer_sock"; then
+        ok "a pair issued by this relay works against it, the roles are separate, and it migrates to a second relay holding the same key"
+    else
+        bad "the token round trip, its role separation, or its migration to a second relay failed (see the output above)"
+    fi
+    tok_ok=1
+fi
+kill "$relay_pid" 2>/dev/null
+wait "$relay_pid" 2>/dev/null
+kill "$peer_pid" 2>/dev/null
+wait "$peer_pid" 2>/dev/null
+rm -f "$relay_sock" "$peer_sock"
+
+# ⛔ AND A RELAY WITH NO KEY STILL ACCEPTS EVERYTHING. This is the compatibility
+# rule and it is the case most likely to break silently, because the banner and
+# the behaviour are separate claims about the same process and they disagreed
+# once already: a relay with no key printed "ACCEPTED as anything" and refused
+# every peer with "no token was sent". A gate that only ever starts a keyed
+# relay would not have seen it.
+nosock="$WORK/token-nokey.sock"
+nolog="$WORK/token-nokey.log"
+rm -f "$nosock"
+"$DROPSSH" relay --listen "unix://$nosock" >"$nolog" 2>&1 &
+nokey_pid=$!
+for _ in $(seq 1 60); do [ -S "$nosock" ] && break; sleep 0.1; done
+if [ -S "$nosock" ] && python3 "$HERE/token-check.py" "$nosock" --nokey; then
+    ok "a relay with no token key accepts an untokened upgrade, as it always has"
+else
+    bad "a relay with no token key refused an untokened upgrade: the historical behaviour is broken"
+fi
+kill "$nokey_pid" 2>/dev/null
+wait "$nokey_pid" 2>/dev/null
+rm -f "$nosock"
+
 head_ "one owner per websocket session (U2), asserted on the artefact"
 # ⛔ U2 WAS 0/6 BECAUSE EVERY EXISTING CASE SITS *ABOVE* THE SESSION MOVE, so
 # no probe could tell a move from a copy. Closing it with another probe case

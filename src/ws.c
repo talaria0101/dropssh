@@ -582,8 +582,32 @@ int ws_client(Transport *t, const char *host_header, const char *path,
     return 0;
 }
 
+/* ⛔ AND WHEN THERE IS NO `Sec-WebSocket-Key`, THIS LEAVES THE REQUEST IN
+ * `rbuf` RATHER THAN CLEARING IT, because that request is very likely a plain
+ * `POST /v1/pair` and the body has to survive for the handler to read.
+ *
+ * A pair is an ordinary HTTP POST and not an upgrade, so it is refused here --
+ * correctly, because this is the upgrade door. But refusing it is only useful
+ * if the caller can then get at the body it refused, and for a long time the
+ * two were wired so it could not: every `POST /v1/pair` died with "no
+ * Sec-WebSocket-Key in the upgrade request", which is true and tells an
+ * operator nothing.
+ *
+ * So the contract is: on a missing key, `rbuf` holds the whole request and the
+ * caller may read the body out of it. `rbuf` is only reset once a key has been
+ * found, which is what makes that true. A caller that does not care gets the
+ * -1 and the same buffer it would have got anyway. */
 int ws_server_peek(Transport *t, WsSession *ws, char *request_path,
                    size_t pathlen, ws_status *st) {
+    return ws_server_peek_tok(t, ws, request_path, pathlen, NULL, 0, st);
+}
+
+int ws_server_peek_tok(Transport *t, WsSession *ws, char *request_path,
+                       size_t pathlen, char *peek_token,
+                       size_t peek_token_len, ws_status *st) {
+    if (peek_token && peek_token_len) {
+        peek_token[0] = 0;
+    }
     memset(ws, 0, sizeof *ws);
     ws->t = t;
     ws->is_client = 0;
@@ -649,17 +673,54 @@ int ws_server_peek(Transport *t, WsSession *ws, char *request_path,
     }
 
     const char *k = NULL;
+    char token_hdr[1024] = "";
     {
-        /* case-insensitive header scan, bounded to the header block */
+        /* case-insensitive header scan, bounded to the header block.
+         *
+         * ⛔ THE SCAN DOES NOT STOP AT THE KEY. It used to `break` as soon as
+         * it found `Sec-WebSocket-Key`, because that was the only header it
+         * wanted. Adding the token made that a live bug in the wrong
+         * direction: a client that puts `X-Relay-Token` AFTER the key -- which
+         * RFC 9110 explicitly allows, since header order carries no meaning --
+         * was refused as "no token was sent" while presenting a perfectly good
+         * one. The whole scan runs to the end of the header block and both
+         * values are taken from it. */
         char *line = strstr(headers, "\r\n");
         while (line) {
             line += 2;
-            if (strncasecmp(line, "Sec-WebSocket-Key:", 18) == 0) {
+            if (k == NULL && strncasecmp(line, "Sec-WebSocket-Key:", 18) == 0) {
                 k = line + 18;
                 while (*k == ' ') {
                     k++;
                 }
-                break;
+            }
+            /* ⛔ THE RELAY TOKEN IS READ HERE, IN THE SAME SCAN, AND NOT BY A
+             * SECOND PASS OVER THE HEADERS. `ws_server_peek` used to keep only
+             * the WebSocket key and throw the rest away, so a relay that wanted
+             * to authenticate an upgrade had no way to get the credential out
+             * of the request without re-reading the raw buffer -- and the raw
+             * buffer is RESET at the end of this function, so the second pass
+             * was reading freed memory. One scan, one parse, both values.
+             *
+             * The copy is BOUNDED and the value is taken up to the next CR or
+             * LF, so a header claiming to be 60 KB long cannot make this grow
+             * and cannot smuggle a second header line in through the value. A
+             * token with a CR or LF in it is not a token; it is a request
+             * smuggling attempt, and truncating at the line break is what
+             * makes that a parse rather than an execution. */
+            if (token_hdr[0] == 0 &&
+                strncasecmp(line, "X-Relay-Token:", 14) == 0) {
+                const char *tv = line + 14;
+                while (*tv == ' ') {
+                    tv++;
+                }
+                size_t tn = 0;
+                while (tv[tn] != 0 && tv[tn] != '\r' && tv[tn] != '\n' &&
+                       tn < sizeof token_hdr - 1) {
+                    token_hdr[tn] = tv[tn];
+                    tn++;
+                }
+                token_hdr[tn] = 0;
             }
             char *nx = strstr(line, "\r\n");
             if (nx == NULL) {
@@ -667,6 +728,9 @@ int ws_server_peek(Transport *t, WsSession *ws, char *request_path,
             }
             line = nx;
         }
+    }
+    if (peek_token && token_hdr[0]) {
+        snprintf(peek_token, peek_token_len, "%s", token_hdr);
     }
     if (k == NULL) {
         free(headers);

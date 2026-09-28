@@ -163,6 +163,25 @@ int ws_server(Transport *t, WsSession *ws, char *request_path,
  * nothing to refuse keeps one call. */
 int ws_server_peek(Transport *t, WsSession *ws, char *request_path,
                    size_t pathlen, ws_status *st);
+
+/* ⛔ THE SAME CALL, ALSO HANDING BACK `X-Relay-Token`.
+ *
+ * The relay authenticates an upgrade, and the credential arrives in a header of
+ * the upgrade request. `ws_server_peek` parses the header block, keeps the
+ * WebSocket key and discards the rest -- and it discards it because at the time
+ * it was written there was nothing else in the request worth keeping. A second
+ * scan over the raw buffer is not an option, because `ws_server_peek` RESETS
+ * `rbuf` at the end, so anything that re-read it afterwards reads freed or
+ * reused memory. So the value is captured in the same scan that finds the key.
+ *
+ * `peek_token` may be NULL, in which case the token is parsed and discarded
+ * exactly as before and a caller that does not authenticate sees no
+ * difference. The value is bounded, truncated at the first CR or LF, and never
+ * longer than the caller's buffer.
+ */
+int ws_server_peek_tok(Transport *t, WsSession *ws, char *request_path,
+                       size_t pathlen, char *peek_token,
+                       size_t peek_token_len, ws_status *st);
 int ws_server_accept(WsSession *ws, ws_status *st);
 
 /* Read payload bytes into `buf`. Returns the byte count, which is 0 both for
