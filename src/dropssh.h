@@ -78,6 +78,13 @@ typedef struct {
                                 * build with the bound DELETED can be shown to
                                 * fail. Nothing in the suite passes it. */
     int         once;         /* serve: one session then exit */
+    /* ⛔ A TOTAL RECONNECTION BUDGET, IN ATTEMPTS. 0 means "for ever", and 0
+     * is the default because the common case is a node that starts before its
+     * relay and must still pair twenty minutes later. A capped backoff with no
+     * total is an agent that never admits it is broken: it runs, it does not
+     * crash, and it logs a line every 30 s, which from outside looks healthy.
+     * See wait_and_retry in src/serve.c. */
+    unsigned    retry_budget;  /* serve: attempts before giving up; 0 = forever */
     int         generate;     /* connect: ask the relay for a token first */
     int         json;
 } dropssh_opts;

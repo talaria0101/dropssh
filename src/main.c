@@ -57,6 +57,9 @@ static void usage(FILE *f) {
 "  --name N            a reverse node name, or an operator's target name\n"
 "  --token T           a relay token; sent as X-Relay-Token, never in a URL\n"
 "  --mint              mint a forward token from the relay first (connect)\n"
+"  --retry-budget N    serve: give up after N failed registrations and exit 4.\n"
+"                      0, the default, means retry for ever, which is what a\n"
+"                      cage that boots before its relay needs.\n"
 "  --proxy HOST:PORT   an HTTP CONNECT proxy, for a cage with no egress\n"
 "  --doh URL           a DoH endpoint, for a cage with no resolver\n"
 "  --insecure          skip TLS verification. Off by default, on purpose.\n"
@@ -211,6 +214,22 @@ int main(int argc, char **argv) {
             o.preload = NEXT();
         } else if (strcmp(a, "--once") == 0) {
             o.once = 1;
+        } else if (strcmp(a, "--retry-budget") == 0) {
+            /* ⛔ strtol WITH THE END POINTER CHECKED, for the reason review 1
+             * found for --bound-ms and that the relay's --pair-ttl repeats:
+             * `atoi`'s answer to a non-numeric string is 0, and 0 here means
+             * "retry for ever". A flag whose typo silently selects the default
+             * is a flag that cannot be relied on to turn something OFF. */
+            const char *v = NEXT();
+            char *end = NULL;
+            long b = strtol(v, &end, 10);
+            if (end == v || (end && *end) || b < 0 || b > 100000) {
+                fprintf(stderr, "dropssh: --retry-budget wants a number of "
+                        "attempts in 0..100000, where 0 means 'for ever'. "
+                        "'%s' is not one.\n", v);
+                return 2;
+            }
+            o.retry_budget = (unsigned)b;
         } else if (strcmp(a, "--json") == 0) {
             o.json = 1;
         } else if (strcmp(a, "-v") == 0 || strcmp(a, "--verbose") == 0) {

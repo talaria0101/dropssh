@@ -586,6 +586,50 @@ kill "$nokey_pid" 2>/dev/null
 wait "$nokey_pid" 2>/dev/null
 rm -f "$nosock"
 
+head_ "a node that cannot pair says so instead of retrying for ever"
+# ⛔ A CAPPED BACKOFF WITH NO TOTAL IS AN AGENT THAT NEVER ADMITS IT IS BROKEN,
+# and from outside it looks healthy: the process is running, it is not
+# crashing, and it logs a line every 30 seconds. A supervisor sees a live
+# process and a service that is not there. This is the ligolo item
+# dropssh#8 asks us to adopt, and it is asserted by RUNNING it, because the
+# only way to see a give-up point is to reach it.
+#
+# The relay deliberately does not exist, so every attempt fails. The budget is
+# small so the case is quick, and the exit code is checked separately from the
+# message because they are different claims: a message can be printed by a
+# process that then keeps going, and only the status says it stopped.
+budget_sock="$WORK/no-such-relay.sock"
+rm -f "$budget_sock"
+budget_out="$WORK/retry-budget.out"
+"$DROPSSH" serve --relay "unix://$budget_sock" --name budget-probe \
+    --retry-budget 3 --server "$DROPBEAR -i -E -F -r $WORK/hostkey" \
+    >"$budget_out" 2>&1
+budget_rc=$?
+if [ "$budget_rc" = 4 ]; then
+    ok "a node that cannot pair within its budget exits 4, which is not the exit a session failure uses"
+elif [ "$budget_rc" = 0 ]; then
+    bad "a node that could not pair at all exited 0: a refused node reported as a success"
+else
+    bad "a node that could not pair exited $budget_rc; 4 is the give-up code and 1 is a session that ran and could not log anyone in"
+fi
+if grep -q "the last one" "$budget_out" 2>/dev/null && \
+   grep -q "giving up after 3 attempts" "$budget_out" 2>/dev/null; then
+    ok "the log names the last attempt and the give-up, so the budget is readable without counting"
+else
+    bad "the retry log did not name the last attempt and the give-up point (see $budget_out)"
+fi
+# ⛔ THE HELP IS READ INTO A FILE, NOT THROUGH A PROCESS SUBSTITUTION. The suite
+# is `sh`, not bash, and `<(...)` is a bashism that fails with "No such file or
+# directory" on dash -- which is the same class of "a check that cannot run is
+# not a check" that this project has been bitten by.
+budget_help="$WORK/retry-help.out"
+"$DROPSSH" --help >"$budget_help" 2>&1
+if grep -q "retry for ever" "$budget_help" 2>/dev/null; then
+    ok "the default is documented as unlimited, because a cage that boots before its relay must still pair"
+else
+    bad "the retry budget's default is not documented, so an operator cannot tell whether a node gives up"
+fi
+
 head_ "one owner per websocket session (U2), asserted on the artefact"
 # ⛔ U2 WAS 0/6 BECAUSE EVERY EXISTING CASE SITS *ABOVE* THE SESSION MOVE, so
 # no probe could tell a move from a copy. Closing it with another probe case

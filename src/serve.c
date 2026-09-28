@@ -1011,6 +1011,14 @@ int dropssh_serve(dropssh_opts *o) {
 
     unsigned backoff = 1;
     int sessions = 0;
+    /* ⛔ THE BUDGET AND THE COUNTER ARE READ ONCE, HERE, and the counter is
+     * NOT reset by a successful registration. A budget is a budget for the
+     * PROCESS, not for one bad run: a node that paired once and then lost the
+     * relay twenty minutes later has still used up the operator's patience,
+     * and resetting on success would make the number mean "consecutive
+     * failures", which is a different policy and would need a different name. */
+    const unsigned total_attempts = o->retry_budget;
+    unsigned attempts = 0;
     for (;;) {
         ws_status st;
         memset(&st, 0, sizeof st);
@@ -1093,7 +1101,43 @@ wait_and_retry:
         if (o->once) {
             return 1;
         }
-        logf("retrying in %us", backoff);
+        /* ⛔ A TOTAL RECONNECTION BUDGET, AND A GIVE-UP POINT, BECAUSE A CAPPED
+         * BACKOFF WITH NO TOTAL IS AN AGENT THAT NEVER ADMITS IT IS BROKEN.
+         *
+         * The backoff below doubles to 30 s and stays there, so a `serve` whose
+         * relay is gone, or whose name is wrong, or whose token was revoked,
+         * retries for ever. From the outside that process looks HEALTHY: it is
+         * running, it is not crashing, and it logs a line every 30 s. Nothing
+         * in it says the give-up point was never reached, because there wasn't
+         * one. A supervisor sees a live process and a service that is not there.
+         *
+         * The budget is in ATTEMPTS and not in wall-clock, because a wall-clock
+         * budget answers a different question: with a 30 s cap, a 20-minute
+         * budget is 40 attempts on one failure and 20 on five, and the operator
+         * reading the log cannot tell which. Attempts are countable and the log
+         * already counts them.
+         *
+         * ⛔ AND THE DEFAULT IS "KEEP TRYING", BECAUSE THE COMMON CASE IS A
+         * NODE THAT STARTS BEFORE THE RELAY. A cage that boots with no network
+         * and comes up twenty minutes later must still pair, and a budget that
+         * gave up at five minutes would break that deployment to satisfy a
+         * tidier log. So the budget is a NUMBER an operator sets, the default
+         * is unlimited, and `dropssh doctor` and `--help` both say so.
+         *
+         * ⛔ AND THE EXIT CODE IS ITS OWN, so a supervisor can tell "gave up"
+         * from "the server command failed". 4 is the one here; 1 is a session
+         * that ran and could not log anyone in, which is a different fault with
+         * a different fix. */
+        if (total_attempts > 0 && attempts >= total_attempts) {
+            logf("giving up after %u attempts: the relay has not accepted "
+                 "this node. Raise --retry-budget, or set it to 0 to keep "
+                 "trying for ever", attempts);
+            return 4;
+        }
+        attempts++;
+        logf("retrying in %us (attempt %u%s)", backoff, attempts,
+             (total_attempts > 0 && attempts == total_attempts)
+                 ? ", the last one" : "");
         dropssh_sleep_ms(backoff * 1000);
         if (backoff < 30) {
             backoff *= 2;
