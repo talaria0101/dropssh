@@ -566,6 +566,43 @@ side of it is caught by a test instead of by an afternoon.
 
 ---
 
+# ⛔ KNOWN-UNGUARDED: three, and the list is here so it cannot be lost
+
+**2026-09-28, after a five-pass review of `d986214`.** Six defects were
+planted — built, run, and counted — and three came back **0/6**. A guard that
+has never been seen to refuse is not a guard, so these are recorded here with
+what would be needed to close each. ⛔ **This list exists because two sessions
+wrote "every guard was proven to fire" and were wrong, and the cost of that is
+a commit message asserting something is safe when it is not.**
+
+| # | what | why 0/6 | what would close it |
+| --- | --- | --- | --- |
+| **U1** | the 60-second bound on the `ready` wait, `src/connect.c` | unreachable: this relay answers **503 on the upgrade** for a name with no node, so nothing reaches the bound | a relay **stub** in `tests/mux-probe.py` that completes the operator's upgrade and then says nothing. ⭐ **The one genuinely worth writing**, because a hang in an ssh `ProxyCommand` is an ssh that never times out |
+| **U2** | the session **move** in `src/relay.c` (`c->ws = ws; memset(&ws, ...)` rather than a `memcpy`) | unreachable: every `ws_close(&ws)` on the operator path is *above* the move, so a copy aliases nothing that is later closed | a refusal path **below** the move. It is defence in depth — one owner per session, established where the session is stored — and a future refusal added there would reintroduce the aliasing silently |
+| **U3** | the 1011 sweep in `src/relay.c` with no reference held | the window is narrower than 6 probe runs; case 4 forces the ordering but does not land inside it | a case that closes an operator and drops its last reference **in the same instant**. May need a fault-injection hook rather than a timing trick |
+
+**The three that ARE guarded, with the counts, so the shape of a real guard sits
+next to the three that are not:**
+
+| plant | caught |
+| --- | --- |
+| silent drop (B11) | 6/6 |
+| id not stripped (B3) | 6/6 |
+| no early-data refusal | 6/6 |
+| no bound on the `ready` wait | **0/6** |
+| aliased session owner | **0/6** |
+| 1011 sweep with no refcount | **0/6** |
+
+⭐ **And one more that is not a plant but is the same disease.** The framing
+probe once passed for several runs while its node had **stopped** answering
+`open` with `ready` — because the relay did not enforce the ordering, so the
+probe was asserting that the relay does **not** require `ready`, the opposite of
+what it claimed. A test that passes for the wrong reason is worse than one that
+fails, and the check is cheap: ⛔ **does the plant make the thing this case
+claims to test actually change?**
+
+---
+
 # Not in this list
 
 Two entries in [`open-issues.md`](open-issues.md) are about the ssh server
