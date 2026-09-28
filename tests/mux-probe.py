@@ -24,6 +24,11 @@ look identical from the outside.
 USAGE: mux-probe.py DROPSSH_BINARY WORKDIR
   Starts `dropssh relay` on a unix socket in WORKDIR, drives one node and one
   operator against it, and exits non-zero if any rule above is broken.
+
+It also starts a RELAY STUB (`SilentNodeRelay`, U1 in docs/relay-issues.md):
+one that completes a websocket upgrade for the operator and then says nothing at
+all. That is the only way to reach the 60-second bound in src/connect.c, and it
+is the reason the bound was unguarded rather than unproven.
 """
 import base64
 import hashlib
@@ -34,6 +39,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -344,6 +350,126 @@ def parse_json(b):
         return {}
 
 
+class SilentNodeRelay(threading.Thread):
+    """A relay that upgrades the operator and then says NOTHING FOR EVER.
+
+    ⛔ THIS IS THE STUB THAT MAKES U1 CLOSEABLE, AND IT EXISTS BECAUSE THE
+    REAL RELAY CANNOT REACH THE CODE UNDER TEST.
+
+    `docs/relay-issues.md` U1: the 60-second bound on the wait for the node's
+    `ready`, in `src/connect.c`, was 0/6 on the plant. The stated reason is that
+    this relay answers **503 on the upgrade** for a name with no node, so the
+    bound is never reached -- the session dies before the wait starts. That is
+    true, and it means the bound is unreachable by changing the client. It is
+    reachable by changing the RELAY: a relay that accepts the upgrade, tells the
+    operator nothing, and never closes is exactly the "relay that never closes"
+    the bound was written for, and it is the one the comment in connect.c names
+    as the reason the bound exists.
+
+    ⛔ SO THE STUB IMPLEMENTS THE PROTOCOL, NOT JUST THE SILENCE. A stub that
+    only completed the upgrade would test a different thing: the operator would
+    be sitting on a socket that is not a relay at all, and a bound that fired
+    there would say nothing about a bound firing on one. So this speaks the real
+    reverse protocol: it sends `hello`, it mints a session id and sends `open`,
+    and it simply never forwards a `ready`. `dropssh connect` is therefore
+    waiting on a node that never answered, which is the state the bound exists
+    to end, and the elapsed time is the measurement.
+
+    ⛔ AND IT IS A STUB, NOT A MODE OF `dropssh relay`. A silence switch in the
+    product would be a switch nobody sets and a path CI depends on. The whole
+    thing is 60 lines of the wire format, and the wire format is already in
+    this file.
+
+    ⛔ THE BUG IT WAS BUILT FOR IS REAL AND WAS MEASURED. The first version of
+    this case ran against `dropssh relay` with no node attached. That relay
+    holds the operator on the upgrade and closes with 1008 `node open timeout`
+    after about ten seconds, so the client exited well inside its own bound and
+    the case was green for the wrong reason: it was asserting the RELAY's
+    timeout, not the CLIENT's. Both paths are now asserted, and the one with the
+    stub below is the one that reaches the bound.
+    """
+
+    def __init__(self, path):
+        threading.Thread.__init__(self, daemon=True)
+        self.path = path
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(path)
+        self.sock.listen(8)
+        self.stop = False
+        self.upgraded = threading.Event()
+        self.sent_open = threading.Event()
+        self.err = None
+
+    def run(self):
+        try:
+            while not self.stop:
+                try:
+                    conn, _ = self.sock.accept()
+                except OSError:
+                    return
+                try:
+                    self._session(conn)
+                except Exception as e:
+                    self.err = e
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.err = e
+
+    def _session(self, conn):
+        conn.settimeout(30)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return                      # refused before the upgrade
+            buf += chunk
+        head = buf.split(b"\r\n\r\n", 1)[0]
+        m = re.search(rb"Sec-WebSocket-Key:\s*(\S+)", head, re.I)
+        if not m:
+            return
+        key = m.group(1)
+        want = base64.b64encode(hashlib.sha1(key + GUID).digest()).decode()
+        conn.sendall((
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: %s\r\n"
+            "X-Relay-Version: reverse-v1\r\n"
+            "\r\n" % want).encode())
+        self.upgraded.set()
+        if b"/v1/connect/" in head:
+            # ⛔ THE PROTOCOL, AND THEN THE SILENCE. `hello` is what every node
+            # gets on its upgrade, `open` is what the operator waits on, and a
+            # `ready` is what never comes. Nothing is ever closed, so the only
+            # thing that can end this session is the client's own bound.
+            conn.sendall(encode_frame(0x1, json_bytes(
+                {"type": "hello", "version": 1,
+                 "maxFrameBytes": 65536, "maxSessions": 64}), True))
+            conn.sendall(encode_frame(0x1, json_bytes(
+                {"type": "open", "id": ID_LEN * "a"}), True))
+            self.sent_open.set()
+        # Read and discard whatever the client sends, so its writes do not fill
+        # the socket buffer and block it -- an operator blocked in write has not
+        # reached the wait this stub exists to hold it in.
+        try:
+            while True:
+                if not conn.recv(65536):
+                    break
+        except Exception:
+            pass
+
+    def shutdown(self):
+        self.stop = True
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
 def drain(s, seconds):
     """Read both sides until the window closes, recording every close code.
 
@@ -405,6 +531,7 @@ def main():
         stdout=subprocess.DEVNULL, stderr=relay_log,
     )
     try:
+        after_text = 60000
         for _ in range(200):
             if os.path.exists(sock_path):
                 break
@@ -681,6 +808,182 @@ def main():
             gate_client.append("the `connect` refusal case could not run: %s" % e)
         failures.extend(gate_client)
 
+        # ---- case 8: THE BOUND ON THE `ready` WAIT. THIS IS U1.
+        #
+        # ⛔ Case 6 cannot reach this, AND THAT IS THE WHOLE POINT OF THIS CASE.
+        # Case 6 drives a name with no node at the real relay, and the real relay
+        # holds the operator on the upgrade and closes it with 1008 after about
+        # ten seconds. So case 6 measures the RELAY's timeout, and a client with
+        # no bound at all would pass it. The bound under test is the one for a
+        # relay that never closes, which is unreachable against a relay that
+        # always closes, and the probe's own comment on case 6 already admits
+        # the ready-gate was "0 times in 10 runs" as a plant for the same
+        # reason.
+        #
+        # So: a stub relay that completes the upgrade, speaks the protocol, and
+        # never sends `ready` and never closes. See SilentNodeRelay.
+        ready_bound_failures = []
+        #
+        # ⛔ WHAT IS ASSERTED, AND WHY EACH HALF IS HERE.
+        #
+        #   the exit is non-zero -- an ssh reading a clean exit from its
+        #   ProxyCommand reports a transport that worked, and a session that was
+        #   never established is not one that completed.
+        #
+        #   the elapsed time is >= the bound -- WITHOUT THIS THE CASE IS
+        #   DECORATION. Any early exit, including a crash and including the
+        #   "Connection closed" that a stub which refused the upgrade would
+        #   produce, passes the check above. The lower bound is the assertion
+        #   that the client really spent the wait.
+        #
+        #   the elapsed time is under a slack above the bound -- so the wait is
+        #   bounded rather than merely eventual. Without it, a bound that fires
+        #   in 61 minutes passes.
+        #
+        #   the message names `ready` -- an operator told "connection closed"
+        #   has to try the next idea in the wrong order. `1008 node open
+        #   timeout` is the message on the OTHER path, and this one must not be
+        #   that, because a stub that never closes must not produce it.
+        # ⛔ THE BOUND IS READ FROM THE BINARY, NOT PASSED BY THIS FILE. Nothing
+        # in the suite passes --bound-ms; the probe reads the default out of
+        # `connect --help` so the number it measures against is a property of
+        # the BUILD. A case that only fires under a flag it sets itself is
+        # decoration, which is the disease this file is about. And 0 is not a
+        # fast bound to be tolerated -- it is how "the bound was deleted"
+        # compiles, so it is the state the case must catch.
+        #
+        # ⛔ AND THE FIRST VERSION OF THIS PARSE WAS WRONG IN A WAY THAT STILL
+        # LOOKED LIKE IT WORKED. It read `--bound-ms[= ]+(\d+)`, which does not
+        # match anything in the help text, because what follows the option name
+        # there is its argument PLACEHOLDER `N` and not a number -- so the
+        # search found nothing and the probe fell back to 60000. On the correct
+        # build that fallback is the right number and the case passes, and on a
+        # build with the bound at 0 it is the wrong number and the case fails
+        # for the right REASON BY ACCIDENT, in the branch meant for a working
+        # bound. A fallback that happens to equal the correct answer is the
+        # hardest kind of wrong: it is invisible exactly when the thing it
+        # stands in for is right.
+        #
+        # So the number is read from the sentence the help actually prints, and
+        # a build whose help does not print one is a FAILURE rather than a
+        # default. Silently guessing here would put the whole case's meaning
+        # in the fallback.
+        try:
+            help_text = subprocess.run(
+                [dropssh, "connect", "--help"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=20).stdout
+        except Exception as e:
+            help_text = b""
+            ready_bound_failures.append(
+                "could not read `connect --help` from the binary under test "
+                "(%s), so the `ready` bound it reports is unknown and this case "
+                "cannot assert anything: %s" % (dropssh, e))
+        m = re.search(rb"bound-ms\b.*?Default is\s+(\d+)\s*ms", help_text, re.S)
+        if m:
+            after_text = int(m.group(1))
+        else:
+            after_text = -1
+            ready_bound_failures.append(
+                "`connect --help` does not print a default for --bound-ms, so "
+                "the bound in this build cannot be measured against a number it "
+                "itself reports. The case is skipped rather than guessed at, "
+                "because a fallback that happens to equal the right answer is "
+                "invisible exactly when the thing it stands in for is right.")
+
+        # ⛔ ONE STUB, AND BOTH ASSERTIONS RUN AGAINST IT. The first version of
+        # this case had two independent sub-cases, and the zero one ran BEFORE
+        # the stub was created -- so on a build with no bound the positive
+        # assertions still ran and reported a failure that was really the
+        # positive assertions declining to apply. Two paths, one fixture, and
+        # the branch is chosen by what the BINARY says it does.
+        stub_path = os.path.join(
+            work, "muxprobe-stub-%d-%d.sock" % (os.getpid(),
+                                               int(time.time() * 1000) % 100000))
+        stub = None
+        ready_wait_s = after_text / 1000.0 if after_text > 0 else 0
+        try:
+            stub = SilentNodeRelay(stub_path)
+            stub.start()
+            t0 = time.time()
+            r = subprocess.run(
+                [dropssh, "connect", "--relay", "unix://" + stub_path,
+                 "--name", "case8-silent-node"],
+                input=b"SSH-2.0-GateProbe\r\n",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+            elapsed = time.time() - t0
+            if r.returncode == 0:
+                ready_bound_failures.append(
+                    "`dropssh connect` exited 0 after a silent node gave up on "
+                    "the wait: a session that was never established is being "
+                    "reported to ssh as one that completed")
+            if b"ready" not in r.stderr:
+                ready_bound_failures.append(
+                    "the message for a silent node did not name `ready`, so an "
+                    "operator cannot tell it from a refused upgrade: %r"
+                    % r.stderr[:200])
+            if b"1008" in r.stderr or b"node open timeout" in r.stderr:
+                ready_bound_failures.append(
+                    "the silent-node path reported 1008 node open timeout, which "
+                    "is the RELAY's message and cannot be the one this stub "
+                    "produces: %r" % r.stderr[:200])
+            if after_text == 0:
+                # ⛔ A BOUND OF 0 IS A BUILD WITH NO BOUND, AND THE CASE FAILS IT.
+                # This branch is not a second opinion on a working build; it is
+                # the shape a "the bound was deleted" plant takes once the
+                # option exists, and its job is to SAY SO.
+                #
+                # ⛔ AND IT CANNOT BE ASSERTED ON ELAPSED TIME ALONE. A bound of
+                # 0 ends the wait on its first turn -- measured at 0.0s against
+                # this stub -- which is faster than any real bound and is the
+                # whole defect: `connect` gives up on a `ready` that has not
+                # had time to arrive, reports a node that is not answering, and
+                # ssh's ProxyCommand has exited for a reason that does not
+                # exist. So the assertion is that the wait was NOT bounded
+                # properly, and it is written as a failure rather than a skip
+                # because "this build has no bound" is a broken build, not an
+                # unsupported one.
+                ready_bound_failures.append(
+                    "this build's `ready` bound is 0, so `connect` ends the wait "
+                    "with no bound at all: it gave up after %.1fs on a relay "
+                    "that had sent `open` and was waiting, and an ssh "
+                    "ProxyCommand that exits there reports a node that is not "
+                    "answering when the node simply had not been asked yet. The "
+                    "bound under test is missing." % elapsed)
+            elif after_text > 0:
+                if not stub.sent_open.is_set():
+                    ready_bound_failures.append(
+                        "the stub relay never sent `open`, so the client was not "
+                        "waiting for a `ready` and this case measured something "
+                        "else")
+                if elapsed < ready_wait_s:
+                    ready_bound_failures.append(
+                        "`dropssh connect` gave up on the `ready` wait after "
+                        "%.1fs, so the %ds bound did not fire; an ssh "
+                        "ProxyCommand that returns early here did not wait, it "
+                        "exited" % (elapsed, ready_wait_s))
+                if elapsed > ready_wait_s + 30:
+                    ready_bound_failures.append(
+                        "`dropssh connect` took %.1fs to end the `ready` wait, "
+                        "more than 30s past the %ds bound: the wait is eventual, "
+                        "not bounded" % (elapsed, ready_wait_s))
+        except subprocess.TimeoutExpired:
+            ready_bound_failures.append(
+                "`dropssh connect` did not return within 180s against a relay "
+                "that upgraded it and then said nothing; the wait for `ready` is "
+                "not bounded, and this process is an ssh ProxyCommand, so ssh "
+                "never times out")
+        except Exception as e:
+            ready_bound_failures.append("the silent-node case could not run: %s" % e)
+        finally:
+            if stub is not None:
+                stub.shutdown()
+            try:
+                os.unlink(stub_path)
+            except OSError:
+                pass
+        failures.extend(ready_bound_failures)
+
         # ---- case 4: a NODE DISCONNECT WHILE AN OPERATOR IS ATTACHED.
         # ⛔ THIS CASE EXISTS BECAUSE OF A REAL CRASH, AND IT IS THE ONLY CASE
         # THAT WOULD HAVE CAUGHT IT DETERMINISTICALLY.
@@ -873,8 +1176,9 @@ def main():
         if not failures:
             print("mux-probe: id-prefix, bare-frame close 1009, text-frame "
                   "close 1003, the ready ordering, a bounded `connect` that "
-                  "exits non-zero on a silent node, a node disconnect with an "
-                  "operator attached, and a refusal on the operator's own thread "
+                  "exits non-zero on a silent node, the 60s bound on the "
+                  "`ready` wait itself, a node disconnect with an operator "
+                  "attached, and a refusal on the operator's own thread "
                   "all behave as measured")
         return 1 if failures else 0
     finally:

@@ -568,6 +568,9 @@ side of it is caught by a test instead of by an afternoon.
 
 # ⛔ KNOWN-UNGUARDED: three, and the list is here so it cannot be lost
 
+> **U1 IS NOW CLOSED**; its full entry, with the plant counts, is at the very
+> end of this file. **U2 and U3 remain 0/6.**
+
 **2026-09-28, after a five-pass review of `d986214`.** Six defects were
 planted — built, run, and counted — and three came back **0/6**. A guard that
 has never been seen to refuse is not a guard, so these are recorded here with
@@ -577,7 +580,7 @@ a commit message asserting something is safe when it is not.**
 
 | # | what | why 0/6 | what would close it |
 | --- | --- | --- | --- |
-| **U1** | the 60-second bound on the `ready` wait, `src/connect.c` | unreachable: this relay answers **503 on the upgrade** for a name with no node, so nothing reaches the bound | a relay **stub** in `tests/mux-probe.py` that completes the operator's upgrade and then says nothing. ⭐ **The one genuinely worth writing**, because a hang in an ssh `ProxyCommand` is an ssh that never times out |
+| **U1** ✅ | the 60-second bound on the `ready` wait, `src/connect.c` | unreachable: this relay answers **503 on the upgrade** for a name with no node, so nothing reaches the bound | **CLOSED 2026-09-28.** A relay **stub** in `tests/mux-probe.py` that completes the operator's upgrade, speaks the real protocol, and then says nothing. The bound is now a value the binary itself reports (`--bound-ms`, printed in `connect --help`), so its absence is measurable. See U1's own entry at the end of this file. |
 | **U2** | the session **move** in `src/relay.c` (`c->ws = ws; memset(&ws, ...)` rather than a `memcpy`) | unreachable: every `ws_close(&ws)` on the operator path is *above* the move, so a copy aliases nothing that is later closed | a refusal path **below** the move. It is defence in depth — one owner per session, established where the session is stored — and a future refusal added there would reintroduce the aliasing silently |
 | **U3** | the 1011 sweep in `src/relay.c` with no reference held | the window is narrower than 6 probe runs; case 4 forces the ordering but does not land inside it | a case that closes an operator and drops its last reference **in the same instant**. May need a fault-injection hook rather than a timing trick |
 
@@ -589,7 +592,7 @@ next to the three that are not:**
 | silent drop (B11) | 6/6 |
 | id not stripped (B3) | 6/6 |
 | no early-data refusal | 6/6 |
-| no bound on the `ready` wait | **0/6** |
+| no bound on the `ready` wait | **0/6, then 3/3** (U1, closed) |
 | aliased session owner | **0/6** |
 | 1011 sweep with no refcount | **0/6** |
 
@@ -602,6 +605,68 @@ fails, and the check is cheap: ⛔ **does the plant make the thing this case
 claims to test actually change?**
 
 ---
+
+# U1, closed: the bound on the `ready` wait is now guarded
+
+**Done 2026-09-28.** U1 was the one on this list a stub could reach, and it is
+now reached.
+
+**What changed in the product.** The wait for a node's `ready` is bounded by
+`o->bound_ms` rather than a literal. Its default, `DROPSSH_READY_BOUND_MS`, is
+60000 ms, lives in `src/dropssh.h` so `main.c` can print the same number the
+loop uses, and `--bound-ms N` overrides it. `connect --help` prints
+`Default is 60000 ms`, and `0` means **no bound at all** and produces a
+different sentence, so a build that has lost the bound cannot be mistaken for a
+working one by reading its output.
+
+**Why a stub and not `dropssh relay`.** The reason U1 was 0/6 is now stated
+correctly: not that the bound is unreachable, but that **this** relay is
+unreachable *for* the bound. `dropssh relay` answers 503 on the upgrade for a
+name with no node, and the live ajam relay holds the operator and then closes
+1008 `node open timeout` at about ten seconds. Both end the session long before
+a 60 s client-side bound, so both measure the RELAY's patience, not the
+CLIENT's. The bound exists for the relay that never closes, so the fixture has
+to be one that never closes: `SilentNodeRelay` in `tests/mux-probe.py`
+completes the WebSocket upgrade, verifies `Sec-WebSocket-Accept`, sends `hello`
+and then `open`, and then reads and discards for ever.
+
+⛔ **THE STUB SPEAKS THE PROTOCOL, NOT JUST THE SILENCE.** A fixture that only
+completed the upgrade would be a socket that is not a relay at all, and a bound
+that fired there would say nothing about a bound firing on a relay. It sends
+the two control frames a real relay sends, so `connect` is genuinely waiting for
+a `ready` from a node that has been asked and has not answered.
+
+**The counts.**
+
+| build | what it is | case result |
+| --- | --- | --- |
+| correct | bound 60000 ms | **passes**; 6/6 then 3/3 across two rounds, wait measured 60.0 s each time, exit 1, message names `ready` and not `1008` |
+| `DROPSSH_READY_BOUND_MS 0` | the option exists, the bound is gone | **3/3 caught**: exits after 0.0 s, having given up on a `ready` that had not had time to arrive |
+| the `if (waited_ready >= ...)` block deleted | the bound is not evaluated | **3/3 caught**: no return within 180 s |
+
+**⛔ THE CASE WAS WRONG TWICE BEFORE IT WAS RIGHT, AND IT WAS GREEN BOTH TIMES.**
+Recorded because this is the failure mode this repository has now hit four
+times, and because a reader deciding whether to trust the case above needs to
+know it was green while wrong.
+
+1. **The first version used the real relay.** It measured the relay's 1008
+   close, not the client's bound, and passed for that reason. Same trap as case
+   6, which is still asserted separately for the 503 path because it is a real
+   operator situation and a real half of the behaviour.
+2. **The parse that reads the bound out of `--help` matched nothing and fell
+   back to 60000.** On the correct build the fallback is the right number, so
+   the case passed; on a zero-bound build it was the wrong number and the case
+   failed in the branch written for a working bound. The help text was then
+   reworded so the number is unambiguous, and the probe now reads the sentence
+   the help actually prints and treats a build that prints no such sentence as a
+   **failure**. ⛔ A fallback that happens to equal the correct answer is
+   invisible exactly when the thing it stands in for is right.
+
+**What this does not establish.** The stub covers one relay misbehaviour: the
+one that never closes. The live relay's own ten-second close is a different
+path, covered by case 6. Nothing here measures a node that is slow rather than
+absent, and R2, the scheduled real-relay job, is still the only thing that
+would.
 
 # Not in this list
 

@@ -70,6 +70,13 @@ static void usage(FILE *f) {
 "                      clean byte pipe because it is ssh's.\n"
 "  -v, --verbose       say what is happening, on stderr\n"
 "\n"
+"TESTING OPTIONS (not for operators)\n"
+"  --bound-ms N        how long `connect` waits for the node's `ready`\n"
+"                      before giving up. Default is %d ms. Pass 0 for no\n"
+"                      bound at all. tests/mux-probe.py reads this line out\n"
+"                      of --help and uses it to prove the bound fires when\n"
+"                      it is removed.\n"
+"\n"
 "EXAMPLES\n"
 "  # an operator getting a shell, through the ajam relay, to a named node\n"
 "  ssh -o ProxyCommand='dropssh connect --name mynode' root@mycage\n"
@@ -88,7 +95,7 @@ static void usage(FILE *f) {
 "\n"
 "  # why did it not use my flag\n"
 "  dropssh config --relay relay.example:443 --insecure\n",
-        DROPSSH_DEFAULT_RELAY);
+        DROPSSH_DEFAULT_RELAY, DROPSSH_READY_BOUND_MS);
 }
 
 int dropssh_version_cmd(void) {
@@ -160,6 +167,7 @@ int main(int argc, char **argv) {
     }
     o.port = 443;
     o.connect_ms = 15000;
+    o.bound_ms = DROPSSH_READY_BOUND_MS;
     o.token = getenv("DROPSSH_TOKEN");
     if (o.token == NULL) {
         o.token = getenv("DROPSSH_RELAY_TOKEN");
@@ -204,6 +212,17 @@ int main(int argc, char **argv) {
             o.verbose++;
         } else if (strcmp(a, "--connect-timeout") == 0) {
             o.connect_ms = atoi(NEXT());
+        } else if (strcmp(a, "--bound-ms") == 0) {
+            const char *v = NEXT();
+            if (v == NULL) {
+                fprintf(stderr, "dropssh: --bound-ms needs a value\n");
+                return 2;
+            }
+            o.bound_ms = atoi(v);
+            if (o.bound_ms < 0) {
+                fprintf(stderr, "dropssh: --bound-ms is a time in ms, not %s\n", v);
+                return 2;
+            }
         } else if (strcmp(a, "--proxy") == 0) {
             const char *p = NEXT();
             /* an explicit --proxy sets the process-wide egress, so every

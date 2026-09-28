@@ -339,11 +339,23 @@ int dropssh_connect(dropssh_opts *o) {
              * normally ends this wait. It exists for the relay that never
              * closes, because ssh waits for this process and an operator with
              * no message has no way out. */
-            if (waited_ready >= 60000) {
-                logf("the node never answered `ready` after 60s; giving up. "
-                     "The node is not answering `open` -- check that it is "
-                     "running, that its --server command starts, and that it "
-                     "reached the relay");
+            if (waited_ready >= (unsigned)o->bound_ms) {
+                if (o->bound_ms == 0) {
+                    /* ⛔ A ZERO BOUND IS "NONE", NOT "IMMEDIATELY", AND THE TWO
+                     * ARE NOT THE SAME DEFECT. With 0 the wait would end on its
+                     * first turn, before the relay's `open` has even been read,
+                     * so the operator would report a silent node it had never
+                     * been told about. Saying so here is also what makes the
+                     * zero build's message a different string from a working
+                     * one's, which is how the probe tells them apart. */
+                    logf("the node never answered `ready`; giving up with no "
+                         "bound configured. The node is not answering `open`");
+                } else {
+                    logf("the node never answered `ready` after %ds; giving up. "
+                         "The node is not answering `open` -- check that it is "
+                         "running, that its --server command starts, and that it "
+                         "reached the relay", o->bound_ms / 1000);
+                }
                 rc = 1;
                 goto done;
             }

@@ -58,10 +58,27 @@ typedef struct {
     int         insecure;
     int         verbose;
     int         connect_ms;
+    int         bound_ms;      /* connect: how long to wait for the node's `ready`.
+                                * 0 disables the bound, which the gate needs so a
+                                * build with the bound DELETED can be shown to
+                                * fail. Nothing in the suite passes it. */
     int         once;         /* serve: one session then exit */
     int         generate;     /* connect: ask the relay for a token first */
     int         json;
 } dropssh_opts;
+
+/* ⛔ HOW LONG AN OPERATOR WAITS FOR THE NODE'S `ready`. Defined here because
+ * `main.c` has to print it as the default for --bound-ms, and a default shown
+ * in --help that is not the number in the code is how "it ignored my flag"
+ * starts. `connect.c` is the only user.
+ *
+ * Six times the relay's own ten-second open timeout, so a slow but working node
+ * is not cut off and a relay that does close normally ends the wait first. It
+ * exists for the relay that never closes, because `connect` is an ssh
+ * ProxyCommand: an operator with no message has no way out and ssh has no
+ * timeout of its own. Overridable so that its ABSENCE can be demonstrated; see
+ * `tests/mux-probe.py` case 8 and U1 in `docs/relay-issues.md`. */
+#define DROPSSH_READY_BOUND_MS 60000
 
 int dropssh_serve(dropssh_opts *o);
 int dropssh_connect(dropssh_opts *o);
