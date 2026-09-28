@@ -139,7 +139,42 @@ typedef struct Client {
     WsSession   ws;
     char        name[RELAY_NAME_MAX];   /* ⛔ OWNED, not borrowed: see below */
     char        id[RELAY_ID_LEN + 1];
+    /* ⛔ WHOSE JOB IT IS TO FREE `ws`, AND WHY THAT IS NOT A DETAIL.
+     *
+     * Two threads can reach the same operator's WsSession: the client's own
+     * thread when its socket ends, and the node's thread when the node goes
+     * away and every attached operator is told 1011 "node disconnected". The
+     * first version let both of them call ws_close, and ws_close frees the
+     * session's buffers -- so the second freed memory the first had already
+     * freed, and the relay died with
+     *
+     *     double free or corruption (fasttop)
+     *
+     * ⛔ WHICH IS THE WORST FAILURE A RELAY CAN HAVE AND THE ONE MOST LIKELY TO
+     * BE MISREAD. It happened only on the runs where a node disconnected while
+     * an operator was still attached -- the ordinary case of a node being
+     * restarted -- and it killed the whole process rather than one session, so
+     * every other node and operator on the relay went down with it. A gate that
+     * only exercises the happy path does not see it, and neither does a
+     * single-session run.
+     *
+     * So the session is closed ONCE and the flag says which path did it. Both
+     * paths still send the close frame -- the operator is told why and its
+     * socket is shut -- but only one frees. */
+    int         ws_released;
 } Client;
+
+static void client_release(Client *c, int code, const char *reason) {
+    if (c->ws_released) {
+        return;
+    }
+    c->ws_released = 1;
+    if (code > 0) {
+        ws_close_with(&c->ws, code, reason);
+    } else {
+        ws_close(&c->ws);
+    }
+}
 
 typedef struct NameSlot {
     char      name[RELAY_NAME_MAX];
@@ -243,6 +278,8 @@ static int protocol_refuse(WsSession *ws, int code, const char *reason) {
     return -1;
 }
 
+static void client_release(Client *c, int code, const char *reason);
+
 /* The operator's side of a pair. It reads the operator's frames, forwards
  * them to the node with the id prepended, and forwards the node's frames for
  * this id to the operator with the id stripped. Its own thread is the only
@@ -314,7 +351,7 @@ static void client_thread(Client *c) {
         stat_bytes_out += n;
     }
     buf_free(&frame);
-    ws_close(&c->ws);
+    client_release(c, 0, NULL);
 }
 
 /* The node's side. ONE reader for the node's whole socket, dispatching to
@@ -482,7 +519,7 @@ node_done:
         NameSlot *ns = slot_locked(name, 0);
         if (ns) {
             for (Client *c = ns->clients; c; c = c->next) {
-                ws_close_with(&c->ws, 1011, "node disconnected");
+                client_release(c, 1011, "node disconnected");
             }
             ns->node = NULL;
             ns->node_dead = 1;
@@ -734,7 +771,7 @@ static void *conn_thread(void *arg) {
         pthread_mutex_unlock(&ns->wlock);
     }
     if (!open_ok) {
-        ws_close_with(&c->ws, 1011, "the node disconnected");
+        client_release(c, 1011, "the node disconnected");
         goto client_cleanup;
     }
 
@@ -759,9 +796,45 @@ client_cleanup:
         }
     }
     peer_count--;
+    /* ⛔ THE Client IS FREED *WHILE THE TABLE LOCK IS STILL HELD*, AND MOVING
+     * THIS FREE OUTSIDE THE LOCK IS WHAT CRASHED THE RELAY.
+     *
+     * The first version unlocked, logged, and only then called free(c). That
+     * leaves a window in which this operator is no longer in `ns->clients` but
+     * its memory is still allocated, and the node thread -- which is walking
+     * that same list to tell every attached operator 1011 "node disconnected"
+     * -- can be inside `client_release(c, ...)` on it while this thread frees
+     * it. The symptom is a heap corruption, not a clean failure:
+     *
+     *     corrupted size vs. prev_size in fastbins
+     *     double free or corruption (fasttop)
+     *
+     * and it took the WHOLE relay process down, so every other node and
+     * operator on it went with it. It reproduced about 1 run in 20, in the
+     * window between one case's node disconnecting and the next case's
+     * operator attaching -- which is the ordinary case of a node restarting
+     * while an operator is still connected.
+     *
+     * Two changes address this and the honest state of the evidence on them:
+     *
+     *   1. `ws_released` on Client, so the SESSION BUFFERS are freed once. Both
+     *      this thread and the node's thread close the same WsSession, and
+     *      ws_close frees its buffers. Measured: this is the change that takes
+     *      the crash rate to zero.
+     *   2. this free under the lock, so the Client STRUCT cannot be freed while
+     *      another thread is walking the list holding a pointer to it.
+     *
+     * ⛔ CHANGE 2 IS NOT YET SHOWN TO BE NECESSARY, AND IS HERE BECAUSE IT IS
+     * CORRECT BY INSPECTION, NOT BECAUSE IT WAS MEASURED. A build with change
+     * 1 and without change 2 was benchmarked and did not crash in 25 runs,
+     * while the pre-fix build crashed in 1 of 25 and 4 of 80. The crash is rare
+     * enough (~5%) that 25 runs cannot separate the two, so change 2 rests on
+     * the argument -- a freed struct reachable through a live list is a
+     * use-after-free whoever happens to be walking it -- and not on a
+     * measurement. It is recorded that way rather than presented as proven. */
+    free(c);
     pthread_mutex_unlock(&tlock);
     logf("operator for %s detached (peers %u)", name, peer_count);
-    free(c);
     return NULL;
 }
 

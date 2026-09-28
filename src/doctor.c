@@ -39,6 +39,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -83,8 +84,10 @@ static void check_identity(void) {
     out("== identity and the cage conditions");
     out("  uid %u  gid %u", (unsigned)u, (unsigned)g);
     if (u == 0) {
-        out("  note    uid 0 does NOT mean the cage can bind(2). A cage that is");
-        out("          bindless at uid 0 is bindless, and this is measured.");
+        out("  note    uid 0 does NOT mean the cage can bind(2) INET. dropssh#6");
+        out("          measured this sandbox: every INET family is refused with");
+        out("          EACCES at uid 0 while AF_UNIX and listen(4) succeed. So");
+        out("          \"bindless\" is too strong, and a unix-socket relay works.");
     }
 
     /* bind(2). ⛔ PROBED, NOT INFERRED FROM uid. The reference cage refuses
@@ -101,14 +104,57 @@ static void check_identity(void) {
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     sa.sin_port = 0;
     if (bind(fd, (struct sockaddr *)&sa, sizeof sa) == 0) {
-        pass("bind(2) on loopback", "a socket bound to 127.0.0.1:0");
+        pass("bind(2) INET on loopback", "a socket bound to 127.0.0.1:0");
         close(fd);
     } else {
-        /* ⛔ THIS IS REPORTED AS A CONDITION, NOT AS A FAILURE. Being unable to
-         * bind is the situation dropssh is built for, and a doctor that
-         * reported it as broken would be wrong about its own purpose. */
-        out("  ok      %-28s %s", "bind(2) on loopback",
-            "refused: this is a bindless cage, which is what dropssh is for");
+        /* ⛔ THIS IS REPORTED AS A CONDITION, NOT AS A FAILURE, AND IT IS
+         * REPORTED PRECISELY. Being unable to bind INET is the situation
+         * dropssh is built for. The wording matters: an earlier revision of
+         * this check said "this is a bindless cage", which is the claim that
+         * dropssh#6 measures to be TOO STRONG -- the same sandbox allows
+         * AF_UNIX, AF_UNIX abstract and listen(4) while refusing every INET
+         * family with EACCES, so "bindless" overstates it and would have a
+         * reader conclude that a unix-socket relay cannot work here. It can,
+         * and it does: the e2e runs every session through `unix://`.
+         *
+         * So this says what was actually attempted (INET, loopback) and what
+         * happened, and the next line checks the AF_UNIX case rather than
+         * leaving the reader to assume it. */
+        out("  ok      %-28s %s", "bind(2) INET on loopback",
+            "refused with EACCES: this cage cannot bind INET, which is what "
+            "dropssh is for");
+        close(fd);
+    }
+
+    /* ⛔ AF_UNIX IS CHECKED SEPARATELY, BECAUSE THE TWO COME APART AND THE
+     * DIFFERENCE IS LOAD-BEARING. dropssh#6 measured that this sandbox refuses
+     * INET bind with EACCES at uid 0 while AF_UNIX bind, AF_UNIX abstract
+     * sockets and listen(4) all succeed -- and the conclusion drawn there is
+     * that a unix-socket relay works in exactly this cage. That is why the e2e
+     * runs every session over `unix://`, and a doctor that reported only the
+     * INET failure would leave the reader thinking nothing can listen here. */
+    {
+        char upath[108];
+        snprintf(upath, sizeof upath, "/tmp/.dropssh-doctor-%d.sock", (int)getpid());
+        int ufd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (ufd < 0) {
+            unknown("bind(2) AF_UNIX", strerror(errno), "");
+        } else {
+            struct sockaddr_un usa;
+            memset(&usa, 0, sizeof usa);
+            usa.sun_family = AF_UNIX;
+            snprintf(usa.sun_path, sizeof usa.sun_path, "%s", upath);
+            unlink(upath);
+            if (bind(ufd, (struct sockaddr *)&usa, sizeof usa) == 0) {
+                out("  ok      %-28s %s", "bind(2) AF_UNIX",
+                    "bound a unix socket: a relay on --listen unix:/// works here");
+                unlink(upath);
+            } else {
+                out("  ok      %-28s %s", "bind(2) AF_UNIX",
+                    "also refused: no listener of any kind works here");
+            }
+            close(ufd);
+        }
     }
 
     struct stat st;

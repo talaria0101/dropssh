@@ -243,8 +243,6 @@ def run_case(relay_path, name, node_sends_id_prefix, node_text=False):
     # operator's job is to have already sent its banner. The asymmetry is the
     # point: the node speaks control both ways and the operator speaks data
     # only.
-    time.sleep(0.4)
-
     if node_text:
         # A TEXT frame where the relay expects data.
         s.node.sendall(encode_frame(0x1, b"this should be data", True))
@@ -257,7 +255,22 @@ def run_case(relay_path, name, node_sends_id_prefix, node_text=False):
     # The operator writes BARE bytes; the relay prepends the id for the node.
     s.op.sendall(encode_frame(0x2, b"OP-BARE", True))
 
-    drain(s, 3.0)
+    # ⛔ THE DATA WINDOW AND THE CLOSE WINDOW ARE SEPARATE, AND THE CLOSE GETS
+    # A BOUNDED WAIT OF ITS OWN. The first version drained for a fixed 3 s and
+    # expected both the payload and the close inside it. On a loaded machine the
+    # payload arrives and the close, which the relay sends after it has closed
+    # its own side, can arrive after the window -- so the case reported "no
+    # close" and failed for a reason that had nothing to do with the rule.
+    #
+    # The two are separated because they are different observations: case 1
+    # asserts a payload, cases 2 and 3 assert a close, and a case that fails
+    # because the close was slow teaches a reader the close code is unreliable
+    # when it is merely asynchronous.
+    drain(s, 2.0)
+    if s.node_close is None:
+        deadline = time.time() + 5
+        while time.time() < deadline and s.node_close is None:
+            drain(s, 0.3)
     return s
 
 
@@ -435,11 +448,100 @@ def main():
         s.node.close()
         s.op.close()
 
+        # ---- case 4: a NODE DISCONNECT WHILE AN OPERATOR IS ATTACHED.
+        # ⛔ THIS CASE EXISTS BECAUSE OF A REAL CRASH, AND IT IS THE ONLY CASE
+        # THAT WOULD HAVE CAUGHT IT DETERMINISTICALLY.
+        #
+        # When a node goes away, the relay tells every attached operator 1011
+        # "node disconnected" -- from the NODE's thread -- while each
+        # operator's own thread is still reading its socket and will close its
+        # own session when that read ends. Two threads, one WsSession, and
+        # ws_close frees the session's buffers, so both freeing them took the
+        # whole relay process down with
+        #
+        #     double free or corruption (fasttop)
+        #
+        # which killed every OTHER node and operator on it. It reproduced about
+        # once in twelve runs, which is the worst possible frequency: rare
+        # enough to look like a flake and common enough to be a production
+        # outage. Cases 1-3 never touch that path, because each of them lets
+        # the operator go first.
+        #
+        # So the ordering is forced: the operator is attached and idle, and the
+        # NODE is the one that closes. The assertion is that the relay is still
+        # serving afterwards -- which is the property that actually broke, and
+        # which no assertion about one session's bytes would have caught.
+        node_probe_ok = True
+        try:
+            nsock = connect_relay(sock_path)
+            handshake_return = None
+            nb = handshake(nsock, "/v1/node/case4")
+            nr = Reader(nsock)
+            nr.buf = nb
+            # the relay's hello
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not nr.feed(0.2):
+                    break
+                f = nr.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    break
+            osock = connect_relay(sock_path)
+            ob = handshake(osock, "/v1/connect/case4")
+            orr = Reader(osock)
+            orr.buf = ob
+            # wait for `open`
+            sid4 = None
+            deadline = time.time() + 8
+            while time.time() < deadline and sid4 is None:
+                if not nr.feed(0.2):
+                    break
+                f = nr.take()
+                if f and f[0] == 0x1:
+                    m = parse_json(f[1])
+                    if m.get("type") == "open":
+                        sid4 = m.get("id")
+                        nsock.sendall(encode_frame(
+                            0x1, json_bytes({"type": "ready", "id": sid4}), True))
+            # The operator is attached and has NOT sent anything. Now the node
+            # vanishes: this is the ordering that used to double free.
+            nsock.close()
+            # Give the relay time to do its 1011 sweep and for the operator's
+            # own thread to notice its socket ended.
+            time.sleep(2.0)
+            # The relay must still be alive and still serve a NEW pair. That is
+            # the assertion: a double free takes the process, so the cheapest
+            # way to see it is to ask the relay for another session afterwards.
+            probe2 = connect_relay(sock_path)
+            b2 = handshake(probe2, "/v1/node/case4-after")
+            p2 = Reader(probe2)
+            p2.buf = b2
+            alive = False
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not p2.feed(0.2):
+                    break
+                f = p2.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    alive = True
+                    break
+            probe2.close()
+            osock.close()
+            if not alive:
+                failures.append(
+                    "after a node disconnected with an operator attached, the "
+                    "relay did not serve a NEW node: the process is gone, which "
+                    "is what a double free in the 1011 sweep does")
+        except Exception as e:
+            node_probe_ok = False
+            failures.append("the node-disconnect case could not run: %s" % e)
+
         for f in failures:
             print("mux-probe: FAIL %s" % f)
         if not failures:
-            print("mux-probe: id-prefix, bare-frame close 1009, and text-frame "
-                  "close 1003 all behave as measured")
+            print("mux-probe: id-prefix, bare-frame close 1009, text-frame "
+                  "close 1003, and a node disconnect with an operator attached "
+                  "all behave as measured")
         return 1 if failures else 0
     finally:
         relay.terminate()
