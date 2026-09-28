@@ -482,10 +482,38 @@ to two is not a measurement.
 prints the four-way table above plus the auth matrix. It is an hour of work and
 it removes the largest source of error in this project so far.
 
-## R2. Run the verbs against a real relay in CI
+## R2. Run the verbs against a real relay in CI -- BUILT, needs a credential
 
 `connect --mint` against a public target, on a schedule rather than every
 commit. This is the gate that would have caught B3, B6 and B9.
+
+**Done as far as it can be done here, 2026-09-28.** `tests/relay-session.sh`
+carries a real session: a pubkey login to uid 0 through a real `ssh` client, a
+270 KB transfer asserted by sha256, two concurrent sessions on one node socket,
+and the node's own registration count read from its log. A scheduled job runs it.
+
+⛔ **AND IT CANNOT RUN WITHOUT A PAIR, AND THE JOB SAYS SO INSTEAD OF PASSING.**
+A pair is minted by the relay's `POST /v1/pair`; the node and connect tokens are
+per-pair **and per-role**, and there is no way to obtain one from the outside.
+`--mint` is the FORWARD endpoint and answers 403 on a reverse upgrade, measured.
+So the job needs three repository secrets, and **a pair expires** — a secret set
+months ago is a job that has been quietly measuring nothing. The job reports
+three outcomes and never conflates them: ran and passed, ran and failed, or
+could not run because no secret is set, which is yellow and states that a green
+tick there is not a pass.
+
+⛔ **AND IT NAMES WHICH FAULT IT WAS**, because "connection failed" is the
+message that costs an afternoon. 403 on an upgrade is a token or a role problem
+and says so; 409 is a name another node holds and says so; a connection error is
+the relay or the egress and says so; silence with no error is a credential the
+relay never saw. Measured against the live relay with a deliberately wrong
+token: the diagnostic arrives in **4 s** and names the token/role case. Without
+`--retry-budget 2` the same diagnostic took 60 s and appeared once under nine
+copies of itself.
+
+The relay's `/health` is fetched whether or not the credential is present,
+because it is the one measurement here that needs no credential and it says
+whether the other half is even meaningful.
 
 ## R3. `dropssh doctor`
 
@@ -560,11 +588,39 @@ Every option, every default, and where each value came from: flag, environment
 or built-in. A wrong setting discovered by reading the resolved output is a
 class of report that otherwise arrives as "it ignored my flag".
 
-## R8. Fetch `docs/08-reverse.md` from the relay, pinned
+## R8. Fetch the relay's own document, with its version -- DONE 2026-09-28
 
 The reference implementation next to ours, so drift is visible rather than
 discovered. The shims are fetched this way already; the protocol reference
 should be too.
+
+⛔ **AND A GIT PIN IS THE WRONG SHAPE, WHICH IS WHY IT IS DONE DIFFERENTLY.**
+Reading the relay's reply on issue #9 shows there is no repository in this
+project to pin: the relay publishes a Cloudflare Worker, and what it SERVES at
+`tcp.ssh.relay.ajam.dev` is the thing a client actually talks to. A pin against
+a repository records what the source said on a day; this records what the
+deployment is serving now, **with its version**, which is the thing that changes.
+
+⛔ **AND DRIFT HAS ALREADY HAPPENED, which is the argument for fetching at all.**
+`/health` reported `2026-09-28-r11` when this project's measurements were taken
+and `2026-09-28-r12` when the fetch script was written, the same day. **A2** —
+"the operator's leg is data-only" — was added between them, in response to our
+own issue. Nothing in this tree would have noticed: our client already works
+around it by never sending control on that leg, so a protocol change is
+invisible here until it becomes a close code in the field.
+
+`scripts/fetch-relay-spec.sh` fetches `llms-full.txt`, `index.md` and
+`/health`, writes `docs/relay-spec/` with the version and the fetch time, and
+re-checks the **five facts this tree measured**: the two reverse paths, 1009
+`bad multiplex frame`, 1003 `binary frames required`, and `node open timeout`.
+At `2026-09-28-r12`, **5/5 hold**.
+
+⛔ **IT IS NOT A CONFORMANCE SUITE AND SAYS SO.** Nothing parses the document.
+Parsing a peer's prose specification and asserting our client against it would
+be a suite we would have to keep correct when the peer rewords a sentence, and a
+reword is not a protocol change. The drift path is a report with exit 1 and an
+explanation; it was exercised against a document with two facts removed and gave
+2 DRIFT lines naming them.
 
 ## R10. Two **concurrent** sessions in the e2e
 

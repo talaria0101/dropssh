@@ -110,7 +110,7 @@ anyone in is the failure this project exists to prevent**, and `dropbear -t`,
 `file` and a green `make` are all incapable of seeing it: it appears at login,
 on a machine with no `/etc/passwd`, as a message that names the wrong thing.
 
-**Twenty-four** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
+**Thirty-four** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
 
 * dropbear is dynamically linked, so the shim can reach it
 * `dropbear -i` stays up on a **socketpair** waiting for a session
@@ -137,6 +137,17 @@ on a machine with no `/etc/passwd`, as a message that names the wrong thing.
 * `doctor` reports the environment and exits non-zero on a failed check
 * `config` prints every setting with its source, and never a token's value
 * `--json` produces a parseable event on stderr and leaves stdout clean
+* **relay tokens**: a pair issued by a keyed relay works against it, the two
+  roles are separate credentials, a pair is bound to one name, the pair
+  **migrates to a second relay holding the same key**, and a relay with **no**
+  key still accepts every peer (`tests/token-check.py`)
+* **the SOCKS5 destination policy** (`tests/socks-policy-test.sh`): the
+  listener reaches only the destination the operator named, and a
+  `--socks` with no `--socks-dest` is refused at startup
+* **the release ships a CA bundle** and a binary in an otherwise empty
+  directory finds it beside itself
+* **a node that cannot pair within `--retry-budget`** exits 4, and the log names
+  the last attempt and the give-up
 
 Two things about how to read it:
 

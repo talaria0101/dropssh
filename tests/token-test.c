@@ -231,6 +231,41 @@ int main(void) {
         }
     }
 
+    /* ---- 8. A LIFETIME MUST BE POSITIVE, IN BOTH DIRECTIONS. Found by
+     * review 1 while reading the issuer rather than by a plant, and both halves
+     * were live. A zero TTL issued a token that verified AT THE INSTANT OF
+     * ISSUE and never again -- a credential with no lifetime -- and a NEGATIVE
+     * TTL issued one whose expiry was already past, which the verifier then
+     * answered "malformed" for: a token this relay had just signed, reported as
+     * not a token at all. ⛔ The second is the one that costs an afternoon,
+     * because "malformed" sends the reader looking for a transport fault. */
+    {
+        char t[600];
+        if (dropssh_token_issue(&ka, "box", DROPSSH_ROLE_NODE, 0, now,
+                                t, sizeof t) == 0) {
+            bad("a token was issued with a zero lifetime, so it is a credential "
+                "that is valid at the instant it is minted and never again");
+        } else {
+            ok("a zero lifetime is refused: no credential is issued at all");
+        }
+        if (dropssh_token_issue(&ka, "box", DROPSSH_ROLE_NODE, -3600, now,
+                                t, sizeof t) == 0) {
+            bad("a token was issued with a NEGATIVE lifetime, so it was born "
+                "expired and the verifier reports it as 'malformed' -- which "
+                "names a transport fault rather than an expiry");
+        } else {
+            ok("a negative lifetime is refused: a token is never born expired");
+        }
+        if (dropssh_token_issue(&ka, "box", DROPSSH_ROLE_NODE, 100L * 365 * 24 * 3600,
+                                now, t, sizeof t) == 0) {
+            bad("a token was issued with a century of life, so it is in "
+                "practice a permanent credential");
+        } else {
+            ok("a lifetime past ten years is refused, so a token cannot be "
+               "permanent by accident");
+        }
+    }
+
     printf("== %d passed, %d failed\n", pass, fail);
     return fail ? 1 : 0;
 }

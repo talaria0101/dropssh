@@ -188,6 +188,25 @@ int dropssh_token_issue(const dropssh_key *k, const char *name,
     if (strlen(name) >= 120) {
         return -1;
     }
+    /* ⛔ A LIFETIME MUST BE POSITIVE, AND BOTH ENDS OF "NOT POSITIVE" ARE
+     * REFUSED HERE RATHER THAN PRODUCING A TOKEN.
+     *
+     * A zero TTL issued a token that verified AT THE INSTANT OF ISSUE and not
+     * one moment later: a credential with no lifetime, minted successfully, and
+     * the first thing anybody noticed was that a session built on it died
+     * without a message. A NEGATIVE TTL issued a token whose expiry was already
+     * in the past, and the verifier then answered "malformed" for it -- a token
+     * this relay had just signed, reported as not a token at all. Measured
+     * 2026-09-28, both.
+     *
+     * The second is the worse of the two, and the reason is the same one that
+     * runs through this file: a diagnostic that names the wrong fault costs an
+     * afternoon. "expired" is the answer for a token whose time has passed, and
+     * a token with a negative lifetime has had its time pass before it was
+     * born. */
+    if (ttl_seconds <= 0 || ttl_seconds > 10L * 365 * 24 * 3600) {
+        return -1;
+    }
     long long exp = now_ms + (long long)ttl_seconds * 1000;
     char payload[256];
     int pn = snprintf(payload, sizeof payload, "%s|%d|%lld", name,

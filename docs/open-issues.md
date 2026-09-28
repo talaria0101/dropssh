@@ -17,11 +17,28 @@ that are about the ssh server instead.
 **The relay work is done.** B1-B10, R1, R3, R4, R5, R6, R10 and R11 were fixed
 in commit `67308d8`; the multiplexed reverse path is implemented and was
 measured live against `tcp.ssh.relay.ajam.dev` (two concurrent sessions on one
-node socket, a 270177-byte transfer byte for byte). `tests/e2e.sh` is 19/19 and
-`tests/mux-probe.py` pins the relay's framing rules.
+node socket, a 270177-byte transfer byte for byte).
 
-What remains is **R2** (a scheduled real-relay CI job, which needs a network and
-a credential) and the two server-side items below.
+**Updated 2026-09-28.** `tests/e2e.sh` is **34/34** and `tests/mux-probe.py`
+carries **thirteen** cases, up from the nine it started this session with. Five
+of the new ones are for the three known-unguarded items, and **U1, U2 and U3
+are all closed**; see the three full entries at the end of
+[`relay-issues.md`](relay-issues.md), and read U3's for a claim in this tree
+that measurement falsified.
+
+Four defects were found by writing the cases rather than by reading the code,
+and three of them were **silent data loss or a wrong refusal**:
+
+| found by | what it was |
+| --- | --- |
+| the 300 KB case (#10) | `relay.c` clamped an operator's frame to the node's `maxFrameBytes`, so **300000 bytes arrived as 65536** and 234464 were lost with no close and no log |
+| U2's ownership case | `ws_close` NULLed `ws->t` without setting `ws->closed`, so a write on a closed or moved-from session **dereferenced NULL** |
+| U2/U3's concurrency read | `NameSlot.node` was a bare pointer **into** a heap `NodeCtx` the node's own thread freed, so a writer used freed memory |
+| rebuilding the release | `scripts/build-dropbear.sh`'s idempotency marker was a string in **neither** the patch nor the patched source, so the **second `build.sh --full` in a clean checkout always failed** |
+
+What remains is **R9** (a `--passwd-file` patched into dropbear) and, from the
+relay list, **R2** and **R8** — both of which are now BUILT and both of which
+need something this repository does not have; see their entries.
 
 Every claim was checked against the source before it was written down, and one
 was wrong and is corrected in place: **B8** in the relay list originally said
@@ -53,7 +70,8 @@ not an approximate location.
 | **B12** | open, in the relay. Not exploitable; the consequence for a client is that the id in an operator frame must not be treated as addressing. |
 | **B13**-**B14** | open, in the relay author's own reference operator. Both stop it running; both are documented. |
 | **R1**, **R3**-**R6**, **R10**, **R11** | **fixed in `67308d8`**: `tests/mux-probe.py`, `doctor`, `--json`, `pair`, `config`, two concurrent sessions, and a negative test for the id rule. |
-| **R2**, **R8** | open. A real-relay CI job, and fetching the relay's reference operator pinned. |
+| **R2** | **BUILT, cannot run here.** `tests/relay-session.sh` and a scheduled job that carries a real session, a 270 KB transfer by sha256, and two concurrent sessions on one node socket. It needs a pair from the relay's `POST /v1/pair`, which is per-pair AND per-role and cannot be obtained from the outside. The job reports three outcomes and never reports a missing credential as a pass. |
+| **R8** | **DONE.** There is no repository to pin: the relay publishes a Worker and what it SERVES is the thing a client talks to. `scripts/fetch-relay-spec.sh` fetches the served document, records the version from `/health`, and re-checks the five facts this tree measured. At `2026-09-28-r12`, 5/5 hold. It was `r11` when our measurements were taken, the same day. |
 
 Full text, with what each looks like:
 [`relay-issues.md`](relay-issues.md).
@@ -64,11 +82,34 @@ Full text, with what each looks like:
 
 Both are server-side. Neither is a transport problem.
 
-## R7. Ship the CA bundle in the release
+## R7. Ship the CA bundle in the release -- DONE 2026-09-28
 
-It is fetched at build time for mbedTLS's benefit and then discarded, so a
-clean machine has none and the first connection cannot verify anything. One
-file in the tarball fixes it.
+It was fetched at build time for mbedTLS's benefit and then discarded, so a
+clean machine had none and the first connection could not verify anything.
+
+The release now ships one, and the binary looks for it **beside itself**
+resolved from `/proc/self/exe` rather than `argv[0]` — a ProxyCommand's
+`argv[0]` is frequently not a path. It is **appended** to the search list, so
+an operator who set `DROPSSH_CA_BUNDLE` keeps the bundle they chose.
+
+**Measured end to end, with a live verified TLS handshake.** A release directory
+containing nothing but `dropssh` and `ca-certificates.crt`, with a binary built
+so that the system paths were removed from its search list, against
+`tcp.ssh.relay.ajam.dev`:
+
+| | result |
+| --- | --- |
+| bundle present | **TLS verified**, and the failure was the relay's 403 |
+| bundle removed | `no CA bundle found ... this build looked there (/tmp/ct2/ca-certificates.crt); if it is not there, the release is incomplete` |
+
+The source is **certifi, pinned by commit** (`9d0a8f1f…`), and not curl's own
+bundle, because **curl's repository does not contain one**: `scripts/cacert.pem`,
+`certs/cacert.pem` and `scripts/curl-ca-bundle.crt` all return 404 at
+`curl-8_11_1`, `curl-8_10_1`, `curl-8_9_1` and `master`. curl links against the
+OS store, so "fetch curl's bundle" cannot be done and a build that claimed to
+had been shipping whatever the build host happened to have. 121 certificates
+in the shipped bundle, and the fetch retries three times because a transient
+429 is not a missing file.
 
 ## R9. A `--passwd-file` option patched into dropbear
 
