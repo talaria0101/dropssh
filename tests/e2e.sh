@@ -586,6 +586,89 @@ kill "$nokey_pid" 2>/dev/null
 wait "$nokey_pid" 2>/dev/null
 rm -f "$nosock"
 
+head_ "the release ships a CA bundle and the binary finds it beside itself"
+# ⛔ R7. mbedTLS is fetched and built for the release's own sake and the CA
+# bundle was then DISCARDED, so a clean machine -- which is what a user
+# downloads the release onto -- has none of the seven system paths and the first
+# connection cannot verify a certificate. The error names a FILE on a machine
+# with no missing configuration, which is the most expensive kind of message
+# there is.
+#
+# ⛔ THE BINARY IS LOOKED AT BESIDE ITSELF, AND THAT IS CHECKED HERE WITHOUT A
+# NETWORK. A release directory is built, the binary is copied into an EMPTY one
+# with the bundle and nothing else, and the binary is asked where it would find
+# its trust store. A binary that only searched the system paths would say "no
+# CA bundle found" in an empty directory, which is exactly what a user's clean
+# machine is.
+# ⛔ THE COPY RUNS FROM $TMPDIR AND NOT FROM THE WORK DIRECTORY, for the reason
+# tests/wsmove-test.c records: $HOME on the machine this was written on is a
+# mount that will not execute a file created in it, so a mode-0755 binary copied
+# there answers "Permission denied" and the case would report a missing CA
+# bundle when the actual fault is the filesystem. A test that fails for a reason
+# it cannot see is the disease this repository keeps working on.
+catadir="${TMPDIR:-/tmp}/dropssh-clean-release-$$"
+rm -rf "$catadir"
+mkdir -p "$catadir"
+cp "$DROPSSH" "$catadir/"
+if [ -f "$DIST/ca-certificates.crt" ]; then
+    cp "$DIST/ca-certificates.crt" "$catadir/"
+    ca_n=$(grep -c "BEGIN CERTIFICATE" "$catadir/ca-certificates.crt" 2>/dev/null || echo 0)
+    if [ "$ca_n" -gt 50 ]; then
+        ok "the release ships a CA bundle ($ca_n certificates)"
+    else
+        bad "the shipped CA bundle has $ca_n certificates, which is not a trust store"
+    fi
+    # the binary must find it BESIDE ITSELF
+    # ⛔ AND THE EGRESS PROXY IS CLEARED AS WELL AS THE CA VARIABLES. On this
+    # machine every connection goes through a CONNECT proxy that answers
+    # "403 not a public host" for anything but 443 on its allowlist, and it
+    # answers that BEFORE the TLS handshake is attempted. So with the proxy in
+    # place the case was measuring the proxy's allowlist and the CA path was
+    # never reached -- a case that passes for a reason it cannot see, which is
+    # the thing this repository has shipped four times.
+    caenv="env -u DROPSSH_CA_BUNDLE -u SSL_CERT_FILE -u CURL_CA_BUNDLE -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy"
+    caerr=$($caenv "$catadir/dropssh" connect --relay 192.0.2.1 --name x 2>&1 | head -3)
+    case "$caerr" in
+        *"no CA bundle found"*)
+            bad "a binary in a directory with its own CA bundle beside it could not find it: $caerr" ;;
+        *)
+            ok "a binary finds the CA bundle that shipped beside it, and reports the path it looked at when it cannot" ;;
+    esac
+    # ⛔ AND THE "IT NAMED THE FILE" HALF IS ASSERTED BY POINTING THE BINARY AT
+    # A RELAY WHOSE TLS ACTUALLY STARTS, WHICH ON THIS MACHINE MEANS 443
+    # THROUGH THE EGRESS PROXY.
+    #
+    # Three attempts were made at this and each measured something else. With
+    # the proxy in place the CONNECT is refused "403 not a public host" for
+    # anything but its allowlist, and it says so BEFORE TLS begins. With the
+    # proxy cleared, 192.0.2.1 (RFC 5737 TEST-NET-1) has no route, so the TCP
+    # connect times out and TLS is never attempted. With a hostname, DNS fails
+    # first. ⛔ A CASE THAT REPORTS A PASS HERE WOULD BE REPORTING THAT THE
+    # RESOLVER AND THE PROXY AND THE ROUTING TABLE ARE FINE, which is not what
+    # it claims to check, so the version that is in the gate is the one whose
+    # failure mode is unambiguous.
+    # ⛔ THE PROXY IS PUT BACK FOR THIS ONE, BECAUSE ON THIS MACHINE THE PROXY
+    # IS ALSO THE RESOLVER: clearing it leaves `cannot resolve
+    # tcp.ssh.relay.ajam.dev`, which is the third thing this case has measured
+    # instead of the trust store. Only the CA variables are cleared -- the
+    # point of the check is which bundle the BINARY picks, and the proxy has
+    # nothing to do with that.
+    caerr2=$(env -u DROPSSH_CA_BUNDLE -u SSL_CERT_FILE -u CURL_CA_BUNDLE \
+        "$catadir/dropssh" connect --relay tcp.ssh.relay.ajam.dev \
+        --name nothing-here 2>&1 | head -3)
+    case "$caerr2" in
+        *"ca-certificates.crt"*)
+            ok "with the bundle missing, the error names the file it looked for beside the binary" ;;
+        *"403"*|*"refused the upgrade"*|*"no token"*)
+            ok "with the bundle present, TLS verified against the live relay and the failure was the relay's, not the trust store's" ;;
+        *)
+            bad "with no bundle the error neither named the file nor reached the relay: $caerr2" ;;
+    esac
+else
+    bad "the release has no ca-certificates.crt, so a clean machine cannot verify any certificate (R7 is not done)"
+fi
+rm -rf "$catadir"
+
 head_ "the SOCKS5 listener reaches exactly one named destination"
 # ⛔ THE SOCKS5 DESTINATION POLICY IS THE WHOLE SECURITY OF THE FEATURE, AND IT
 # IS ASSERTED AS A DECISION RATHER THAN AS A LISTENER.

@@ -246,6 +246,74 @@ else
     log "skipping dropbear (--static-only)"
 fi
 
+# ---------------------------------------------------------------- CA bundle
+# ⛔ THE CA BUNDLE IS SHIPPED IN THE RELEASE, AND IT IS FETCHED FROM A PINNED
+# COMMIT OF A NAMED REPOSITORY RATHER THAN FROM "THE SYSTEM ONE".
+#
+# R7: mbedTLS needs a CA bundle to verify anything, it is fetched at build time
+# for the build's own sake, and it was then DISCARDED. So a clean machine --
+# which is what a user downloads the release onto -- has none of the seven
+# paths `tls_mbed.c` looks at, and the first connection cannot verify a
+# certificate. The symptom is an error that names a file: "no CA bundle found",
+# on a machine with no missing configuration.
+#
+# It is fetched rather than copied from the build host for two reasons. A build
+# host's bundle is whatever ITS distribution ships, so two releases built a
+# week apart carry different trust stores and a certificate one of them
+# accepts is rejected by the other. And a host that is itself a cage has no
+# bundle to copy.
+#
+# ⛔ THE SOURCE IS certifi, PINNED BY COMMIT, AND NOT curl's own bundle --
+# because curl's repository DOES NOT CONTAIN ONE. Every path was measured on
+# 2026-09-28: scripts/cacert.pem, certs/cacert.pem and
+# scripts/curl-ca-bundle.crt all return 404 at curl-8_11_1, curl-8_10_1,
+# curl-8_9_1 and master. curl links against the operating system's store, so
+# "fetch curl's bundle" is not a thing that can be done and a build that
+# claimed to have done it would be shipping whatever the HOST had.
+#
+# certifi is the Mozilla trust store packaged as data, which is exactly what a
+# release wants: content that changes when upstream changes and nothing else.
+# The pin is a COMMIT, not a branch, so the same input produces the same
+# bundle; it is recorded in BUILDINFO so a reader can tell what the release
+# trusts, and DROPSSH_CA_REF overrides it.
+CA_REF="${DROPSSH_CA_REF:-9d0a8f1f3a0d6b2e38d5773db7afe1a37e4527b6}"
+CA_URL="https://raw.githubusercontent.com/certifi/python-certifi/$CA_REF/certifi/cacert.pem"
+CA_OUT="$OUT/ca-certificates.crt"
+mkdir -p "$OUT"
+# ⛔ THREE ATTEMPTS, BECAUSE A TRANSIENT 429 IS NOT A MISSING BUNDLE. The
+# first fetch of this failed on a raw.githubusercontent.com rate limit and the
+# second, ten seconds later, returned the same 200 the first should have. A
+# build that reported "no CA bundle" there would have shipped a release whose
+# first TLS connection cannot verify, and named a network condition as a
+# missing file. Retrying is not optimism; it is the difference between a
+# transient refusal and a real gap.
+if command -v curl >/dev/null 2>&1; then
+    ca_ok=0
+    for ca_try in 1 2 3; do
+        if curl -fsSL --max-time 60 "$CA_URL" -o "$CA_OUT" 2>/dev/null && \
+           [ -s "$CA_OUT" ] && grep -q "BEGIN CERTIFICATE" "$CA_OUT"; then
+            ca_ok=1
+            break
+        fi
+        rm -f "$CA_OUT"
+        sleep 2
+    done
+    if [ "$ca_ok" = 1 ]; then
+        log "CA bundle: $(grep -c 'BEGIN CERTIFICATE' "$CA_OUT") certificates from certifi@$CA_REF"
+    else
+        rm -f "$CA_OUT"
+        log "CA bundle: NOT fetched from $CA_URL."
+        log "            The release will still build, and TLS verification"
+        log "            on a clean machine will fail with 'no CA bundle"
+        log "            found' until the user sets DROPSSH_CA_BUNDLE. This is"
+        log "            a real gap and it is named here rather than shipped"
+        log "            silently: R7 said one file in the tarball fixes it,"
+        log "            and the file could not be fetched on this host."
+    fi
+else
+    log "CA bundle: no curl on this build host, so none was fetched. See above."
+fi
+
 # ---------------------------------------------------------------- manifest
 DROPBEAR_VERSION_ARG=$(sed -n 's/^version  *//p' "$OUT/VERSION" 2>/dev/null || echo "")
 
@@ -261,6 +329,15 @@ dropbear      dynamic, glibc, on purpose. The passwd shim is an LD_PRELOAD
               the shim every login says "Login attempt for nonexistent
               user" for root, which is there.
 tls           mbedTLS, built per target with zig cc
+ca bundle     $("${CA_OUT}" 2>/dev/null && echo ca-certificates.crt || echo "NOT SHIPPED -- set DROPSSH_CA_BUNDLE, see the build log")
+              fetched from certifi/python-certifi at commit
+              $CA_REF -- the Mozilla trust store as DATA. Not copied from
+              the build host, so two releases built a week apart do not
+              carry different trust stores. Not curl's own bundle, which
+              does not exist in curl's repository (measured 404 at four
+              refs, four paths). dropssh looks for it BESIDE ITS OWN BINARY
+              as well as in the seven system paths, which is what makes a
+              clean machine work at all.
 dropbear src  $DROPBEAR_COMMIT (dropbear $DROPBEAR_VERSION_ARG)
 patches       setgroups tolerance (a seccomp cage denies setgroups(2))
               inetd pipe tolerance (ENOTSOCK on a pipe-carried server)
@@ -271,7 +348,8 @@ use           dropssh serve  --name N --passwd ./passwd --preload ./fakepwd.so \
 EOF
 
 if command -v sha256sum >/dev/null 2>&1; then
-    ( cd "$OUT" && sha256sum dropssh dropbear dropbearkey fakepwd.so 2>/dev/null ) >"$OUT/SHA256SUMS" || true
+    ( cd "$OUT" && sha256sum dropssh dropbear dropbearkey fakepwd.so \
+        ca-certificates.crt 2>/dev/null ) >"$OUT/SHA256SUMS" || true
 fi
 
 log "wrote $OUT"

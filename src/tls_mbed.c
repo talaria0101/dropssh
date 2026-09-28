@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <mbedtls/ssl.h>
 #include <mbedtls/entropy.h>
@@ -72,6 +73,27 @@ typedef struct {
  */
 static const char *ca_paths[] = {
     "",      /* filled from the environment below; "" means "not set" */
+    /* ⛔ THE BUNDLE THAT CAME WITH THE RELEASE, BESIDE THE BINARY.
+     *
+     * R7: mbedTLS is fetched and built for the release's own sake and the CA
+     * bundle was then discarded, so a clean machine -- which is what a user
+     * downloads onto -- has none of the seven system paths below and the first
+     * connection cannot verify anything. The error it produces names a FILE,
+     * "no CA bundle found", on a machine with no missing configuration, which
+     * is the most expensive kind of message there is.
+     *
+     * So the release ships `ca-certificates.crt` and the binary looks for it
+     * NEXT TO ITSELF, resolved from /proc/self/exe rather than from argv[0]:
+     * argv[0] is whatever the operator typed, which may be a bare name found
+     * on PATH, and a ProxyCommand's argv[0] is frequently not a path at all.
+     *
+     * This entry is APPENDED rather than prepended, deliberately. The
+     * environment and the system paths stay ahead of it, so an operator who
+     * has set DROPSSH_CA_BUNDLE on purpose keeps the bundle they chose, and
+     * the shipped one is the fallback rather than an override. A release that
+     * silently preferred its own trust store over an administrator's would be
+     * a release nobody could pin. */
+    "",      /* filled from the release directory, below */
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/cert.pem",
@@ -132,6 +154,24 @@ static int tlsstate_init(tlsstate *s, int insecure, char *err, size_t errlen) {
          * everything and reported "no CA bundle found" for a bundle that was
          * sitting right there.
          */
+        /* Resolve the bundle that shipped beside this binary. Done ONCE into
+         * the slot above rather than per connection, because the path does not
+         * change while the process runs and the resolution is a readlink. */
+        if (ca_paths[1][0] == 0) {
+            char self[4096];
+            ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+            if (sl > 0) {
+                self[sl] = 0;
+                char *slash = strrchr(self, '/');
+                if (slash != NULL) {
+                    *slash = 0;
+                    static char beside[4096];
+                    snprintf(beside, sizeof beside,
+                             "%s/ca-certificates.crt", self);
+                    ca_paths[1] = beside;
+                }
+            }
+        }
         int loaded = 0;
         for (int i = 0; ca_paths[i]; i++) {
             if (ca_paths[i][0] == 0) {
@@ -152,8 +192,14 @@ static int tlsstate_init(tlsstate *s, int insecure, char *err, size_t errlen) {
         if (!loaded) {
             snprintf(err, errlen,
                      "no CA bundle found, so no certificate can be verified. "
-                     "Set DROPSSH_CA_BUNDLE to a ca-certificates.crt, or pass "
-                     "--insecure to skip verification on purpose.");
+                     "The release ships ca-certificates.crt beside this "
+                     "binary and this build looked there (%s); if it is not "
+                     "there, the release is incomplete. Otherwise set "
+                     "DROPSSH_CA_BUNDLE, or pass --insecure to skip "
+                     "verification on purpose.",
+                     ca_paths[1][0] ? ca_paths[1]
+                                    : "and found no ca-certificates.crt next "
+                                      "to the running binary");
             return -1;
         }
         mbedtls_ssl_conf_ca_chain(&s->conf, &s->cacert, NULL);
