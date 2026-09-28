@@ -110,12 +110,19 @@ anyone in is the failure this project exists to prevent**, and `dropbear -t`,
 `file` and a green `make` are all incapable of seeing it: it appears at login,
 on a machine with no `/etc/passwd`, as a message that names the wrong thing.
 
-**Nineteen** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
+**Twenty-four** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
 
 * dropbear is dynamically linked, so the shim can reach it
 * `dropbear -i` stays up on a **socketpair** waiting for a session
 * a pubkey session to uid 0, through relay, serve, dropbear and connect
 * a 270 KB transfer that comes back byte for byte
+* **one owner per websocket session** (`tests/wsmove-test.c`): after the move
+  the source owns nothing, and closing it is inert. This is U2, and it is a
+  compiled test against the real `src/ws.c` because ownership is not a race and
+  a probe case can only observe the crash it is trying to prevent. ⛔ The binary
+  is built in the work directory and, if the host will not execute a file
+  there, run once from `$TMPDIR`; "would not run" is reported as itself and
+  never as the defect.
 * a session as the login user with the shipped passwd file
 * a login with an executable shell is accepted
 * a login with a shell that does **not** exist is refused, and says which shell
@@ -124,7 +131,9 @@ on a machine with no `/etc/passwd`, as a message that names the wrong thing.
 * **two concurrent sessions on one node socket**, each receiving only its own
   bytes, and the node's own log showing one registration for two sessions
 * the relay's framing rules (via `tests/mux-probe.py`): the id asymmetry, the
-  1009 close for a bare node frame, the 1003 close for a text data frame
+  1009 close for a bare node frame, the 1003 close for a text data frame, a
+  refusal **below** the session move, and the 1011 sweep with the operator's
+  socket closed in the same instant as the node's
 * `doctor` reports the environment and exits non-zero on a failed check
 * `config` prints every setting with its source, and never a token's value
 * `--json` produces a parseable event on stderr and leaves stdout clean
@@ -161,7 +170,14 @@ tests/e2e.sh    the gate
 tests/mux-probe.py
                 the relay's framing rules as a gate: the prepend/strip
                 asymmetry, the 1009 close for a bare node frame, the 1003
-                close for a text frame on a data leg. No network, no token.
+                close for a text frame on a data leg, a refusal below the
+                session move, and the 1011 sweep with both sockets closed
+                together. No network, no token.
+tests/wsmove-test.c
+                the one-owner-per-session contract, on the real `src/ws.c`.
+                The session move is ownership rather than a race, so it is
+                asserted by asking whether the moved-from source owns
+                anything -- a question a copy cannot answer correctly.
 docs/           the measurements, which are the real documentation
 vendor/         does not exist, on purpose: inputs are fetched and pinned
 ```
@@ -242,6 +258,20 @@ Still open, and named in `docs/relay-issues.md`:
   then closes stdin, but the reply is still coming. A websocket Close there
   tells the relay to tear the session down, and the operator exits having read
   nothing.
+* ⛔ **A POINTER IN THE TABLE IS NOT A REFERENCE TO THE OBJECT, AND `wlock` IS
+  NOT ONE EITHER.** `NameSlot.node` was a `WsSession *` pointing *into* a heap
+  `NodeCtx` that the node's own connection thread freed on its way out, while an
+  operator held that pointer and was about to write through it. `wlock`
+  serialises operators against each other; the node's exit path never took it,
+  so it could not keep the node alive. Both halves of the table now hold a
+  reference count, because one rule applied in one place and forgotten in
+  another has produced three double frees in this file.
+* ⛔ **A MOVE IS NOT A COPY, AND THE MOVE IS ONE FUNCTION.** `ws_move` takes a
+  pointer to the source so it can clear it itself. The two hand-written
+  versions were correct and one deleted `memset` away from aliasing every buffer
+  in the session, with no compiler error and no test. A moved-from session has
+  no transport and no buffers, so a `ws_close` on one is inert by construction
+  rather than by a convention somebody has to remember.
 * ⛔ **EVERY SOCKET IS NON-BLOCKING, AND `wrap_fd` IS WHERE THAT IS SET.** Three
   of the four constructors bypassed it, so the local relay and every socket the
   relay accepted were blocking. The old blocking `ws_read` hid it; a loop that

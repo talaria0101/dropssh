@@ -35,6 +35,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -215,10 +216,19 @@ static void client_release(Client *c, int code, const char *reason) {
     }
 }
 
+/* The node's context, declared here because `NameSlot` holds a pointer to it
+ * rather than a pointer straight into its websocket. See node_hold. */
+typedef struct NodeCtx NodeCtx;
+
 typedef struct NameSlot {
     char      name[RELAY_NAME_MAX];
     int       used;
-    WsSession *node;          /* the node's session, when connected */
+    /* ⛔ THE NODE IS A `NodeCtx *` AND NOT A `WsSession *`, BECAUSE A BARE
+     * POINTER INTO IT IS NOT A REFERENCE TO IT. See node_hold. A reader takes
+     * a reference under `tlock` and drops it after the write, which can block;
+     * the connection thread frees the NodeCtx on its way out and does so
+     * outside every lock this file holds. */
+    NodeCtx  *node;          /* the node, when connected */
     Client   *clients;        /* operators attached to it */
     unsigned  client_count;
     int       node_dead;
@@ -339,12 +349,101 @@ static int protocol_refuse(WsSession *ws, int code, const char *reason) {
 
 static void client_release(Client *c, int code, const char *reason);
 
+/* ⛔ A POINTER INTO THE TABLE IS NOT A REFERENCE TO THE OBJECT, AND ON THE NODE
+ * SIDE THAT WAS A USE-AFTER-FREE RATHER THAN ONLY A RULE.
+ *
+ * `NameSlot.node` used to be `WsSession *` -- that is, `&nc->ws`, a pointer
+ * INTO a heap NodeCtx. An operator thread did:
+ *
+ *     lock tlock;  node_ws = ns->node;  lock wlock;  unlock tlock;
+ *     ... ws_write_text(node_ws, ...);            <- the NodeCtx may be gone
+ *     unlock wlock
+ *
+ * while the node's own connection thread, on its way out, did `free(nc)` with
+ * nothing held. The window is the whole write. `wlock` does not close it: the
+ * node's exit path takes only `tlock`, and takes no `wlock` at all, so `wlock`
+ * serialises OPERATORS against each other and does nothing to keep the NODE
+ * alive. The comment that stood here claimed "the context outlives every use
+ * of it", which was true of the node thread's own uses and false of every
+ * operator's.
+ *
+ * `Client` already solved this with a refcount and a table reference. The node
+ * gets the same mechanism rather than a second rule, because two rules have to
+ * agree and this file has already had three double frees from one rule being
+ * applied in one place and forgotten in another.
+ *
+ * `refs` is guarded by `tlock`. The connection thread's own reference is the
+ * one taken when the NodeCtx is published, and node_drop frees on the last
+ * unref, outside the lock. */
+struct NodeCtx {
+    WsSession ws;
+    int       fd;
+    char      name[RELAY_NAME_MAX];   /* ⛔ OWNED, not borrowed */
+    int       refs;
+};
+
+/* Take a reference under `tlock`. Returns NULL if there is no node. */
+static NodeCtx *node_hold_locked(NameSlot *ns) {
+    NodeCtx *nc = ns ? ns->node : NULL;
+    if (nc) {
+        nc->refs++;
+    }
+    return nc;
+}
+
+static void node_drop(NodeCtx *nc) {
+    int last;
+    pthread_mutex_lock(&tlock);
+    last = (--nc->refs <= 0);
+    pthread_mutex_unlock(&tlock);
+    if (last) {
+        free(nc);
+    }
+}
+
+/* ⛔ A FAULT-INJECTION POINT, INERT UNLESS `DROPSSH_RELAY_FAULT` NAMES IT.
+ *
+ * U3 is the 1011 sweep in `node_done` with no reference held, and it was 0/6 on
+ * the plant because the window between the sweep taking a `Client *` out of the
+ * table and the operator's own thread freeing it is narrower than a probe run
+ * can hit. The honest fix for "a race that is too small to hit" is not a
+ * bigger race in a loop; it is a way to stand the two threads at the two ends
+ * of the window on purpose. That is what this is.
+ *
+ * The mechanism is a yield, and it is deliberately NOT a sleep: a sleep
+ * changes the timing but not the order, so a build with the reference removed
+ * still might not fault, and a guard that still might not fault is the thing
+ * this project keeps shipping. Yielding at both ends of the window lets the
+ * operating system interleave the two threads with high probability while
+ * leaving the correctness of the fixed build entirely unchanged -- the
+ * reference is what makes the interleaving safe, not the scheduling.
+ *
+ * ⛔ AND IT IS READ ONCE, AT STARTUP, AND IT IS NOT A PRODUCT FLAG. A
+ * concurrency knob on the relay is a knob nobody sets and a path CI depends
+ * on, which is the same objection that ruled out a `--silent` mode for the
+ * `ready` bound (U1). It is read once into a `const char *`, it names one of
+ * two fixed points, and an unrecognised value is a hard error rather than a
+ * silently-ignored one, so a typo cannot quietly disable the instrument and
+ * turn the case green for the wrong reason. */
+static const char *relay_fault_point = NULL;
+
+static void relay_fault(const char *name) {
+    if (relay_fault_point == NULL || strcmp(relay_fault_point, name) != 0) {
+        return;
+    }
+    /* A bounded yield, not an unbounded wait: the case must still finish if a
+     * future change makes one of the two threads unreachable, and a test that
+     * can hang is worse than a test that can fail. */
+    for (int i = 0; i < 2000; i++) {
+        sched_yield();
+    }
+}
+
 /* The operator's side of a pair. It reads the operator's frames, forwards
  * them to the node with the id prepended, and forwards the node's frames for
  * this id to the operator with the id stripped. Its own thread is the only
  * writer on the operator's websocket, which is what keeps a frame whole. */
 static void client_thread(Client *c) {
-    WsSession *node_ws;
     buffer frame;
     buf_init(&frame);
     for (;;) {
@@ -388,12 +487,22 @@ static void client_thread(Client *c) {
                      "answered `ready`", c->id);
                 client_release(c, 1008, "wait for ready");
                 NameSlot *ens;
-                WsSession *ews;
+                NodeCtx *enc;
+                /* One lookup, one reference, taken under the table lock. The
+                 * first version read `ens->node` twice -- once to test it for
+                 * NULL and again after taking `wlock` -- and the second read
+                 * could see a different node from the first, because the
+                 * table's `node` pointer is cleared by the outgoing node's own
+                 * thread. Holding the reference is what makes the value
+                 * stable across the write, which can block. */
                 pthread_mutex_lock(&tlock);
                 ens = slot_locked(c->name, 0);
-                ews = ens ? ens->node : NULL;
+                enc = node_hold_locked(ens);
+                if (ens) {
+                    pthread_mutex_lock(&ens->wlock);
+                }
                 pthread_mutex_unlock(&tlock);
-                if (ews) {
+                if (enc && ens) {
                     /* ⛔ THE NODE IS *TOLD*, NOT CLOSED, AND THAT IS THE WHOLE
                      * POINT.
                      *
@@ -423,57 +532,92 @@ static void client_thread(Client *c) {
                      * session -- which is the only place that must happen. A
                      * `close` control message is also forwarded to every other
                      * operator attached to that node, because one operator
-                     * arriving early says nothing about the others. */
-                    pthread_mutex_lock(&tlock);
-                    ens = slot_locked(c->name, 0);
-                    WsSession *lock_ws = ens ? ens->node : NULL;
-                    if (ens) {
-                        pthread_mutex_lock(&ens->wlock);
-                    }
-                    pthread_mutex_unlock(&tlock);
-                    if (lock_ws && ens) {
+                     * arriving early says nothing about the others.
+                     *
+                     * ⛔ ONE LOOKUP, ONE REFERENCE, ONE LOCK, AND THE SIBLINGS
+                     * ARE COLLECTED UNDER `tlock` RATHER THAN WALKED IN PLACE.
+                     *
+                     * Two things were wrong here and both are the same mistake.
+                     * The block read `ens->node` twice -- once to test it for
+                     * NULL and again after re-taking `wlock` -- and the two
+                     * reads could see DIFFERENT nodes, because the outgoing
+                     * node's own thread clears `ns->node` on its way out. And
+                     * it walked `ens->clients` with no lock at all, while every
+                     * unlink of that list happens under `tlock` in
+                     * `client_cleanup`: a sibling detaching mid-walk freed the
+                     * Client the next iteration was about to write to.
+                     *
+                     * So: one reference on the node, held across the node's
+                     * write; the siblings collected into a fixed array with a
+                     * reference each, under `tlock`; and every write done with
+                     * no lock held except the node's own `wlock` around the node
+                     * frame itself. This is the shape the 1011 sweep already
+                     * uses for exactly the same fan-out. */
+                    {
                         char close_msg[96];
                         snprintf(close_msg, sizeof close_msg,
                                  "{\"type\":\"close\",\"id\":\"%s\"}", c->id);
-                        ws_write_text(lock_ws,
-                                      (const unsigned char *)close_msg,
+                        ws_write_text(&enc->ws, (const unsigned char *)close_msg,
                                       strlen(close_msg));
-                        /* And the other operators on this node, because the
-                         * node is going away from under all of them. */
-                        for (Client *o = ens->clients; o; o = o->next) {
-                            if (o != c) {
-                                char m2[96];
-                                snprintf(m2, sizeof m2,
-                                         "{\"type\":\"close\",\"id\":\"%s\"}", o->id);
-                                ws_write_text(&o->ws,
-                                              (const unsigned char *)m2, strlen(m2));
-                            }
-                        }
-                        pthread_mutex_unlock(&ens->wlock);
                     }
+                    pthread_mutex_unlock(&ens->wlock);
+                    {
+                        Client *sibs[RELAY_MAX_SESSIONS];
+                        int nsibs = 0;
+                        pthread_mutex_lock(&tlock);
+                        for (Client *o = ens->clients;
+                             o && nsibs < RELAY_MAX_SESSIONS; o = o->next) {
+                            if (o == c) {
+                                continue;
+                            }
+                            o->refs++;
+                            sibs[nsibs++] = o;
+                        }
+                        pthread_mutex_unlock(&tlock);
+                        for (int i = 0; i < nsibs; i++) {
+                            char m2[96];
+                            snprintf(m2, sizeof m2,
+                                     "{\"type\":\"close\",\"id\":\"%s\"}", sibs[i]->id);
+                            ws_write_text(&sibs[i]->ws,
+                                          (const unsigned char *)m2, strlen(m2));
+                            client_unref(sibs[i]);
+                        }
+                    }
+                }
+                if (enc) {
+                    node_drop(enc);
                 }
                 break;
             }
         }
         /* ⛔ THE ID IS PREPENDED HERE AND ONLY HERE, in the SAME FRAME. The
          * node receives id+payload. If this were two frames the node would
-         * read the id as session bytes. */
+         * read the id as session bytes.
+         *
+         * ⛔ AND THE NODE IS HELD, NOT MERELY POINTED AT. `wlock` is taken
+         * across the write so two operators cannot interleave frames on the
+         * node's socket, but `wlock` does NOT keep the node alive: the
+         * outgoing node's own thread takes only `tlock` on its way out and
+         * then frees the NodeCtx, so a write here could land in freed memory.
+         * The reference is taken under the same `tlock` that published the
+         * node and dropped after the lock is released, so the NodeCtx outlives
+         * the write by exactly as much as it needs to. */
         NameSlot *ns;
+        NodeCtx  *enc;
         pthread_mutex_lock(&tlock);
         ns = slot_locked(c->name, 0);
-        node_ws = ns ? ns->node : NULL;
-        /* Held ACROSS the write, not just to read the pointer. The lock is
-         * taken under the table lock and released after ws_write returns, so
-         * two operators on one node serialise their frames and two nodes do
-         * not serialise against each other. */
+        enc = node_hold_locked(ns);
         if (ns) {
             pthread_mutex_lock(&ns->wlock);
         }
         pthread_mutex_unlock(&tlock);
-        if (node_ws == NULL) {
+        if (enc == NULL) {
+            if (ns) {
+                pthread_mutex_unlock(&ns->wlock);
+            }
             break;
         }
-        unsigned mf = ws_max_frame(node_ws);
+        unsigned mf = ws_max_frame(&enc->ws);
         if (mf && n + RELAY_ID_LEN > mf) {
             n = mf > RELAY_ID_LEN ? mf - RELAY_ID_LEN : 0;
         }
@@ -482,17 +626,19 @@ static void client_thread(Client *c) {
             if (ns) {
                 pthread_mutex_unlock(&ns->wlock);
             }
+            node_drop(enc);
             break;
         }
         memcpy(framed, c->id, RELAY_ID_LEN);
         if (n) {
             memcpy(framed + RELAY_ID_LEN, frame.p, n);
         }
-                int wrc = ws_write(node_ws, framed, n + RELAY_ID_LEN);
+        int wrc = ws_write(&enc->ws, framed, n + RELAY_ID_LEN);
         free(framed);
         if (ns) {
             pthread_mutex_unlock(&ns->wlock);
         }
+        node_drop(enc);
         if (wrc != 0) {
             break;
         }
@@ -501,15 +647,6 @@ static void client_thread(Client *c) {
     buf_free(&frame);
     client_release(c, 0, NULL);
 }
-
-/* The node's side. ONE reader for the node's whole socket, dispatching to
- * operators by id. The node's thread is the only writer on the node's
- * websocket, so an id prefix and its payload always leave together. */
-typedef struct NodeCtx {
-    WsSession ws;
-    int       fd;
-    char      name[RELAY_NAME_MAX];   /* ⛔ OWNED, not borrowed */
-} NodeCtx;
 
 /* ⛔ THE NAME IS A FIELD OF THE CONTEXT, NOT A POINTER INTO A CALLER'S STACK.
  * An earlier draft passed a `struct { NodeCtx *nc; char name[]; }` on the
@@ -760,6 +897,18 @@ node_done:
         }
         pthread_mutex_unlock(&tlock);
         for (int i = 0; i < ndoomed; i++) {
+            /* ⛔ THE INJECTION POINT FOR U3, AND IT IS *INSIDE* THE LOOP AND
+             * AFTER THE REFERENCES ARE TAKEN, WHICH IS THE ONLY PLACE IT MEANS
+             * ANYTHING. The defect being guarded is a pointer taken out of the
+             * table and used after the operator's own thread is free to have
+             * freed it, so the window is between "the sweep holds a pointer"
+             * and "the sweep has closed that operator's session". Yielding
+             * here is where the operator's thread gets the chance to reach its
+             * own last unref. With the reference held, that unref only
+             * decrements the count and the object survives; with it removed,
+             * the object is freed and the `client_release` below writes through
+             * freed memory. */
+            relay_fault("sweep-release");
             client_release(doomed[i], 1011, "node disconnected");
             client_unref(doomed[i]);
         }
@@ -895,12 +1044,16 @@ static void *conn_thread(void *arg) {
             ws_close(&ws);
             return NULL;
         }
-        /* ⛔ THE NODE'S SESSION IS HEAP-ALLOCATED AND ITS THREAD OWNS IT FOR
-         * ITS WHOLE LIFE, so the pointer in the table cannot dangle when this
-         * (short-lived) connection thread returns. The old version kept a
-         * WsSession on the accepting thread's STACK and put that pointer in a
-         * global table, which is a use-after-return that works with one
-         * connection and is a crash with two. */
+        /* ⛔ THE NODE'S SESSION IS HEAP-ALLOCATED AND IT IS PUBLISHED AS A
+         * POINTER TO THE CONTEXT, NOT A POINTER INTO IT.
+         *
+         * The old version kept a WsSession on the accepting thread's STACK and
+         * put that pointer in a global table, which is a use-after-return that
+         * works with one connection and is a crash with two. The heap version
+         * fixed that but introduced the mirror-image bug: `&nc->ws` outlived
+         * nothing, because `free(nc)` ran while a reader held the pointer. The
+         * table holds `nc` and readers hold a reference on it, so neither the
+         * stack's lifetime nor a bare interior pointer can be the owner. */
         NodeCtx *nc = calloc(1, sizeof *nc);
         if (nc == NULL) {
             pthread_mutex_unlock(&tlock);
@@ -912,13 +1065,17 @@ static void *conn_thread(void *arg) {
          * below: a struct copy shares its buffer POINTERS, so the stack `ws`
          * and `nc->ws` would own the same allocations and the first close
          * would free memory the other still points at. The node's session is
-         * closed by exactly one thread -- its own -- and zeroing the stack copy
-         * makes every other `ws_close(&ws)` on this path a no-op. */
-        nc->ws = ws;
-        memset(&ws, 0, sizeof ws);
+         * closed by exactly one thread -- its own -- and `ws_move` leaves the
+         * stack copy inert, so every other `ws_close(&ws)` on this path is a
+         * no-op rather than a second free. `docs/relay-issues.md` U2. */
+        ws_move(&nc->ws, &ws);
         nc->fd = fd;
         snprintf(nc->name, sizeof nc->name, "%s", name);
-        e->node = &nc->ws;
+        /* The table's own reference on the node, dropped by node_drop when
+         * this connection thread returns. Readers add one for the duration of
+         * a write that can block. Same contract as `Client.refs`. */
+        nc->refs = 1;
+        e->node = nc;
         e->node_dead = 0;
         peer_count++;
         if (peer_count > stat_peak_peers) {
@@ -928,19 +1085,27 @@ static void *conn_thread(void *arg) {
         logf("node %s connected (peers %u)", name, peer_count);
 
         /* The node owns its socket for the rest of the connection, and this
-         * thread is the one that blocks in node_thread for exactly that long,
-         * so the context outlives every use of it. */
+         * thread is the one that blocks in node_thread for exactly that long.
+         *
+         * ⛔ BUT "OUTLIVES EVERY USE OF IT" WAS TRUE OF THE NODE'S OWN USES AND
+         * FALSE OF AN OPERATOR'S, and that was a use-after-free. An operator
+         * reads `ns->node`, releases `tlock`, and then writes to the node; the
+         * outgoing node's own thread took no lock an operator holds and went
+         * straight to `free(nc)`. So the context is now freed through the
+         * same refcount the readers use: the reference taken when it was
+         * published is dropped here, and if an operator still holds one the
+         * free happens on that operator's thread instead. */
         node_thread(nc);
         pthread_mutex_lock(&tlock);
         peer_count--;
         NameSlot *fin = slot_locked(name, 0);
-        if (fin && fin->node == &nc->ws) {
+        if (fin && fin->node == nc) {
             fin->node = NULL;
             fin->node_dead = 1;
         }
         pthread_mutex_unlock(&tlock);
         logf("node %s disconnected (peers %u)", name, peer_count);
-        free(nc);
+        node_drop(nc);
         return NULL;
     }
 
@@ -1000,9 +1165,12 @@ static void *conn_thread(void *arg) {
      * is written out here.
      *
      * The move is by hand rather than `*c->ws = ws` because that is a copy and
-     * a copy is what is being removed. The stack `ws` is zeroed afterwards, so
-     * every `ws_close(&ws)` on the refusal paths below is a no-op on an
-     * already-moved session rather than a second free.
+     * a copy is what is being removed. It is now `ws_move(&c->ws, &ws)`, a
+     * single named operation that clears the source ITSELF, so every
+     * `ws_close(&ws)` on the refusal paths is a no-op on an already-moved
+     * session rather than a second free -- and, unlike the hand-written
+     * `c->ws = ws; memset(&ws, 0, ...)` pair it replaced, the clearing is not a
+     * separate statement a future edit can delete.
      *
      * ⛔ AND WHY THE MOVE IS DEFENCE IN DEPTH RATHER THAN A FIX FOR AN OBSERVED
      * CRASH, WHICH IS NOT THE CLAIM AN EARLIER DRAFT OF THIS COMMENT MADE.
@@ -1021,9 +1189,13 @@ static void *conn_thread(void *arg) {
      * property every one of the three double frees in this file needed and none
      * of them had, and because a future refusal added BELOW this line would
      * reintroduce the aliasing silently. That is a change to make the next
-     * edit's failure mode loud, not a fix for a crash measured today. */
-    c->ws = ws;
-    memset(&ws, 0, sizeof ws);
+     * edit's failure mode loud, not a fix for a crash measured today.
+     *
+     * ⛔ U2 IS NOW CLOSED BY `ws_move`, and the guard for it is a case that
+     * drives a refusal BELOW this line -- the `if (!open_ok)` block, which is
+     * the only path in this function that runs after the move and closes the
+     * session. See `tests/mux-probe.py` case 9. */
+    ws_move(&c->ws, &ws);
     snprintf(c->name, sizeof c->name, "%s", name);
     random_id(c->id);
     c->next = e->clients;
@@ -1044,22 +1216,33 @@ static void *conn_thread(void *arg) {
     char open_msg[128];
     snprintf(open_msg, sizeof open_msg, "{\"type\":\"open\",\"id\":\"%s\"}", c->id);
     /* The same lock as the data path, for the same reason: this is a write to
-     * the node's websocket from an operator's thread. */
+     * the node's websocket from an operator's thread.
+     *
+     * ⛔ AND THE NODE IS HELD ACROSS IT. This is the ONE write in this file
+     * that happens BELOW the `c->ws` move, which is what makes it the case
+     * U2 needs: with the session copied rather than moved, a refusal here
+     * would close a stack copy that the Client also owns. The reference is
+     * what makes the node's context outlive the write, for the same reason the
+     * data path holds one -- see node_hold. */
     NameSlot *ns;
+    NodeCtx  *enc;
     pthread_mutex_lock(&tlock);
     ns = slot_locked(name, 0);
-    WsSession *node_ws = ns ? ns->node : NULL;
+    enc = node_hold_locked(ns);
     if (ns) {
         pthread_mutex_lock(&ns->wlock);
     }
     pthread_mutex_unlock(&tlock);
     int open_ok = 0;
-    if (node_ws != NULL) {
-        open_ok = ws_write_text(node_ws, (const unsigned char *)open_msg,
+    if (enc != NULL) {
+        open_ok = ws_write_text(&enc->ws, (const unsigned char *)open_msg,
                                 strlen(open_msg)) == 0;
     }
     if (ns) {
         pthread_mutex_unlock(&ns->wlock);
+    }
+    if (enc) {
+        node_drop(enc);
     }
     if (!open_ok) {
         client_release(c, 1011, "the node disconnected");
@@ -1109,6 +1292,15 @@ client_cleanup:
     }
     peer_count--;
     pthread_mutex_unlock(&tlock);
+
+    /* ⛔ THE OTHER END OF U3'S WINDOW. The operator's own thread is about to
+     * drop the table's last reference, which is the free when nothing else
+     * holds one. Yielding between the unlink and the unref gives the node's
+     * sweep the same chance to be inside `client_release` on this Client. The
+     * two points are symmetric on purpose: either one alone would be a guess
+     * about which thread wins, and a guard built on a guess is the disease
+     * this file exists to correct. */
+    relay_fault("client-last-unref");
 
     client_unref(c);
 
@@ -1162,6 +1354,28 @@ static void print_status(void) {
 int dropssh_relay_main(int argc, char **argv) {
     const char *listen_path = NULL;
     int status_mode = 0;
+    /* ⛔ THE FAULT-INJECTION POINT IS VALIDATED, NOT MERELY READ. An
+     * unrecognised value is refused, because a silently-ignored typo would
+     * leave the instrument disabled and the U3 case green for the wrong
+     * reason -- the same failure as the U1 probe's help-text parse, which
+     * matched nothing and fell back to a number that happened to be right. */
+    {
+        const char *fault = getenv("DROPSSH_RELAY_FAULT");
+        if (fault && fault[0]) {
+            if (strcmp(fault, "sweep-release") == 0 ||
+                strcmp(fault, "client-last-unref") == 0) {
+                relay_fault_point = fault;
+            } else {
+                fprintf(stderr,
+                        "dropssh relay: DROPSSH_RELAY_FAULT is '%s', which is not "
+                        "a known injection point. The points are 'sweep-release' "
+                        "and 'client-last-unref'. Refusing rather than ignoring "
+                        "it, so a typo cannot silently disable the "
+                        "instrument.\n", fault);
+                return 2;
+            }
+        }
+    }
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
             listen_path = argv[++i];
@@ -1187,6 +1401,16 @@ int dropssh_relay_main(int argc, char **argv) {
 "  --max-sessions N             refuse an operator above N sessions on a node\n"
 "  --idle-timeout MS            drop a peer silent for this long\n"
 "  --status                     print what this process is doing, and exit\n"
+"\n"
+"TESTING\n"
+"  DROPSSH_RELAY_FAULT=sweep-release|client-last-unref\n"
+"                             yield at that point in the 1011 sweep or in an\n"
+"                             operator's last unref. Inert unless set, and an\n"
+"                             unrecognised value is refused rather than\n"
+"                             ignored. It is an instrument for the race the\n"
+"                             sweep has twice crashed on, NOT the reason U3 was\n"
+"                             closed: the case that closed U3 reaches the race\n"
+"                             without it. See docs/relay-issues.md.\n"
 "\n"
 "ROLES\n"
 "  a node    -> /v1/node/<name>     dials out and waits to be paired\n"

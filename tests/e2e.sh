@@ -519,6 +519,73 @@ else
     bad "tests/mux-probe.py is missing, so the id-prefix rule is unasserted"
 fi
 
+head_ "one owner per websocket session (U2), asserted on the artefact"
+# ⛔ U2 WAS 0/6 BECAUSE EVERY EXISTING CASE SITS *ABOVE* THE SESSION MOVE, so
+# no probe could tell a move from a copy. Closing it with another probe case
+# would repeat that mistake, so the property is asserted directly, on the real
+# compiled ws.c, by the only thing that can distinguish them: closing the
+# moved-from source must be inert, and a copy's is not.
+#
+# ⛔ AND IT IS PROVEN TO FIRE. The guard was built against a plant that removes
+# the clear from ws_move -- a copy, which is the U2 defect -- and that plant
+# fails four named assertions and exits 1. A test that has only ever passed is
+# not evidence, and this one was made to fail before it was made to pass.
+#
+# The target is the host's, not the release's: this is a source-level test
+# compiled here, not a released artefact, so it uses whatever `zig cc` defaults
+# to. It links ws.c, buffer.c and util.c directly, so what it asserts about is
+# the shipping code.
+#
+# ⛔ IT IS BUILT WHERE THE SUITE'S WORK DIRECTORY IS, AND RUN FROM WHERE THE
+# HOST WILL ACTUALLY EXECUTE IT, BECAUSE THOSE CAN BE DIFFERENT PLACES.
+#
+# The work directory is `$HOME` when there is one, and on the zfs mount this
+# was developed on, `$HOME` does not permit executing a file created in it: a
+# binary that compiled, linked, and has mode 0755 answers "Permission denied".
+# So the binary is tried in `$WORK` first, and if the host refuses to run it
+# there it is tried once in the temp directory.
+#
+# ⛔ AND "COULD NOT RUN" IS ITS OWN FAILURE, NEVER THE U2 DEFECT. The two are
+# different claims and reporting one as the other is how a green suite comes to
+# mean nothing: a test that cannot execute must say that it could not execute,
+# and must not report the defect it was written to catch. The exit status alone
+# cannot tell them apart, so the failure is read from the run's own output and
+# the "permission denied" case is a distinct message.
+if [ -f "$HERE/wsmove-test.c" ]; then
+    wsmove_bin="$WORK/wsmove-test"
+    wsmove_runlog="$WORK/wsmove-run.log"
+    if zig cc -O1 -o "$wsmove_bin" "$HERE/wsmove-test.c" \
+        "$ROOT/src/ws.c" "$ROOT/src/buffer.c" "$ROOT/src/util.c" \
+        >"$WORK/wsmove-build.log" 2>&1; then
+        wsmove_ok=0
+        if "$wsmove_bin" >"$wsmove_runlog" 2>&1; then
+            wsmove_ok=1
+        elif grep -qi "permission denied" "$wsmove_runlog" 2>/dev/null; then
+            wsmove_alt="${TMPDIR:-/tmp}/dropssh-wsmove-$$"
+            if cp "$wsmove_bin" "$wsmove_alt" 2>/dev/null \
+               && chmod +x "$wsmove_alt" 2>/dev/null \
+               && "$wsmove_alt" >"$wsmove_runlog" 2>&1; then
+                wsmove_ok=1
+                rm -f "$wsmove_alt"
+            else
+                rm -f "$wsmove_alt" 2>/dev/null
+                bad "tests/wsmove-test.c compiled but this host would not execute it, in the work directory or in $TMPDIR: the one-owner property is UNTESTED, not passing"
+            fi
+        else
+            wsmove_ok=2
+        fi
+        if [ "$wsmove_ok" = 1 ]; then
+            ok "a moved-from session owns nothing, and closing it is inert"
+        elif [ "$wsmove_ok" = 2 ]; then
+            bad "a moved-from session still owns the session: a WsSession is being COPIED where it must be moved, and copying shares the buffer pointers (see the output above)"
+        fi
+    else
+        bad "tests/wsmove-test.c did not compile, so the one-owner property is unasserted (see $WORK/wsmove-build.log)"
+    fi
+else
+    bad "tests/wsmove-test.c is missing, so the one-owner property is unasserted"
+fi
+
 head_ "doctor, config and pair answer without a network"
 # ⛔ THESE THREE ARE ASSERTED BECAUSE EACH WAS PREVIOUSLY EITHER MISSING OR
 # A FLAG THAT DID NOTHING. `doctor` answers the environment questions that were

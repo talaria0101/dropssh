@@ -255,7 +255,19 @@ int ws_write(WsSession *ws, const unsigned char *buf, size_t len);
  * it wrong. */
 int ws_write_text(WsSession *ws, const unsigned char *buf, size_t len);
 
-/* Send a Close frame and close the transport. Safe to call twice. */
+/* ⛔ MOVE OWNERSHIP, AND NEVER COPY A WsSession. See ws_move for the full
+ * reason: a copy of a session shares its buffer pointers, and the first close
+ * frees what the second still points at.
+ *
+ * `*src` is left INERT -- no transport, no buffers -- so a `ws_close(src)` after
+ * the move is a no-op rather than a second free. That property is what makes it
+ * safe to keep the existing `ws_close(&ws)` on refusal paths that sit above
+ * this call, and it is what stops a refusal added BELOW it from reintroducing
+ * the aliasing. `docs/relay-issues.md` U2. */
+void ws_move(WsSession *dst, WsSession *src);
+
+/* Send a Close frame and close the transport. Safe to call twice, and safe to
+ * call on a session that has been moved away from. */
 void ws_close(WsSession *ws);
 
 /* Send a Close frame carrying `code` and `reason`. ⛔ THE REASON IS THE

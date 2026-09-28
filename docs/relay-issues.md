@@ -607,8 +607,9 @@ side of it is caught by a test instead of by an afternoon.
 
 # ⛔ KNOWN-UNGUARDED: three, and the list is here so it cannot be lost
 
-> **U1 IS NOW CLOSED**; its full entry, with the plant counts, is at the very
-> end of this file. **U2 and U3 remain 0/6.**
+> **U1 IS CLOSED**; its full entry, with the plant counts, is at the very
+> end of this file. **U2 and U3 are now closed too, and U3's closure CORRECTS
+> the claim below.**
 
 **2026-09-28, after a five-pass review of `d986214`.** Six defects were
 planted — built, run, and counted — and three came back **0/6**. A guard that
@@ -620,8 +621,8 @@ a commit message asserting something is safe when it is not.**
 | # | what | why 0/6 | what would close it |
 | --- | --- | --- | --- |
 | **U1** ✅ | the 60-second bound on the `ready` wait, `src/connect.c` | unreachable: this relay answers **503 on the upgrade** for a name with no node, so nothing reaches the bound | **CLOSED 2026-09-28.** A relay **stub** in `tests/mux-probe.py` that completes the operator's upgrade, speaks the real protocol, and then says nothing. The bound is now a value the binary itself reports (`--bound-ms`, printed in `connect --help`), so its absence is measurable. See U1's own entry at the end of this file. |
-| **U2** | the session **move** in `src/relay.c` (`c->ws = ws; memset(&ws, ...)` rather than a `memcpy`) | unreachable: every `ws_close(&ws)` on the operator path is *above* the move, so a copy aliases nothing that is later closed | a refusal path **below** the move. It is defence in depth — one owner per session, established where the session is stored — and a future refusal added there would reintroduce the aliasing silently |
-| **U3** | the 1011 sweep in `src/relay.c` with no reference held | the window is narrower than 6 probe runs; case 4 forces the ordering but does not land inside it | a case that closes an operator and drops its last reference **in the same instant**. May need a fault-injection hook rather than a timing trick |
+| **U2** ✅ | the session **move** in `src/relay.c` (`c->ws = ws; memset(&ws, ...)` rather than a `memcpy`) | unreachable: every `ws_close(&ws)` on the operator path is *above* the move, so a copy aliases nothing that is later closed | **CLOSED 2026-09-28.** `ws_move()` in `src/ws.c`, and `tests/wsmove-test.c` asserts the contract on the real `ws.c`. The plant fails 4 named assertions. See the full entry at the end of this file. |
+| **U3** ✅ | the 1011 sweep in `src/relay.c` with no reference held | ⛔ **THE STATED REASON WAS TOO STRONG, AND THIS ENTRY IS THE CORRECTION.** See the full entry at the end of this file. | **CLOSED 2026-09-28.** `tests/mux-probe.py` case 10, **25/25 against the original code**, no fault injection needed. |
 
 **The three that ARE guarded, with the counts, so the shape of a real guard sits
 next to the three that are not:**
@@ -632,8 +633,8 @@ next to the three that are not:**
 | id not stripped (B3) | 6/6 |
 | no early-data refusal | 6/6 |
 | no bound on the `ready` wait | **0/6, then 3/3** (U1, closed) |
-| aliased session owner | **0/6** |
-| 1011 sweep with no refcount | **0/6** |
+| aliased session owner | **0/6, then 4/4 by name** (U2, closed; a new instrument, not a new scenario) |
+| 1011 sweep with no refcount | **0/6, then 25/25** (U3, closed; **the original 0/6 was measured against the wrong scenario**) |
 
 ⭐ **And one more that is not a plant but is the same disease.** The framing
 probe once passed for several runs while its node had **stopped** answering
@@ -660,8 +661,8 @@ fire. An empty result beats an invented one.
 | --- | --- | --- | --- | --- |
 | 1 | correctness, line by line, and the error paths | `f02ae10` + `c9840e0` | read every changed line; exercised every new error path by running the binary | **2 defects**, both fixed |
 | 2 | concurrency: what is freed under a pointer, what is written under a lock that can block | `f02ae10` + `c9840e0` | traced every writer and reader of the two structures the commits touch; ran the loop's bound directly against a hostile input | **0 defects in this work**; 1 pre-existing area re-confirmed (U2/U3) |
-| 3 | the tests: would each fail if its defect returned? | not yet run | | |
-| 4 | the docs and the issue comments: does any assert what this change made false? | not yet run | | |
+| 3 | the tests: would each fail if its defect returned? | `f02ae10` + `c9840e0`, then this session's U2/U3 work | **built the plants and ran them.** U1 3/3, U2 4/4 named, U3 25/25. Two of the three guards did not exist and are now proven to fire |
+| 4 | the docs and the issue comments: does any assert what this change made false? | `f02ae10` + `c9840e0`, plus U2/U3 | **the U3 "0/6, window narrower than a run" claim was FALSE** and is corrected in place with the measurement that corrects it. The U2 "unreachable" claim was true and is now closed. A build-gate defect found by the same pass: `scripts/build-dropbear.sh` |
 | 5 | what is NOT covered, as what was swept and what would have had to be true | not yet run | | |
 
 ## Review 1, correctness: two defects, both fixed
@@ -868,3 +869,103 @@ rather than the relay and are deliberately excluded here:
 * **R9**, a `--passwd-file` option patched into dropbear. It removes the
   `LD_PRELOAD` dependency and the glibc/musl split, and it is the best remaining
   change to the product. It is a server change, not a transport one.
+
+# U2, closed: one owner per session, and a test that says which
+
+**Done 2026-09-28.** U2 was 0/6 because every refusal path in the operator's
+function sits **above** the move, so no probe could tell a move from a copy.
+
+**What changed in the product.** The move is now `ws_move(dst, src)`, one
+function in `src/ws.c` that takes a **pointer to the source** and clears it
+itself. The two hand-written versions were `dst = src; memset(&src, 0, ...)`
+and `*dst = *src; memset(&src, 0, ...)`. Both are correct and **both are one
+edit away from a copy**: delete the `memset` and the ownership is aliased again,
+with no compiler error and no test. Clearing the source from inside the move is
+what removes the second statement, and the source is left with no transport and
+no buffers, so every existing `ws_close(&ws)` on a refusal path above the move
+is a no-op **by construction** rather than by a convention someone must
+remember. `src/relay.c` now calls it at both move sites.
+
+**And a NULL dereference went with it.** `ws_close` used to NULL `ws->t` and
+leave `ws->closed` clear; the write paths tested only `ws->closed`, and
+`send_frame` dereferences `t` unconditionally. So a write on a closed or
+moved-from session was a NULL dereference, and the operator's `!open_ok`
+refusal — the one write below the move — is exactly such a write. `ws_close`
+now sets `closed` as well, and `ws_write`, `ws_write_text` and
+`ws_shutdown_tx` test `t == NULL` too, so "the session is finished" is one
+fact with two representations that cannot disagree.
+
+**⛔ WHY THE GUARD IS A NEW BINARY AND NOT A THIRD PROBE CASE.** A case that
+drives a refusal below the move can only observe *a crash*, and only when the
+refusal and a second close interleave. U2 is not a race: it is an **ownership**
+property, and ownership is answerable directly. `tests/wsmove-test.c` links
+the real `src/ws.c`, `src/buffer.c` and `src/util.c` — the shipping code, not a
+copy of it — and asks the one question a copy cannot pass: after the move, does
+the **source** own anything?
+
+| build | what it is | result |
+| --- | --- | --- |
+| correct | `ws_move` clears the source | **6 passed, 0 failed**, exit 0 |
+| PLANT: the clear removed | a copy, which is the U2 defect | **1 passed, 4 failed**, exit 1, every failure named |
+
+⛔ **AND THE FIRST VERSION OF THE TEST WOULD HAVE PASSED AGAINST THE DEFECT,
+which is the whole reason it is written the way it is.** It asserted only that
+the source was empty, and a copy followed by a `memset` is also empty. The
+assertion now asks the ownership question *before anything is freed*, because on
+a copy the first close frees a buffer the other name still points at and the
+test process dies before printing which rule broke. A test whose failure output
+is discarded by the crash it exists to catch has caught nothing. `setvbuf` is
+unbuffered for the same reason.
+
+**`tests/mux-probe.py` case 9** still drives a refusal below the move, because
+the integration path is worth having even when the unit test is the one that
+names the defect. Its two plants are the move reverted to a copy and the node's
+context freed with no reference.
+
+# U3, closed: the 1011 sweep, and a correction to this document
+
+**Done 2026-09-28. ⛔ THE 0/6 IN THE TABLE ABOVE WAS MEASURED AGAINST THE WRONG
+SCENARIO, and this entry is the correction.**
+
+The table said the window was "narrower than 6 probe runs; case 4 forces the
+ordering but does not land inside it". That is true, and it is true of **the
+scenario it was measured on**: case 4 disconnects the **node** while the
+**operator stays attached and idle**, so the operator's thread is parked in
+`ws_recv_frame` and does not reach its last unref while the sweep is running.
+
+**Closing both sockets in the same instant — which is what a real teardown looks
+like — makes the window wide, not narrow.** An operator whose socket closes is
+in `client_cleanup`, dropping the table's last reference, while the node's
+sweep is holding a pointer to the same `Client`.
+
+| build | what it is | node and operator both closed together | relay died |
+| --- | --- | --- | --- |
+| original, unplanted | the refcount is there | 25 runs | **0/25** |
+| original + U3 plant | `c->refs++` removed from the sweep | 25 runs | **25/25** |
+| fixed + fault injected | the refcount is there, `DROPSSH_RELAY_FAULT` set | 25 runs | **0/25** |
+
+`tests/mux-probe.py` case 10 drives that scenario and is **3/3 against the
+original code with the plant applied**. So the guard needed a different
+**scenario**, not a fault-injection hook.
+
+**⛔ THE FAULT-INJECTION HOOK EXISTS ANYWAY, AND IT IS NOT WHAT CLOSED U3.**
+`DROPSSH_RELAY_FAULT` names one of two points, `sweep-release` and
+`client-last-unref`, and the relay yields there. It is read once at startup, an
+unrecognised value is a **hard error** rather than a silently ignored one, and
+it is inert unless set. It was the plan, and the measurement showed the plan was
+wrong: the race was reachable without it. It is kept because a yield at both
+ends of a window this file has crashed on twice is a cheap way to keep the
+window open on demand, and **kept and labelled as not having closed U3** is the
+only honest description of it.
+
+**A real use-after-free went with it, and it is not U3.** `NameSlot.node` was a
+`WsSession *` — a pointer **into** a heap `NodeCtx` — and the node's own
+connection thread called `free(nc)` on its way out while an operator held that
+pointer and was about to write through it, on both the data path and the
+`!open_ok` path. `wlock` does not close it: `wlock` serialises operators
+against each other, and the node's exit path never took it. The comment that
+stood there claimed "the context outlives every use of it", which was true of
+the node's own uses and false of every operator's. The table now holds a
+`NodeCtx *` and readers hold a reference, the same mechanism `Client` already
+used, because two rules have to agree and this file has had three double frees
+from one rule being applied in one place and forgotten in another.

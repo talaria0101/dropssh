@@ -811,7 +811,22 @@ static int send_frame(WsSession *ws, int opcode, const unsigned char *pl,
 }
 
 int ws_write(WsSession *ws, const unsigned char *buf, size_t len) {
-    if (ws->closed) {
+    /* ⛔ THE WRITE PATHS GUARD ON `t` AND NOT ONLY ON `closed`, BECAUSE
+     * `ws_close` NULLS `t` BUT DID NOT SET `closed`, AND `send_frame`
+     * DEREFERENCES `t` UNCONDITIONALLY.
+     *
+     * So a write on a session that has been closed -- or one that has been
+     * MOVED FROM, and a moved-from session is all-zero and has `t == NULL` and
+     * `closed == 0` -- passed the `closed` check and dereferenced NULL. The
+     * operator's `!open_ok` refusal path in `relay.c` is one `client_release`
+     * away from a late write, and U2's whole point is that a future refusal
+     * below the move must be safe. A NULL deref is a crash of the whole relay,
+     * which is the failure this file has produced three times already.
+     *
+     * `t == NULL` is exactly the condition under which `send_frame` cannot do
+     * its job, so returning -1 here is not a new policy: it is the -1 the
+     * write would have had to return anyway, decided before the dereference. */
+    if (ws == NULL || ws->closed || ws->t == NULL) {
         return -1;
     }
     size_t off = 0;
@@ -841,7 +856,10 @@ int ws_write(WsSession *ws, const unsigned char *buf, size_t len) {
 }
 
 int ws_write_text(WsSession *ws, const unsigned char *buf, size_t len) {
-    if (ws->closed) {
+    /* Same guard as ws_write, for the same reason: see the note there. `t` is
+     * the pointer send_frame dereferences, so a session with no transport has
+     * nothing to write to. */
+    if (ws == NULL || ws->closed || ws->t == NULL) {
         return -1;
     }
     return send_frame(ws, 0x1, buf, len);
@@ -851,7 +869,9 @@ int ws_write_text(WsSession *ws, const unsigned char *buf, size_t len) {
  * session readable. Used when the ssh server has exited and its output is on
  * the wire, so the far end sees the end of the stream rather than a cut. */
 void ws_shutdown_tx(WsSession *ws) {
-    if (ws == NULL || ws->close_sent) {
+    /* `t` guarded as well: send_frame dereferences it, and a session that has
+     * been closed or moved from has none. Same reason as ws_write. */
+    if (ws == NULL || ws->close_sent || ws->t == NULL) {
         return;
     }
     send_frame(ws, 0x8, NULL, 0);
@@ -863,6 +883,42 @@ void ws_shutdown_tx(WsSession *ws) {
  * the queue, so the two names it uses are declared first rather than the close
  * path being moved. */
 static void ws_free_frames(WsSession *ws);
+
+/* ⛔ ONE OWNER PER SESSION, AND THE MOVE IS A NAMED OPERATION BECAUSE A
+ * STRUCT COPY OF A SESSION IS ALWAYS A BUG IN THIS FILE.
+ *
+ * A WsSession's ownership lives in its buffer POINTERS (rbuf, frag, spill) and
+ * in the Transport it wraps. `memcpy` of a session copies the struct AND
+ * leaves two names pointing at the same four allocations, so the first close
+ * frees memory the second still points at. This file and `relay.c` have
+ * produced three double frees that way, and every one of them took down a whole
+ * process rather than one session.
+ *
+ * The two hand-written versions of the move were `dst = src; memset(&src,0)`
+ * and `*dst = *src; memset(&src,0)`. Both are correct and BOTH are one edit
+ * away from being a copy: delete the `memset` and the ownership is aliased
+ * again, silently, with no compiler error and no test -- which is exactly the
+ * state U2 describes (0/6 on the plant). So the move is one function, it takes
+ * a POINTER TO THE SOURCE so it can clear the source itself, and the source
+ * is left as a WsSession with no transport and no buffers. Every `ws_close` on
+ * a moved-from session is then a no-op by construction rather than by a
+ * convention someone has to remember.
+ *
+ * ⛔ AND THE INERT SOURCE IS NOT "AN UNUSABLE WsSession": it is one that is
+ * safe to close and safe to close AGAIN, because the two things close() needs
+ * -- a transport to shut and buffers to free -- are both gone. That is what
+ * lets every existing `ws_close(&ws)` on a refusal path above the move stay
+ * exactly where it is, and it is why a future refusal added BELOW the move
+ * cannot reintroduce the aliasing. */
+void ws_move(WsSession *dst, WsSession *src) {
+    if (dst == NULL || src == NULL) {
+        return;
+    }
+    *dst = *src;
+    /* Clear the whole source, not just the buffers: leaving a stale `t` behind
+     * would let a close shut a transport the new owner is already using. */
+    memset(src, 0, sizeof *src);
+}
 
 void ws_close(WsSession *ws) {
     if (ws == NULL) {
@@ -876,6 +932,12 @@ void ws_close(WsSession *ws) {
         ws->t->close(ws->t);
         ws->t = NULL;
     }
+    /* ⛔ CLOSING SETS `closed` AS WELL AS NULLING `t`, so that "this session
+     * is finished" is ONE fact with two representations that cannot disagree.
+     * Before this, `ws_close` nulled `t` and left `closed` clear, so the write
+     * paths -- which test `closed` -- believed a closed session was still open
+     * and dereferenced a NULL `t`. See the note in ws_write. */
+    ws->closed = 1;
     ws_free_frames(ws);
     buf_free(&ws->rbuf);
     buf_free(&ws->frag);

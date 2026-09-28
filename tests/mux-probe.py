@@ -512,11 +512,7 @@ def drain(s, seconds):
 
 
 # -------------------------------------------------------------------- main
-def main():
-    if len(sys.argv) < 3:
-        sys.stderr.write(__doc__)
-        return 2
-    dropssh, work = sys.argv[1], sys.argv[2]
+def _probe_body(dropssh, work):
     # ⛔ THE PROBE'S SOCKET PATH IS UNIQUE PER RUN, AND THE REASON IS THAT THE
     # RELAY DOES `unlink` THEN `bind` ON A FIXED PATH. Two runs of the probe --
     # or a probe racing a relay left over from an interrupted suite -- both
@@ -1199,6 +1195,208 @@ def main():
                 pass
         failures.extend(limit_failures)
 
+        # ---- case 9: a REFUSAL *BELOW* THE SESSION MOVE. THIS IS U2.
+        #
+        # `docs/relay-issues.md` U2 was 0/6 on the plant for a reason that was
+        # itself the finding: the operator's WsSession is MOVED into the
+        # Client rather than copied, and the case that would prove it was a
+        # refusal that runs AFTER the move. Every refusal in the original suite
+        # -- the peer cap, the session limit, no node -- sits ABOVE the move,
+        # so reverting the move to a `memcpy` changed nothing any of them could
+        # see. The probe reported 0/6 and the reason was correct.
+        #
+        # There is exactly ONE path below the move that closes the session: the
+        # `if (!open_ok)` block, taken when the `open` cannot be written to the
+        # node. So the case drives that, and asserts the cheap property that a
+        # double free cannot pass: the relay is still serving afterwards.
+        #
+        # ⛔ AND THE TWO PLANTS THIS CASE HAS TO CATCH, WHICH ARE NOT THE SAME.
+        #   the move reverted to a copy (`c->ws = ws`, no clear) -- the alias
+        #   the move exists to prevent, and the one U2 names.
+        #   the node's context freed with no reference -- the use-after-free
+        #   that the same code path reaches, and one that was live on BOTH the
+        #   data path and this one before the node was given a refcount.
+        move_failures = []
+        movesock = os.path.join(
+            work, "muxmove-%d-%d.sock" % (os.getpid(),
+                                           int(time.time() * 1000) % 100000))
+        movelog = open(os.path.join(work, "muxprobe-move.log"), "wb")
+        moverelay = subprocess.Popen(
+            [dropssh, "relay", "--listen", "unix://" + movesock],
+            stdout=subprocess.DEVNULL, stderr=movelog)
+        try:
+            for _ in range(200):
+                if os.path.exists(movesock):
+                    break
+                time.sleep(0.05)
+            # The node attaches, and then vanishes. The operator arrives while
+            # the node is going away, so the `open` it tries to write is either
+            # refused outright (`node_ws` already cleared) or written into a
+            # node that is on its way out. Both are the `!open_ok` path, and
+            # both run BELOW the move.
+            mnode = connect_relay(movesock)
+            mnb = handshake(mnode, "/v1/node/move9")
+            mnr = Reader(mnode)
+            mnr.buf = mnb
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not mnr.feed(0.2):
+                    break
+                f = mnr.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    break
+            mnode.close()
+            # Give the node's own thread time to run its exit path, so the
+            # operator below is attaching to a name whose node is going away.
+            time.sleep(0.4)
+            ops9 = 0
+            for _ in range(4):
+                try:
+                    o = connect_relay(movesock)
+                    handshake(o, "/v1/connect/move9")
+                    ops9 += 1
+                except RuntimeError as e:
+                    # A refusal AT THE UPGRADE is the other shape of the same
+                    # race and is also a path that closes a session.
+                    if "503" not in str(e) and "409" not in str(e):
+                        raise
+            time.sleep(1.0)
+            probe9 = connect_relay(movesock)
+            b9 = handshake(probe9, "/v1/node/move9-after")
+            p9 = Reader(probe9)
+            p9.buf = b9
+            alive9 = False
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not p9.feed(0.2):
+                    break
+                f = p9.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    alive9 = True
+                    break
+            probe9.close()
+            if not alive9:
+                move_failures.append(
+                    "after a refusal below the session move the relay did not "
+                    "serve a NEW node: the process is gone, which is what an "
+                    "aliased session owner or a freed node context does")
+        except Exception as e:
+            move_failures.append("the below-the-move case could not run: %s" % e)
+        finally:
+            moverelay.terminate()
+            try:
+                moverelay.wait(timeout=5)
+            except Exception:
+                moverelay.kill()
+            movelog.close()
+            try:
+                os.unlink(movesock)
+            except OSError:
+                pass
+        failures.extend(move_failures)
+
+        # ---- case 10: THE 1011 SWEEP, AND WHETHER IT HOLDS A REFERENCE. U3.
+        #
+        # Case 4 forces the ordering -- a node disconnects with an operator
+        # attached -- and that is the right ordering, but the window between
+        # the sweep taking a `Client *` and the operator's own thread freeing
+        # it is narrower than a probe run, which is why U3 was 0/6.
+        #
+        # ⛔ SO THE RACE IS NOT MADE BIGGER BY LOOPING; IT IS STOOD AT ON
+        # PURPOSE. `DROPSSH_RELAY_FAULT` names an injection point in the relay
+        # and the relay yields there, so the two threads are given every chance
+        # to interleave at exactly the two ends of the window. The correctness
+        # of the fixed build does not depend on the scheduling at all: with the
+        # reference held, the operator's unref only decrements a count.
+        #
+        # ⛔ AND THE PLANT IS WHAT PROVES THE CASE. Removing `c->refs++` from
+        # the sweep is caught as a relay that no longer serves. That plant is
+        # the plant U3 reported as 0/6, and the count is in `docs/relay-issues.md`.
+        sweep_failures = []
+        sweepsock = os.path.join(
+            work, "muxsweep-%d-%d.sock" % (os.getpid(),
+                                           int(time.time() * 1000) % 100000))
+        sweeplog = open(os.path.join(work, "muxprobe-sweep.log"), "wb")
+        env = dict(os.environ)
+        env["DROPSSH_RELAY_FAULT"] = "sweep-release"
+        sweeprelay = subprocess.Popen(
+            [dropssh, "relay", "--listen", "unix://" + sweepsock],
+            stdout=subprocess.DEVNULL, stderr=sweeplog, env=env)
+        try:
+            for _ in range(200):
+                if os.path.exists(sweepsock):
+                    break
+                time.sleep(0.05)
+            snode = connect_relay(sweepsock)
+            snb = handshake(snode, "/v1/node/sweep10")
+            snr = Reader(snode)
+            snr.buf = snb
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not snr.feed(0.2):
+                    break
+                f = snr.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    break
+            sop = connect_relay(sweepsock)
+            sob = handshake(sop, "/v1/connect/sweep10")
+            sor = Reader(sop)
+            sor.buf = sob
+            # The operator must be attached, and the node must not have
+            # answered `ready` yet: an attached operator with an unready
+            # session is the state the 1011 sweep exists to end.
+            deadline = time.time() + 8
+            attached = False
+            while time.time() < deadline and not attached:
+                if not snr.feed(0.2):
+                    break
+                f = snr.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "open":
+                    attached = True
+            if not attached:
+                sweep_failures.append(
+                    "the sweep case never attached an operator, so the 1011 "
+                    "sweep had nothing to sweep and the case measured nothing")
+            # The node goes, and the operator's own socket goes with it, so the
+            # operator's thread is racing its last unref against the sweep.
+            snode.close()
+            time.sleep(0.2)
+            sop.close()
+            time.sleep(2.0)
+            probe10 = connect_relay(sweepsock)
+            b10 = handshake(probe10, "/v1/node/sweep10-after")
+            p10 = Reader(probe10)
+            p10.buf = b10
+            alive10 = False
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not p10.feed(0.2):
+                    break
+                f = p10.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    alive10 = True
+                    break
+            probe10.close()
+            if not alive10:
+                sweep_failures.append(
+                    "the 1011 sweep with the fault injected at its own release "
+                    "point took the relay down: the process is gone, which is "
+                    "what a sweep that holds no reference does")
+        except Exception as e:
+            sweep_failures.append("the 1011-sweep case could not run: %s" % e)
+        finally:
+            sweeprelay.terminate()
+            try:
+                sweeprelay.wait(timeout=5)
+            except Exception:
+                sweeprelay.kill()
+            sweeplog.close()
+            try:
+                os.unlink(sweepsock)
+            except OSError:
+                pass
+        failures.extend(sweep_failures)
+
         for f in failures:
             print("mux-probe: FAIL %s" % f)
         if not failures:
@@ -1206,8 +1404,9 @@ def main():
                   "close 1003, the ready ordering, a bounded `connect` that "
                   "exits non-zero on a silent node, the 60s bound on the "
                   "`ready` wait itself, a node disconnect with an operator "
-                  "attached, and a refusal on the operator's own thread "
-                  "all behave as measured")
+                  "attached, a refusal on the operator's own thread, a refusal "
+                  "below the session move, and the 1011 sweep with its race "
+                  "injected at both ends all behave as measured")
         return 1 if failures else 0
     finally:
         relay.terminate()
@@ -1215,6 +1414,64 @@ def main():
             relay.wait(timeout=5)
         except subprocess.TimeoutExpired:
             relay.kill()
+
+
+def main():
+    """Run the probe, and turn a relay that DIED into one named failure.
+
+    ⛔ A RELAY THAT CRASHES MUST BE REPORTED AS A CRASH, NOT AS A TRACEBACK FROM
+    AN UNRELATED CASE. Every double free in `src/relay.c` has taken the whole
+    process down, and until now the probe showed that as a Python
+    `ConnectionRefusedError` at whichever case happened to run next -- naming
+    the wrong thing, which is the failure mode this file has been bitten by
+    three times. So the body is wrapped: a dead relay, and a connection refused
+    because of one, is reported as the crash it is, with the relay's own log
+    tail, and the probe exits non-zero.
+    """
+    if len(sys.argv) < 3:
+        sys.stderr.write(__doc__)
+        return 2
+    dropssh, work = sys.argv[1], sys.argv[2]
+    try:
+        return _probe_body(dropssh, work)
+    except (ConnectionRefusedError, ConnectionResetError) as e:
+        return relay_died(work, e)
+    except RuntimeError as e:
+        # ⛔ A CASE THAT RAISED BECAUSE THE RELAY STOPPED ANSWERING IS THE SAME
+        # FAILURE, AND IT ARRIVES AS A RuntimeError RATHER THAN AS A REFUSED
+        # SOCKET. A relay killed by a double free stops completing handshakes,
+        # so the next case to run is the one that times out waiting for a
+        # `ready` and raises. Reporting that as "the node's ready did not
+        # arrive" would blame the framing rules for a crash three cases earlier,
+        # which is the exact "a failure that names the wrong thing" this file
+        # exists to stop.
+        if "did not reach the operator" in str(e) or "sent no open" in str(e) \
+           or "sent no hello" in str(e):
+            return relay_died(work, e)
+        raise
+
+
+def relay_died(work, e):
+    """Report a relay that is no longer answering as the crash it is.
+
+    The relay's own logs are printed with each, because each of the four relay
+    processes the probe starts writes a different one and a reader otherwise
+    has no way to tell which of them died.
+    """
+    print("mux-probe: FAIL the relay process is GONE (%s). A relay that dies "
+          "takes down every node and operator on it, and that is what a double "
+          "free, a use-after-free or an unguarded 1011 sweep does. This is the "
+          "crash itself, reported here rather than as a traceback from "
+          "whichever case happened to run next." % e)
+    for name in ("muxprobe-relay.log", "muxprobe-limit.log",
+                 "muxprobe-move.log", "muxprobe-sweep.log"):
+        path = os.path.join(work, name)
+        if not os.path.exists(path):
+            continue
+        with open(path, "rb") as fh:
+            tail = fh.read()[-800:].decode("utf-8", "replace").rstrip()
+        print("mux-probe: %s ended with:\n%s" % (name, tail))
+    return 1
 
 
 if __name__ == "__main__":

@@ -73,6 +73,28 @@ log "dropbear version $VER"
 # Each patch is idempotent and says so when it is already applied. A patch
 # that upstream has already taken must not be re-applied; a patch that fails to
 # apply must stop the build rather than produce a server that silently lacks it.
+# ⛔ THE IDEMPOTENCY MARKER MUST BE A STRING THE PATCH ACTUALLY ADDS, AND THIS
+# ONE WAS NOT, SO THE SECOND BUILD IN A CLEAN CHECKOUT ALWAYS FAILED.
+#
+# The marker was `is not in the list but is executable`. That sentence appears
+# NOWHERE in `dropbear-login-shell-tolerance.patch` and nowhere in the patched
+# `src/svr-auth.c`. So the "is it already applied?" grep never matched, the
+# patch went on to `git apply --check`, the file was already patched, the check
+# failed, and the build stopped with
+#
+#     dropbear-login-shell-tolerance.patch does not apply to 59870ad...;
+#     refusing to ship a server without it
+#
+# which names a patch failure on a tree that is perfectly correct. The first
+# build in a fresh checkout worked, and every rebuild after it failed, so the
+# gate was green exactly once.
+#
+# The marker is now a line the patch adds verbatim, so the check answers the
+# question it was written to answer. ⛔ AND THE LESSON IS THE ONE THIS
+# REPOSITORY ALREADY KEEPS: a guard is only worth what it detects, and a guard
+# built on a string that does not exist detects nothing and still looks like
+# one. It was found by running the build twice, which is the only way a
+# once-green gate announces that it is not.
 apply_patch() {
     local name="$1" file="$2" marker="$3"
     if grep -q "$marker" "$WORK/$file" 2>/dev/null; then
@@ -108,10 +130,10 @@ apply_patch dropbear-setgroups-tolerance.patch src/svr-auth.c "Sandboxed hosts"
 # exists, which is the opposite of what a cage wants. The patch consults the
 # list first, so a host with a policy keeps it, and accepts an executable shell
 # when the list does not name one.
-if grep -q "is not in the list but is executable" "$WORK/src/svr-auth.c" 2>/dev/null; then
+if grep -q "administrator says which shells users may log in with" "$WORK/src/svr-auth.c" 2>/dev/null; then
     log "  login shell tolerance: already in this commit"
 else
-    apply_patch dropbear-login-shell-tolerance.patch src/svr-auth.c "is not in the list but is executable"
+    apply_patch dropbear-login-shell-tolerance.patch src/svr-auth.c "administrator says which shells users may log in with"
 fi
 
 # ENOTSOCK: a server carried on a pipe has no peer address to log. The current
