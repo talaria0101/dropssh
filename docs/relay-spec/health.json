@@ -1,0 +1,36 @@
+{
+  "ok": true,
+  "service": "tcp-ssh-relay",
+  "version": "2026-09-28-r12",
+  "relay": {
+    "name": "default",
+    "region": null,
+    "bucket": null,
+    "edge_colo": "KTM",
+    "path_config": "auto",
+    "dial": "eager"
+  },
+  "egress": {
+    "vpc_binding": true,
+    "roads": {
+      "vpc": 0,
+      "direct": 0,
+      "vpc_failed": 0,
+      "vpc_resting": false
+    }
+  },
+  "relays": [
+    "railway"
+  ],
+  "pool": [
+    "default",
+    "1",
+    "2",
+    "3"
+  ],
+  "paused": false,
+  "reverse": {
+    "enabled": true
+  },
+  "time": "2026-09-28T18:11:57.870Z"
+}

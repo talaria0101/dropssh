@@ -22,6 +22,21 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+  # ⛔ THE SCHEDULE IS WHY THE RELAY'S OWN DOCUMENT IS CHECKED AT ALL, AND IT IS
+  # NOT ON EVERY COMMIT BECAUSE IT NEEDS THE NETWORK.
+  #
+  # Nothing in this repository talks to the relay during a normal build, so a
+  # change to the protocol is invisible here until it becomes a close code in
+  # the field. The relay's version was `2026-09-28-r11` when this project's
+  # measurements were taken and `2026-09-28-r12` later the same day, and A2 --
+  # "the operator's leg is data-only" -- was added between them, in response to
+  # our own issue. Our client already works around it, so nothing here would
+  # have noticed.
+  schedule:
+    # 04:17 UTC daily. An off-the-hour minute on purpose: every workflow that
+    # fires at :00 is queued behind everyone else's, and this one fetches from a
+    # third party.
+    - cron: '17 4 * * *'
 
 permissions:
   contents: read
@@ -278,3 +293,49 @@ jobs:
 
             `dropssh connect` mints its own relay token. No token is in this
             repository and none is needed to get started.
+
+
+  # ⛔ THE RELAY'S OWN DOCUMENT, ON A SCHEDULE, AS A DRIFT REPORT AND NOT AS A
+  # BUILD GATE.
+  #
+  # R8 asked for the reference operator fetched and pinned. There is no
+  # repository in this project to pin -- the relay publishes a Cloudflare
+  # Worker, and what it SERVES is the thing a client talks to -- so this fetches
+  # what is served, records the version it came from, and re-checks the five
+  # facts this repository measured and wrote down.
+  #
+  # `continue-on-error: true` because a drift is a thing to READ, not a build to
+  # break: the relay is somebody else's deployment and its version moving is not
+  # this repository failing. A red job would train everyone to ignore red jobs,
+  # and the next red job might be a real one. The artifact is uploaded so the
+  # diff is reviewable, and the job's own log says what to do about it.
+  relay-spec:
+    name: the relay's own protocol document, and whether it still says what we measured
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch the served document and re-check our five measured facts
+        run: |
+          set -u
+          ./scripts/fetch-relay-spec.sh || rc=$?
+          rc=${rc:-0}
+          echo "---- what this repository believes, for the diff"
+          sed -n '1,40p' docs/relay-spec/RELAY-SPEC-VERSION || true
+          if [ "$rc" = 1 ]; then
+            echo ""
+            echo "::warning title=relay protocol drift::One or more of the five"
+            echo "::warning facts this repository measured no longer appear in the"
+            echo "::warning relay's served document. Read docs/relay-spec/, then"
+            echo "::warning re-measure and update the docs, or record why the new"
+            echo "::warning form is equivalent. Do not re-pin silently."
+          fi
+          exit 0
+      - name: upload what the relay is serving
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-spec
+          path: docs/relay-spec/
+          if-no-files-found: warn
