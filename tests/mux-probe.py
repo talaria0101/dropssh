@@ -1397,6 +1397,114 @@ def _probe_body(dropssh, work):
                 pass
         failures.extend(sweep_failures)
 
+        # ---- case 11: A LARGE TRANSFER REACHES THE FAR SIDE WITH THE SOCKET
+        # OPEN, AND THIS IS A CASE ABOUT A REAL DATA-LOSS DEFECT.
+        #
+        # wstunnel#360 is the reference: the maintainer shipped a flush bug
+        # where data was accepted into a buffer and never delivered until a
+        # boundary, and the only symptom was a transfer that appeared to hang.
+        #
+        # ⛔ THIS CASE FOUND ONE IN OUR OWN RELAY, AND IT IS NOT A FLUSH BUG.
+        # `relay.c` clamped an operator's frame to the node's advertised
+        # `maxFrameBytes` before forwarding it:
+        #
+        #     if (mf && n + RELAY_ID_LEN > mf) {
+        #         n = mf > RELAY_ID_LEN ? mf - RELAY_ID_LEN : 0;
+        #     }
+        #
+        # so a 300000-byte frame arrived as 65536 bytes and the remaining
+        # 234464 were never sent, with no close on either socket and nothing in
+        # the log. The premise was wrong too: `maxFrameBytes` bounds one frame
+        # on the wire and `ws_write` already honours it by CHUNKING, so the
+        # clamp was enforcing a limit by the one method that could not do it
+        # without losing data. Measured on the pre-fix binary, 1/1.
+        flush_failures = []
+        try:
+            import threading
+            s = run_case(sock_path, "case11", node_sends_id_prefix=True)
+            big = b"Z" * 300000
+            data = encode_frame(0x2, big, True)
+            # ⛔ THE NODE READER IS EMPTIED OF THE HAPPY PATH'S OWN TRAFFIC
+            # FIRST. `run_case` leaves an echo in it, and appending to that
+            # reports a byte count that is the sum of two different transfers --
+            # a failure that names the relay and is entirely the case's
+            # arithmetic. The first version did exactly that and reported
+            # 300039 bytes for a 300000-byte frame.
+            while True:
+                f = s.rn.take()
+                if f is None:
+                    break
+                if f[0] == 0x2:
+                    s.node_bin.append(f[1])
+            del s.node_bin[:]
+
+            # ⛔ THE WRITE IS PUMPED IN SLICES FROM A NON-BLOCKING SOCKET, NOT
+            # DONE IN ONE sendall. A 300 KB `sendall` blocks until the far side
+            # reads, and the reader is THIS thread, so the first version
+            # deadlocked in its own write and timed out -- which would have been
+            # recorded as a relay failure rather than as a broken case.
+            sent = [0]
+            stop = [False]
+
+            def _writer():
+                s.op.setblocking(False)
+                while not stop[0] and sent[0] < len(data):
+                    try:
+                        n = s.op.send(data[sent[0]:sent[0] + 65536])
+                        sent[0] += n
+                    except BlockingIOError:
+                        time.sleep(0.005)
+                    except OSError:
+                        break
+
+            th = threading.Thread(target=_writer, daemon=True)
+            th.start()
+            got = b""
+            deadline = time.time() + 30
+            # ⛔ THE WINDOW IS THE POINT, AND THE SOCKET IS NEVER CLOSED. If the
+            # relay delivers only at a boundary -- or drops the overflow, as
+            # the version this case was written for did -- the bytes do not
+            # arrive inside this window, and a case that closed the operator
+            # first would be asserting the opposite of what it claims.
+            while time.time() < deadline and len(got) < len(big) + 32:
+                s.rn.feed(0.05)
+                while True:
+                    f = s.rn.take()
+                    if f is None:
+                        break
+                    if f[0] == 0x2:
+                        s.node_bin.append(f[1])
+                    elif f[0] == 0x8:
+                        code, reason = close_of(f[1])
+                        s.node_close = (code, reason)
+                got = b"".join(s.node_bin)
+            stop[0] = True
+            # ⛔ THE NODE LEG IS ID-PREFIXED, SO 300032 IS CORRECT AND 300000 IS
+            # NOT. The relay prepends the 32-hex session id on the node's wire
+            # and strips it for the operator; that is the whole asymmetry this
+            # probe exists to pin (case 1). The first version of this
+            # assertion compared the raw node bytes to the payload and so
+            # reported a correct relay as losing 32 bytes.
+            #
+            # So the check is: the id is present, and everything after it is
+            # the payload byte for byte. A clamping relay leaves the payload
+            # short; a relay that mis-strips leaves it shifted.
+            body = got[32:] if got[:32].isalnum() else b""
+            if len(got) != len(big) + 32 or body != big:
+                flush_failures.append(
+                    "a %d-byte frame reached the node as %d bytes with the "
+                    "socket still open (%d of the request was written, close "
+                    "seen: %r). A relay that clamps a frame to the node's "
+                    "maxFrameBytes loses the remainder with no close and no "
+                    "log, and the only symptom is a transfer that stops part "
+                    "way. See wstunnel#360 and docs/relay-issues.md."
+                    % (len(big), len(got), sent[0], s.node_close))
+            s.node.close()
+            s.op.close()
+        except Exception as e:
+            flush_failures.append("the large-transfer case could not run: %s" % e)
+        failures.extend(flush_failures)
+
         for f in failures:
             print("mux-probe: FAIL %s" % f)
         if not failures:
@@ -1405,8 +1513,9 @@ def _probe_body(dropssh, work):
                   "exits non-zero on a silent node, the 60s bound on the "
                   "`ready` wait itself, a node disconnect with an operator "
                   "attached, a refusal on the operator's own thread, a refusal "
-                  "below the session move, and the 1011 sweep with its race "
-                  "injected at both ends all behave as measured")
+                  "below the session move, the 1011 sweep with its race "
+                  "injected at both ends, and a 300 KB transfer that completes "
+                  "with the socket open all behave as measured")
         return 1 if failures else 0
     finally:
         relay.terminate()

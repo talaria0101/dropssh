@@ -787,6 +787,32 @@ static void logf_close(WsSession *ws, int code, const char *reason) {
     }
 }
 
+/* ⛔ A DIAGNOSTIC, AND IT IS SILENT UNLESS THE OPERATOR ASKED FOR ONE.
+ *
+ * This file had no logging at all, and adding liveness needed somewhere to say
+ * why a session was being failed. The obvious place -- an unconditional
+ * `fprintf(stderr, ...)` -- is wrong here: a relay runs many sessions, the
+ * keepalive runs every 20 s in each, and a line per failed liveness check on a
+ * busy relay turns an operator's stderr into noise they learn to ignore. It
+ * also competes for the same stderr that an ssh `ProxyCommand` uses to talk to
+ * the operator, which is the one channel this process has.
+ *
+ * So the counters are the report -- `ws_control_drops()` and
+ * `ws_pings_in_flight()` are read by `relay --status` and the node's log -- and
+ * this is the line a developer sees when they have asked to see it. */
+static void ws_note(const char *fmt, ...) {
+    const char *v = getenv("DROPSSH_VERBOSE");
+    if (v == NULL || (*v != '1' && *v != 'y')) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "dropssh ws: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+}
+
 int ws_server_accept(WsSession *ws, ws_status *st) {
     char accept[64];
     dropssh_ws_accept(ws->pending_accept_key, accept, sizeof accept);
@@ -1064,6 +1090,94 @@ static void ws_free_frames(WsSession *ws) {
     ws->fq_tail = NULL;
     ws->fq_count = 0;
     ws->fq_bytes = 0;
+    /* ⛔ THE CONTROL QUEUE IS FREED WITH THE DATA QUEUE, IN `ws_close`, and
+     * not by a separate call at each of the places a session ends. Two free
+     * paths is how a queue gets leaked, and a leaked queue on a relay that
+     * has held many sessions is memory nobody accounts for. */
+    WsFrame *c = ws->cq_head;
+    while (c) {
+        WsFrame *n = c->next;
+        free(c);
+        c = n;
+    }
+    ws->cq_head = NULL;
+    ws->cq_tail = NULL;
+    ws->cq_count = 0;
+}
+
+/* ⛔ THE OUTBOUND CONTROL QUEUE, AND ITS OVERFLOW POLICY IS A DROP AND A
+ * COUNT (dropssh#10 adopt 2, from wstunnel `websocket.rs:228`).
+ *
+ * A control frame -- a ping, a pong, a close -- must never block the data path.
+ * Blocking is the deadlock this file introduced and then removed; the reader
+ * would sit in a write while the far end was not reading, and the session would
+ * stop with every log line correct. So the queue is bounded and, when it is
+ * full, the frame is DROPPED and counted.
+ *
+ * Dropping a control frame is the right answer rather than a compromise: a
+ * dropped pong makes one ping unanswerable, and the in-flight counter then
+ * fails the session if the peer was genuinely gone. Dropping data instead
+ * would corrupt a session; blocking would deadlock it. The count is what makes
+ * the drop visible -- wstunnel's comment is the whole point, and ours is
+ * `ws_control_drops()`, which `relay --status` and the node's own log report.
+ */
+static int ws_queue_control(WsSession *ws, int opcode, const unsigned char *pl,
+                            size_t plen) {
+    if (ws == NULL || ws->t == NULL || ws->closed) {
+        return -1;
+    }
+    if (ws->cq_count >= WS_CONTROL_QUEUE_MAX) {
+        /* ⛔ THE DROP IS COUNTED, NOT LOGGED, because a control frame is sent
+         * on a timer and a log line per dropped frame is a log line per
+         * keepalive interval on a congested relay. The counter is read by
+         * `dropssh relay --status` as `control_dropped`. */
+        ws->cq_dropped++;
+        return -1;
+    }
+    WsFrame *f = malloc(sizeof *f + plen);
+    if (f == NULL) {
+        ws->cq_dropped++;
+        return -1;
+    }
+    f->next = NULL;
+    f->opcode = opcode;
+    f->len = plen;
+    if (plen) {
+        memcpy(f->data, pl, plen);
+    }
+    if (ws->cq_tail) {
+        ws->cq_tail->next = f;
+    } else {
+        ws->cq_head = f;
+    }
+    ws->cq_tail = f;
+    ws->cq_count++;
+    return 0;
+}
+
+/* Drain queued control frames onto the wire, in order, stopping at the first
+ * failure so a full socket leaves the rest queued rather than reordering. */
+static void ws_flush_control(WsSession *ws) {
+    while (ws->cq_head) {
+        WsFrame *f = ws->cq_head;
+        if (send_frame(ws, f->opcode, f->data, f->len) != 0) {
+            return;     /* the socket is full; the rest stay in order behind it */
+        }
+        ws->cq_head = f->next;
+        if (ws->cq_head == NULL) {
+            ws->cq_tail = NULL;
+        }
+        ws->cq_count--;
+        free(f);
+    }
+}
+
+unsigned ws_control_drops(const WsSession *ws) {
+    return ws ? ws->cq_dropped : 0;
+}
+
+unsigned ws_pings_in_flight(const WsSession *ws) {
+    return ws ? ws->pings_in_flight : 0;
 }
 
 void ws_set_queue_cap(WsSession *ws, size_t bytes) {
@@ -1248,11 +1362,34 @@ static int decode_available(WsSession *ws, int *fatal) {
             return -1;
         }
         if (opcode == 0x9) {          /* ping -> pong, same payload */
+            /* ⛔ THE PONG IS SENT BEFORE THE PING IS CONSUMED, AND A FAILED
+             * PONG DOES NOT CLOSE THE SESSION. RFC 6455 lets a peer send an
+             * unsolicited ping and answers it, and the answer is best effort
+             * by design: a pong that cannot be written is a symptom, and the
+             * in-flight counter below is what actually decides liveness. */
             send_frame(ws, 0xA, pl, plen);
             buf_consume(&ws->rbuf, idx + plen);
             continue;
         }
         if (opcode == 0xA) {          /* pong */
+            /* ⛔ ANY PONG RESETS THE IN-FLIGHT COUNT, WHEREVER IT CAME FROM,
+             * AND THAT IS THE WHOLE OF THE LIVENESS RULE (dropssh#10 adopt 1).
+             *
+             * Before this the keepalive sent a ping every 20 s and tracked
+             * nothing: a half-dead socket -- a peer that has gone away without
+             * the TCP connection noticing -- stayed open indefinitely and
+             * reported silence, which is the exact failure every project in
+             * that sweep reported (chisel #608, ligolo #101, sshx #49,
+             * websocat #35). Ours was ours too; nothing counted.
+             *
+             * wstunnel counts pings in flight and fails the session at three
+             * unanswered ones, and any pong resets the count whether it
+             * answers a ping we sent or arrives unsolicited. The NUMBER is
+             * the adoptable part: a mechanism without a threshold is a
+             * mechanism that never gives up, which is what we had. */
+            if (ws->pings_in_flight > 0) {
+                ws->pings_in_flight--;
+            }
             buf_consume(&ws->rbuf, idx + plen);
             continue;
         }
@@ -1339,12 +1476,54 @@ static int decode_available(WsSession *ws, int *fatal) {
     }
 }
 
-/* One turn of the keepalive clock, shared by both read paths. */
+/* One turn of the keepalive clock, shared by both read paths.
+ *
+ * ⛔ LIVENESS IS A POLICY NUMBER AND NOT A TIMER (dropssh#10 adopt 1, from
+ * wstunnel `websocket.rs:104`).
+ *
+ * The rule: a ping is sent when nothing else has been, and every ping that
+ * goes out without a pong coming back counts. At `WS_MAX_PINGS_IN_FLIGHT`
+ * unanswered pings the session is failed. The number is three because that is
+ * what wstunnel uses and because three keepalive intervals is long enough to
+ * survive a busy network and short enough that a dead peer is noticed while an
+ * operator is still watching.
+ *
+ * ⛔ AND THE COUNT IS A COUNT, NOT A TIMESTAMP, BECAUSE A TIMESTAMP ANSWERS A
+ * DIFFERENT QUESTION. "Nothing has arrived in 60 s" is wrong on a healthy idle
+ * ssh session, which is quiet for minutes by design; "three pings I sent have
+ * not been answered" is true on a dead peer and false on a live one whatever
+ * the traffic is. The first version of this tracked only the last transmit
+ * time, and a session with no traffic at all looked exactly like a dead one.
+ */
 static void maybe_keepalive(WsSession *ws) {
-    unsigned now = now_ms();
-    if (ws->keepalive_ms && now - ws->last_tx_ms >= ws->keepalive_ms) {
-        send_frame(ws, 0x9, NULL, 0);
+    if (ws->keepalive_ms == 0) {
+        return;
     }
+    if (ws->pings_in_flight >= WS_MAX_PINGS_IN_FLIGHT) {
+        /* ⛔ THREE UNANSWERED PINGS IS A FAILED SESSION, AND THE REASON SAYS
+         * WHICH COUNT TRIPPED, because "connection closed" on an ssh
+         * ProxyCommand is the same sentence for a relay that is down, a node
+         * that has gone, and a network that has gone quiet. */
+        ws_note("closing: %u pings sent and none answered", ws->pings_in_flight);
+        ws->closed = 1;
+        return;
+    }
+    unsigned now = now_ms();
+    if (now - ws->last_tx_ms >= ws->keepalive_ms) {
+        /* ⛔ THE PING GOES ON THE CONTROL QUEUE, NOT STRAIGHT ON THE WIRE, so a
+         * congested socket cannot make the keepalive block the data path -- the
+         * deadlock `d986214` removed. If the queue is full the ping is dropped
+         * and counted, and the in-flight counter above is what notices a peer
+         * that has genuinely gone. */
+        if (ws_queue_control(ws, 0x9, NULL, 0) == 0) {
+            ws->pings_in_flight++;
+        }
+        /* ⛔ `last_tx_ms` IS NOT ADVANCED HERE, AND THAT IS DELIBERATE. It
+         * records the last time BYTES WENT OUT, and a ping is not traffic: an
+         * ssh session that is genuinely idle must still be pinged, or the
+         * counter below never moves and the liveness check never runs. */
+    }
+    ws_flush_control(ws);
 }
 
 /* Deliver the head of the frame queue, copying the payload so it outlives the
@@ -1444,6 +1623,21 @@ int ws_poll_frame(WsSession *ws, int *opcode, buffer *dst, size_t *len,
         *fatal = 0;
     }
     buf_reset(dst);
+    /* ⛔ THE KEEPALIVE RUNS HERE AND NOT ONLY IN ws_recv_frame, BECAUSE THE
+     * OPERATOR'S LOOP IS THIS ONE.
+     *
+     * `ws_recv_frame` is the blocking reader and the node's thread uses it. The
+     * operator is a single-threaded event loop over stdin and the socket, and
+     * it calls `ws_poll_frame` precisely because it must not block. So with the
+     * keepalive only in `ws_recv_frame`, the operator never pinged, never
+     * counted, and never failed a liveness check -- which is the half of the
+     * connection where a half-dead peer is most likely, because the operator is
+     * the one waiting on a reply.
+     *
+     * This is the same "the path that waits is not the path that runs" shape as
+     * the stdin-starvation bug, and it was found by asking which of the two
+     * readers the operator actually uses rather than by reading either. */
+    maybe_keepalive(ws);
     if (ws->fq_head) {
         return deliver(ws, opcode, dst, len, closed, fatal);
     }

@@ -368,10 +368,67 @@ static void check_relay(const char *relay, int port, const char *name,
     }
 }
 
+/* ⛔ THE LADDER, PRINTED, BECAUSE "WHICH RELAY WOULD THIS USE" IS A QUESTION AN
+ * OPERATOR ASKS BEFORE EVERYTHING ELSE AND UNTIL NOW NOTHING ANSWERED IT.
+ *
+ * `dropssh doctor` checked that ONE relay was reachable, which answers "is it
+ * up" and not "which one", and issue #13 asks for the second: the relay comes
+ * from a flag, or from `DROPSSH_RELAY`, or from the built-in default, and an
+ * operator who cannot see which of those won has to guess. `dropssh config`
+ * already prints every setting with its source; this prints the RELAY
+ * specifically, at the top, with the order the fallback is tried in, because
+ * the ladder is a list and a list buried under twenty checks is not a list
+ * anybody reads.
+ *
+ * ⛔ AND IT SAYS WHETHER THE RELAY IS IN THE PROCESS OF ISSUING PAIRS, because
+ * the difference between a relay you can pair against and a rendezvous that
+ * takes a token you were given elsewhere is the difference between "this
+ * deployment is complete" and "this deployment is half configured", and
+ * nothing in `doctor` said which. The token's own value is never printed --
+ * only whether one is set and whether this relay could have issued it. */
+static void check_ladder(const dropssh_opts *o) {
+    out("\n== the ladder");
+    if (o == NULL || o->relay == NULL) {
+        out("  ????    %-28s %s", "relay", "no relay is configured");
+        unknowns++;
+        return;
+    }
+    const char *src = o->relay_src ? o->relay_src : "built-in default";
+    out("  ok      %-28s %s", "this run would use", o->relay);
+    out("          %-28s %s", "from", src);
+    out("  ok      %-28s %s", "1. dropssh relay",
+        "ours, same protocol. Needs a token key (--token-key) to issue "
+        "pairs; without one it serves and issues nothing");
+    out("  ok      %-28s %s", "2. unix:// relay",
+        "a relay on this machine. No network at all, so this is the fallback "
+        "for 'the network is gone' and not for 'the other cage is elsewhere'");
+    out("  ok      %-28s %s", "3. a relay we run",
+        "on a host we control. The code supports it; the gap is "
+        "operational, not code");
+    if (o->token && o->token[0]) {
+        out("  ok      %-28s %s", "token", "(set, not printed: it is a credential)");
+    } else {
+        out("  ????    %-28s %s", "token",
+            "unset. A rendezvous relay that issues nothing is still a working "
+            "rendezvous: pair by NAME with no token at all");
+        unknowns++;
+    }
+    if (o->name && o->name[0]) {
+        out("  ok      %-28s %s", "name", o->name);
+    } else {
+        out("  ????    %-28s %s", "name", "unset; the name comes from the token's pair");
+        unknowns++;
+    }
+}
+
 int dropssh_doctor(dropssh_opts *o) {
     out("dropssh doctor: what this machine can actually do, read rather than guessed\n");
     out("version %s, tls %s, built %s", dropssh_version(),
         dropssh_tls_backend(), dropssh_gitdescribe());
+    /* ⛔ THE LADDER IS PRINTED BEFORE THE CHECKS AND NOT AMONG THEM, because it
+     * is the answer to the question an operator opens this with, and every
+     * check below it is a detail of one rung. */
+    check_ladder(o);
     check_identity();
     check_proxy_and_tls();
     check_server(o ? o->server : NULL);

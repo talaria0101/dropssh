@@ -678,9 +678,45 @@ static void client_thread(Client *c) {
             }
             break;
         }
+        /* ⛔ THE OPERATOR'S FRAME IS FORWARDED WHOLE, AND THIS IS THE FOURTH
+         * VERSION OF THIS LINE.
+         *
+         * The third version truncated to fit the node's advertised
+         * `maxFrameBytes`:
+         *
+         *     if (mf && n + RELAY_ID_LEN > mf) {
+         *         n = mf > RELAY_ID_LEN ? mf - RELAY_ID_LEN : 0;
+         *     }
+         *
+         * which is a silent data loss and not a policy. Measured 2026-09-28: an
+         * operator frame of 300000 bytes reached the node as 65536 bytes and
+         * the remaining 234464 were never sent, with NO close on either socket
+         * and nothing in the relay's log. The only symptom is a transfer that
+         * stops part way and a session that stays open, which is the exact
+         * shape of wstunnel#360 and of the "bytes are accepted and the session
+         * does not progress" class this project has been bitten by four times.
+         *
+         * The premise was also wrong. `maxFrameBytes` bounds ONE FRAME ON THE
+         * WIRE, and `ws_write` already honours it by CHUNKING: a 300000-byte
+         * write leaves as five frames of at most 65536, each within the limit.
+         * Truncating before the write meant the chunker never saw the rest, so
+         * the limit was being enforced by the one method that could enforce it
+         * correctly, and enforced destructively by the one that could not.
+         *
+         * So the clamp is gone and `ws_write` is the single place a frame's
+         * size is decided. `mf` is kept for the ONE thing it is good for: a
+         * node advertising a frame size too small to carry even the id plus
+         * one byte cannot be forwarded to at all, and that is worth saying
+         * rather than writing a frame the node is guaranteed to reject. */
         unsigned mf = ws_max_frame(&enc->ws);
-        if (mf && n + RELAY_ID_LEN > mf) {
-            n = mf > RELAY_ID_LEN ? mf - RELAY_ID_LEN : 0;
+        if (mf && mf <= RELAY_ID_LEN) {
+            /* the node's limit cannot carry a session id plus any payload */
+            node_drop(enc);
+            if (ns) {
+                pthread_mutex_unlock(&ns->wlock);
+            }
+            client_release(c, 1009, "bad multiplex frame");
+            break;
         }
         unsigned char *framed = malloc(n + RELAY_ID_LEN);
         if (framed == NULL) {
@@ -1728,6 +1764,28 @@ static void print_status(void) {
     printf("pairs_issued %llu\n", relay_pairs_issued);
     printf("tokens_refused %llu\n", relay_tokens_refused);
     printf("pair_ttl_s %u\n", RELAY_PAIR_TTL);
+    /* ⛔ THE TWO LIVENESS COUNTERS (#10 adopt 1 and 2) ARE COUNTED PER SESSION
+     * AND SUMMED HERE, because a policy number nobody can read is a policy
+     * number nobody can argue with. `pings_in_flight` is a LIVE value summed
+     * over every session this relay holds, so a non-zero number on an idle
+     * relay is a relay whose peers have stopped answering. */
+    {
+        unsigned pings = 0, drops = 0;
+        for (int i = 0; i < RELAY_MAX_NAMES; i++) {
+            if (!table[i].used) {
+                continue;
+            }
+            if (table[i].node) {
+                pings += ws_pings_in_flight(table[i].node);
+            }
+            for (Client *c = table[i].clients; c; c = c->next) {
+                pings += ws_pings_in_flight(&c->ws);
+                drops += ws_control_drops(&c->ws);
+            }
+        }
+        printf("pings_in_flight %u\n", pings);
+        printf("control_dropped %u\n", drops);
+    }
     fflush(stdout);
 }
 

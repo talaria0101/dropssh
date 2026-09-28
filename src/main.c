@@ -163,8 +163,11 @@ int main(int argc, char **argv) {
     dropssh_opts o;
     memset(&o, 0, sizeof o);
     o.relay = getenv("DROPSSH_RELAY");
-    if (o.relay == NULL) {
+    if (o.relay != NULL && o.relay[0]) {
+        o.relay_src = "DROPSSH_RELAY";
+    } else {
         o.relay = DROPSSH_DEFAULT_RELAY;
+        o.relay_src = NULL;   /* the built-in default has no source to name */
     }
     o.port = 443;
     o.connect_ms = 15000;
@@ -185,6 +188,7 @@ int main(int argc, char **argv) {
         #define NEXT() (++i < argc ? argv[i] : (usage(stderr), exit(2), ""))
         if (strcmp(a, "--relay") == 0) {
             o.relay = NEXT();
+            o.relay_src = "--relay";
         } else if (strcmp(a, "--port") == 0) {
             o.port = atoi(NEXT());
         } else if (strcmp(a, "--path") == 0) {

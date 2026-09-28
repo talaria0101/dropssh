@@ -86,7 +86,53 @@ typedef struct {
     char       pending_accept_key[128];  /* ⛔ between peek and accept */
     unsigned   last_tx_ms;
     unsigned   keepalive_ms;
+    /* ⛔ ⛔ LIVENESS IS A COUNT, NOT A TIMESTAMP (dropssh#10 adopt 1). Three
+     * pings unanswered is a failed session; any pong resets. See
+     * maybe_keepalive. The number is the adoptable part of wstunnel's
+     * mechanism: a mechanism without a threshold never gives up, and the
+     * version we had tracked nothing at all. */
+    unsigned   pings_in_flight;
+    /* ⛔ THE OUTBOUND CONTROL QUEUE, AND IT IS SEPARATE FROM THE INBOUND DATA
+     * QUEUE ON PURPOSE (dropssh#10 adopt 2).
+     *
+     * We bounded the DECODED data queue and had nothing for control frames.
+     * wstunnel's rule is that a control frame is never allowed to block the
+     * data path, and that it says WHICH frame it drops when the queue is full:
+     *
+     *     // Queue full due to TX write congestion; drop pong to avoid blocking RX
+     *
+     * The POLICY is the finding, not the queue. A control frame that blocks
+     * the reader is the deadlock this repository introduced and removed in
+     * `d986214`; a control frame that is dropped silently makes a later ping
+     * unanswerable, which is what the counter above then notices. So: a
+     * bounded queue, a stated drop, and a counter, because a drop nobody
+     * counts is a drop nobody can debug. */
+    WsFrame   *cq_head;
+    WsFrame   *cq_tail;
+    unsigned   cq_count;
+    unsigned   cq_dropped;
 } WsSession;
+
+/* ⛔ ONE PACKET SIZE, READ BY BOTH DIRECTIONS (dropssh#10 adopt 3).
+ *
+ * We had three: the relay's advertised `maxFrameBytes`, our own `WS_MAX_FRAME`
+ * refusal bound, and the chunk size in `ws_write`. They agreed by luck. A
+ * frame assembled at one size and written at another is not a slow path, it is
+ * a frame whose declared length and payload disagree, and the far end
+ * desynchronises on the NEXT frame -- which is another session's bytes read as
+ * a session id, the exact failure the write lock in `relay.c` exists to
+ * prevent.
+ *
+ * `ws_write` chunks at the RELAY's advertised limit, because a relay that
+ * states a limit and then closes a client for exceeding it is the relay being
+ * right, and this number is that limit. `WS_MAX_FRAME` remains as the absolute
+ * refusal bound for a peer that states nothing useful, and it is deliberately
+ * LARGER: refusing a frame is for a peer that is wrong, chunking is for a peer
+ * that is within its rights. One is a policy and one is a ceiling, and they
+ * are not the same number. */
+#define WS_MAX_PACKET_LENGTH WS_HELLO_DEFAULT_FRAME
+#define WS_MAX_PINGS_IN_FLIGHT 3
+#define WS_CONTROL_QUEUE_MAX  10
 
 /* Mint a forward token from a relay that issues them itself:
  *   POST <base>/v1/mint with an empty body, answering {token,expires,scope}.
@@ -240,6 +286,13 @@ int ws_poll_frame(WsSession *ws, int *opcode, buffer *dst, size_t *len,
  * 1011 "node disconnected". A client that reports only "connection closed"
  * cannot tell its own framing bug from the relay being down, which is exactly
  * the B11 failure that the docs used to describe as silence. */
+/* ⛔ THE TWO COUNTERS THE ADOPTS ADDED, AND THEY EXIST SO THE POLICY IS
+ * OBSERVABLE. A drop nobody counts is a drop nobody can debug, and a
+ * liveness rule whose threshold nobody can read is a rule nobody can argue
+ * with. `dropssh relay --status` prints both. */
+unsigned ws_control_drops(const WsSession *ws);
+unsigned ws_pings_in_flight(const WsSession *ws);
+
 int         ws_close_code(const WsSession *ws);
 const char *ws_close_reason(const WsSession *ws);
 

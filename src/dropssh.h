@@ -43,6 +43,21 @@
 
 typedef struct {
     const char *relay;        /* relay host */
+    /* ⛔ WHERE `relay` CAME FROM, RECORDED WHERE IT IS RESOLVED, BECAUSE A
+     * RESOLVED VALUE WITH NO SOURCE IS THE CLASS OF REPORT THIS REPOSITORY
+     * KEEPS CALLING "it ignored my flag".
+     *
+     * `doctor` prints the relay it would use and the order the ladder is tried
+     * in, and it cannot answer the second question -- was that my flag, my
+     * environment, or the built-in -- without being told. It used to infer it
+     * by comparing the resolved value against `DROPSSH_RELAY`, which is wrong
+     * the moment a flag happens to carry the same string the environment did,
+     * and the answer was "built-in default" for a relay the operator had just
+     * named explicitly.
+     *
+     * NULL means "the built-in default", which is the only case with no source
+     * to name. */
+    const char *relay_src;   /* "--relay", "DROPSSH_RELAY", or NULL for the default */
     int         port;         /* 443 */
     const char *path;         /* request target */
     const char *token;        /* X-Relay-Token, or NULL */
