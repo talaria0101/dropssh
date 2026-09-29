@@ -70,7 +70,7 @@ defence in depth; the ORDERING is what holds. See review 3 in
 
 What remains from the original list is **nothing but the two research issues
 that are deliberately not work** (**#3**, **#5**, **#6**, **#7**, **#12**),
-and **R2**'s credential.
+and the SOCKS forward's last mile, which does not yet carry bytes.
 
 Every claim was checked against the source before it was written down, and one
 was wrong and is corrected in place: **B8** in the relay list originally said
@@ -102,7 +102,7 @@ not an approximate location.
 | **B12** | open, in the relay. Not exploitable; the consequence for a client is that the id in an operator frame must not be treated as addressing. |
 | **B13**-**B14** | open, in the relay author's own reference operator. Both stop it running; both are documented. |
 | **R1**, **R3**-**R6**, **R10**, **R11** | **fixed in `67308d8`**: `tests/mux-probe.py`, `doctor`, `--json`, `pair`, `config`, two concurrent sessions, and a negative test for the id rule. |
-| **R2** | **BUILT, cannot run here.** `tests/relay-session.sh` and a scheduled job that carries a real session, a 270 KB transfer by sha256, and two concurrent sessions on one node socket. It needs a pair from the relay's `POST /v1/pair`, which is per-pair AND per-role and cannot be obtained from the outside. The job reports three outcomes and never reports a missing credential as a pass. |
+| **R2** | **DONE, with no credential.** `tests/relay-session.sh` mints its own pair with `POST /v1/pair` and carries a real session, a 270528-byte transfer by sha256, and two sessions alive at once on one node socket. ⛔ This entry previously said it "cannot run here" and needed three repository secrets; that was WRONG, and the relay's own `llms.txt` at r12 says `POST /v1/pair` with an empty body is self-service. Measured against the live relay 2026-09-28. |
 | **R8** | **DONE.** There is no repository to pin: the relay publishes a Worker and what it SERVES is the thing a client talks to. `scripts/fetch-relay-spec.sh` fetches the served document, records the version from `/health`, and re-checks the five facts this tree measured. At `2026-09-28-r12`, 5/5 hold. It was `r11` when our measurements were taken, the same day. |
 
 Full text, with what each looks like:

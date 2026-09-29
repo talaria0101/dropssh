@@ -57,6 +57,8 @@ Full measurements: [`docs/decisions-tls.md`](docs/decisions-tls.md).
 
 ## Reading order
 
+0. **[`HANDOFF.md`](HANDOFF.md)** — what is proven, what is not, and the traps,
+   if you are picking work up rather than reading the code.
 1. This file.
 2. [`docs/decisions-tls.md`](docs/decisions-tls.md) — the libc split, the
    patches, and the six defects CI found that a cage could not.
@@ -189,6 +191,26 @@ tests/wsmove-test.c
                 The session move is ownership rather than a race, so it is
                 asserted by asking whether the moved-from source owns
                 anything -- a question a copy cannot answer correctly.
+tests/token-test.c   the bearer token: roles, the wrong key, expiry, a lifetime
+tests/socks-policy-test.sh
+                the SOCKS5 destination decision, on the function lifted out of
+                `src/relay.c` at build time, so the test cannot assert a copy
+tests/plant-matrix.sh
+                ⛔ every guard, with the defect it claims to catch PLANTED and the
+                test that claims to catch it RUN. ⛔ A claim that a guard fires is
+                a claim about a counterfactual, and reading a test shows what it
+                would check, not what it does. 13 of 15 rows go red; the two
+                that do not are documented as unreachable, with the reason.
+tests/relay-session.sh
+                ⛔ NEEDS A NETWORK AND A THIRD PARTY, so it is NOT in the e2e and
+                must not be. It mints its own pair with `POST /v1/pair` --
+                self-service, no credential -- and carries a real login, a
+                270528-byte transfer by sha256, and two sessions alive at once
+                on one node socket against `tcp.ssh.relay.ajam.dev`.
+tests/socks-forward-test.sh
+                ⛔ NOT IN THE GATE AND NOT PASSING. Kept failing in the open
+                because a gate entry that is always red is a gate nobody reads.
+                Its header says what is proven and what is not.
 docs/           the measurements, which are the real documentation
 vendor/         does not exist, on purpose: inputs are fetched and pinned
 ```

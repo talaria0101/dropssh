@@ -482,38 +482,68 @@ to two is not a measurement.
 prints the four-way table above plus the auth matrix. It is an hour of work and
 it removes the largest source of error in this project so far.
 
-## R2. Run the verbs against a real relay in CI -- BUILT, needs a credential
+## R2. Run the verbs against a real relay in CI -- DONE 2026-09-28, with no credential
 
 `connect --mint` against a public target, on a schedule rather than every
 commit. This is the gate that would have caught B3, B6 and B9.
 
-**Done as far as it can be done here, 2026-09-28.** `tests/relay-session.sh`
-carries a real session: a pubkey login to uid 0 through a real `ssh` client, a
-270 KB transfer asserted by sha256, two concurrent sessions on one node socket,
-and the node's own registration count read from its log. A scheduled job runs it.
+**Done, and ⛔ the previous version of this entry was wrong about its own
+blocker.** It said a pair "is per-pair and per-role and cannot be obtained from
+the outside", that the job needs three repository secrets, and that it reports
+"no credential configured" as an outcome a reader should accept.
 
-⛔ **AND IT CANNOT RUN WITHOUT A PAIR, AND THE JOB SAYS SO INSTEAD OF PASSING.**
-A pair is minted by the relay's `POST /v1/pair`; the node and connect tokens are
-per-pair **and per-role**, and there is no way to obtain one from the outside.
-`--mint` is the FORWARD endpoint and answers 403 on a reverse upgrade, measured.
-So the job needs three repository secrets, and **a pair expires** — a secret set
-months ago is a job that has been quietly measuring nothing. The job reports
-three outcomes and never conflates them: ran and passed, ran and failed, or
-could not run because no secret is set, which is yellow and states that a green
-tick there is not a pass.
+**All of that was wrong, and the relay's own documentation says so.** From
+`llms.txt` at version `2026-09-28-r12`:
 
-⛔ **AND IT NAMES WHICH FAULT IT WAS**, because "connection failed" is the
-message that costs an afternoon. 403 on an upgrade is a token or a role problem
-and says so; 409 is a name another node holds and says so; a connection error is
-the relay or the egress and says so; silence with no error is a credential the
-relay never saw. Measured against the live relay with a deliberately wrong
-token: the diagnostic arrives in **4 s** and names the token/role case. Without
-`--retry-budget 2` the same diagnostic took 60 s and appeared once under nine
-copies of itself.
+> Self-service rendezvous (control host only): `POST https://tcp.ssh.relay.ajam.dev/v1/pair`
+> with an empty body or `'{}'` returns `{name, node_token, connect_token,
+> stop_token, expires}`... The agent creates this itself, keeps `node_token`, and
+> hands `connect_token` to its operator over their trusted channel.
 
-The relay's `/health` is fetched whether or not the credential is present,
-because it is the one measurement here that needs no credential and it says
-whether the other half is even meaningful.
+⛔ **R2 never needed a secret. It needed somebody to read the relay's
+documentation.** That is the same failure as #8 of `dropssh#10`: a claim about
+someone else's service, made from memory and carried into prose and a CI job,
+drifts from the service. The fix is to **fetch**, which is what
+`scripts/fetch-relay-spec.sh` does for the protocol and what this job now does
+before it believes anything.
+
+**Measured against `tcp.ssh.relay.ajam.dev` at r12**, from a cage that cannot
+`bind(2)` INET at all:
+
+| | |
+| --- | --- |
+| a pubkey login to uid 0 | through a real `ssh` client and a real `ProxyCommand` |
+| 270528 bytes | back byte for byte, sha256 on both ends |
+| two sessions alive at once | on **one** node socket, the count read from the node's own log |
+| the server's environment | contains **no `LD_PRELOAD`**; it reads its passwd database with `dropbear -Y` |
+
+⛔ **AND IT NAMES WHICH FAULT IT WAS, because "connection failed" is the message
+that costs an afternoon.** 403 on an upgrade is a token or a role problem and
+says so; 409 is a name collision and says so; a connection error is the relay or
+the egress and says so; silence with no error is a credential the relay never
+saw. Measured against the live relay with a deliberately wrong token: the
+diagnostic arrives in 4 s, because the node is run with `--retry-budget 2` and
+without it the same answer took 60 s and appeared once under nine copies of
+itself.
+
+⛔ **AND THE CONCURRENCY CASE HAD TO BE REWRITTEN, because the first version
+proved nothing.** Backgrounding each session in a subshell and using bare `wait`
+reports a hang when one session finishes early -- `wait` returns when the LAST job
+finishes -- and the script exited 124 with nothing on stderr. Measured instead:
+three **sequential** sessions, one node registration, every reply delivered,
+which is what established that the multiplexer is real and that the *test's
+wait* was what was broken. The case now runs a long session with a short one
+started inside it.
+
+⛔ **THE CLIENT GETS THE SHIM AND THE SERVER DOES NOT**, because they are
+different machines in the same test: `ssh(1)` on a host with no `/etc/passwd`
+cannot map its own uid and refuses to start. That is a fact about the sandbox
+and not about the server under test, and conflating them produced
+`No user exists for uid 0` -- OpenSSH complaining about the *client*.
+
+The job is scheduled and `continue-on-error`: a third party's deployment is not
+this repository failing, and a scheduled job that goes red for reasons outside
+the tree teaches people to ignore it.
 
 ## R3. `dropssh doctor`
 
