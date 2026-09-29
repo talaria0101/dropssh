@@ -980,12 +980,36 @@ def _probe_body(dropssh, work):
                         "the stub relay never sent `open`, so the client was not "
                         "waiting for a `ready` and this case measured something "
                         "else")
-                if elapsed < ready_wait_s:
+                # ⛔ THE LOWER BOUND IS ONE SECOND UNDER THE BOUND, AND A
+                # SUBTRACTION CANNOT MAKE IT EXACT.
+                #
+                # The first version asserted `elapsed >= 60s`, which is a claim
+                # about a measurement of a deadline: `dropssh connect` fires the
+                # bound at 60 s and the harness measures the time AROUND it, so
+                # the reading is 60.0s minus however long the two clocks
+                # disagreed. It failed roughly one run in four with
+                #
+                #     gave up on the `ready` wait after 60.0s, so the 60s bound
+                #     did not fire
+                #
+                # ⛔ WHICH IS A MESSAGE THAT CONTRADICTS ITS OWN NUMBER, and it
+                # took three runs to decide it was a boundary and not a defect.
+                # A test that fails at the boundary it is asserting is not
+                # measuring the bound, it is measuring the scheduler.
+                #
+                # ⛔ AND THE ONE SECOND IS NOT ARBITRARY: it is an order of
+                # magnitude above the disagreement between two clocks measuring
+                # the same 60 seconds, and an order of magnitude below the
+                # difference between "the bound fired" and "it returned early",
+                # which is the thing the assertion is actually for. A build that
+                # fires at 0.0s still fails this by fifty-nine seconds.
+                if elapsed < ready_wait_s - 1.0:
                     ready_bound_failures.append(
                         "`dropssh connect` gave up on the `ready` wait after "
-                        "%.1fs, so the %ds bound did not fire; an ssh "
-                        "ProxyCommand that returns early here did not wait, it "
-                        "exited" % (elapsed, ready_wait_s))
+                        "%.2fs, which is more than a second before the %ds "
+                        "bound, so the bound did not fire; an ssh ProxyCommand "
+                        "that returns early here did not wait, it exited"
+                        % (elapsed, ready_wait_s))
                 if elapsed > ready_wait_s + 30:
                     ready_bound_failures.append(
                         "`dropssh connect` took %.1fs to end the `ready` wait, "
