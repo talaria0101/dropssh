@@ -717,9 +717,9 @@ fire. An empty result beats an invented one.
 | --- | --- | --- | --- | --- |
 | 1 | correctness, line by line, and the error paths | `f02ae10` + `c9840e0` | read every changed line; exercised every new error path by running the binary | **2 defects**, both fixed |
 | 2 | concurrency: what is freed under a pointer, what is written under a lock that can block | `f02ae10` + `c9840e0` | traced every writer and reader of the two structures the commits touch; ran the loop's bound directly against a hostile input | **0 defects in this work**; 1 pre-existing area re-confirmed (U2/U3) |
-| 3 | the tests: would each fail if its defect returned? | `f02ae10` + `c9840e0`, then this session's U2/U3 work | **built the plants and ran them.** U1 3/3, U2 4/4 named, U3 25/25. Two of the three guards did not exist and are now proven to fire |
-| 4 | the docs and the issue comments: does any assert what this change made false? | `f02ae10` + `c9840e0`, plus U2/U3 | **the U3 "0/6, window narrower than a run" claim was FALSE** and is corrected in place with the measurement that corrects it. The U2 "unreachable" claim was true and is now closed. A build-gate defect found by the same pass: `scripts/build-dropbear.sh` |
-| 5 | what is NOT covered, as what was swept and what would have had to be true | not yet run | | |
+| 3 | the tests: would each fail if its defect returned? | **every guard added or changed this session, planted and run: `tests/plant-matrix.sh`** | 13 of 15 rows go red. U1 3/3, U2 4/4 named, U3 25/25, and 11 more. ⛔ **Two rows do not go red and are recorded as unreachable rather than passing** -- see the two entries below. **Two guards were MISSING and had to be written** |
+| 4 | the docs and the issue comments: does any assert what this change made false? | **every number, status, capability and mechanism claim this session changed** | **3 found and corrected:** the refcount was described as load-bearing when the ORDERING is; "What remains is R9" survived R9 being done; the case count was stale twice. Plus the U3 "0/6" correction from the earlier pass. See the review 4 entry |
+| 5 | what is NOT covered, as what was swept and what would have had to be true | **the whole session's work, listed as NOT established** | 6 things, and the one that matters: ⛔ **no sanitizer was run, because there is none on this machine.** Reviews 1 and 2 are traces. See the review 5 entry |
 
 ## Review 1, correctness: two defects, both fixed
 
@@ -805,6 +805,196 @@ This is why review 4 has to be a separate review: a commit can fix a claim in
 one place and leave it standing in another, and only reading the whole thing
 finds the second.
 
+### Review 3, the tests: every guard planted and run, and what that found
+
+> **Reviewed 2026-09-28** over the whole of this session's work. The instrument
+> is `tests/plant-matrix.sh`: for every guard added or changed, it plants the
+> defect the guard claims to catch and runs the test that claims to catch it.
+> ⛔ **THE INSTRUMENT IS THE POINT.** A claim that a guard fires is a claim
+> about a counterfactual, and no amount of reading a test establishes a
+> counterfactual: reading shows what a test WOULD check, and only running the
+> plant shows what it DOES check. This file exists because two sessions wrote
+> "every guard was proven to fire" and were wrong, and because three plants came
+> back 0/6 on the first pass.
+
+| guard | plant | result |
+| --- | --- | --- |
+| U1, the bound on the `ready` wait | the bound removed, and set to 0 | **3/3, 3/3** |
+| U2, the session move | `ws_move` reverted to a copy | **caught**, 4 named failures |
+| U2, the NULL deref | `ws_close` stops nulling `t` | **caught** |
+| U3, the 1011 sweep | the sweep's reference removed | **25/25** |
+| the 300 KB clamp | the clamp restored | **caught**, with the numbers |
+| the node refcount | the refcount removed | **NOT CAUGHT** — see below |
+| the stdin EOF invariant | EOF closes the link | **caught**, exit 0 named |
+| the ping cap | the cap removed | **caught** |
+| the token role check | removed | **caught** |
+| the token MAC check | removed | **caught** |
+| the token expiry | removed | **caught** |
+| the token lifetime | a zero TTL accepted | **caught** |
+| the SOCKS policy | removed | **caught**, 6 named failures |
+| `ws_close` not setting `closed` | the assignment removed | **NOT CAUGHT** — see below |
+| the retry budget | removed | **caught** |
+| the CA bundle | the fetch disabled | **caught** |
+
+#### ⛔ Two rows do not go red, and the reason in each case is a fact about the product
+
+**`ws_close` no longer setting `ws->closed`.** The write paths test
+`ws->closed` AND `ws->t == NULL`, and every state a session can be in after
+`ws_close` has BOTH set, because `ws_close` nulls `t`. So the state that would
+expose the missing flag — a closed session whose `t` is live again — is
+**unreachable**: a `WsSession` is never re-armed after `ws_close`, because the
+only transitions are a fresh init and `ws_move`. The flag is still load bearing,
+because a FRAMING error sets `closed` and deliberately leaves `t` alone, but
+proving that needs a decoder stub that feeds bytes on demand and this repository
+does not have one. `tests/wsmove-test.c` asserts the flag IS load bearing by
+building the state directly, and says in the case what that does not prove.
+
+**The node refcount.** Four constructions were tried, the last of them with a
+fault point that parks a writer until the node's exit has happened, and a relay
+with the refcount removed served every one: 379 writes across the disconnect,
+then 38 with the writer held, no crash. ⛔ The reason, measured: `node_done`
+ends with `ws_close(ws)`, so the node's session buffers are freed BEFORE the
+connection thread reaches `free(nc)`. By the time the NodeCtx goes, the
+session an operator holds is already closed, `ws_write` returns -1 on it, and
+the writer leaves.
+
+⛔ **SO THE REFCOUNT IS DEFENCE IN DEPTH AND NOT THE LOAD-BEARING GUARD**, and
+what makes the write safe is the ORDERING plus the `t == NULL` check. That is a
+correction to this file's own earlier claim, which said the refcount "is the
+third option and the only one that is correct for both". The refcount is
+correct and worth having; it is not what is standing between the two threads.
+Case 14 holds them on top of each other anyway, because the protection is an
+ORDERING, and an ordering is exactly the thing a later edit moves.
+
+#### ⛔ Two guards were MISSING, and the matrix is what found them
+
+1. **A minted pair name was refused by this relay's own validator, 1 time in 6.**
+   `dropssh_random_b64` emits the STANDARD base64 alphabet, which contains `/`,
+   and the name becomes a path segment, so the validation immediately below
+   rejected it. Measured 5/30, then 0/30 after the fix to hex. ⛔ The deeper
+   fault is that a generator and a validator in the same file used two different
+   alphabets and neither of them named the alphabet.
+2. **The node's exit was a THIRD end of a race the file guarded at two ends.**
+   `sweep-release` and `client-last-unref` existed; the node's free did not. It
+   is now `node-exit-free`, and the writer is parked with `write-in-flight`,
+   which waits on a CONDITION rather than a fixed yield — 2000
+   `sched_yield()` calls take microseconds and the node's thread needs
+   milliseconds.
+
+#### ⛔ And the instrument has faults of its own, which cost more than the products did
+
+* ⛔ A plant that removes the INSTRUMENT as well as the defect proves nothing
+  about either. The first version of the node-refcount plant removed
+  `node-exit-free` along with the refcount, so the case measured a race it had
+  just made unobservable, and the row printed NOT CAUGHT on a broken build.
+* ⛔ A plant row that HANGS is a row that never reports, and a row that never
+  reports is a row nobody can tell from a passing one. Two versions hung: one
+  passed `--server "sleep 300"`, which `serve` probes at startup and which is
+  not a server, and one passed `--server-cmd`, which is not an option at all.
+* ⛔ A MATRIX THAT PRINTS NOTHING FOR NINE MINUTES IS A MATRIX NOBODY WATCHES.
+  The first two runs produced no output, because output through `setsid` to a
+  file is block-buffered. The runner uses `stdbuf -o0` now.
+* ⛔ AND ONE ROW REPORTED A CRASH AS "THE CASE COULD NOT RUN", three runs in a
+  row with a perfect 3/3. A case that reports a crash as its own setup failure
+  has hidden the thing it exists to find, and a 3/3 on that is worth nothing.
+
+### Review 4, the docs: does any of them assert what this work made false?
+
+> **Reviewed 2026-09-28.** The question is not "are the docs accurate" -- it is
+> "does any sentence here say something that is now wrong", because a document
+> that was correct yesterday and describes yesterday's product is the failure
+> this repository keeps finding. Commit `f02ae10` corrected a claim three lines
+> from its own correction, and review 1 of that work found it.
+
+**What was swept:** every file that describes a number, a status, a capability
+or a mechanism that this session changed. `AGENTS.md`, `docs/open-issues.md`,
+`docs/relay-issues.md`, `README.md`, and the help text of every verb, plus every
+`⛔` in the source that names a behaviour.
+
+| claim | was | now | why it moved |
+| --- | --- | --- | --- |
+| e2e case count | "Nineteen" | **"Thirty-five"** | nine cases were added this session; the number was stale at 34 the moment R9 landed |
+| probe case count | 9 | **14** | cases 9 to 14 are new, and case 14 is the one that does NOT catch its defect |
+| U2, U3 status | 0/6 | **CLOSED**, with the U3 correction | the point of the work |
+| the node refcount | "the only one that is correct for both" | **defence in depth; the ORDERING is what holds** | measured: 379 writes across a disconnect with the refcount removed and no crash |
+| R9 | "What remains is R9" | **DONE**, with its entry | and the libc split is now a build choice, not a constraint |
+| R7, R8, R2, #4, #8 | open or open-issues | **DONE, or BUILT and blocked on a credential** | with the reason each is where it is |
+| `dropbear`'s libc | "the shim needs RTLD_NEXT, so a musl dropbear cannot be built" | **still true; the shim is now optional** | `AGENTS.md` said the shim *is* the constraint, and it no longer is |
+
+**Three things found and corrected:**
+
+1. ⛔ **The refcount claim was the wrong kind of true.** "The refcount is the
+   only one that is correct for both" is a claim about the refcount, and the
+   refcount is fine. What is fine but was implied to be load bearing is NOT:
+   the write is safe because `node_done` closes the session before the
+   connection thread frees the context, and because `ws_write` refuses a
+   session with no transport. A document that says the wrong mechanism is
+   load bearing is worse than one that says nothing, because the next reader
+   will protect the refcount and move the ordering.
+
+2. ⛔ **"What remains is R9" survived R9 being done**, in the same file, for the
+   length of one edit. The status line and the entry were in different places
+   and only one of them was being read.
+
+3. ⛔ **And the case count was stale twice**, at 34 and then at 35, because a
+   number in prose is a number nobody recomputes. It is now checked against the
+   suite's own tally in this review, and the e2e prints its own count so the
+   two can be compared.
+
+**What was NOT covered, stated as what would have had to be true to fire:** no
+document was checked against a *deployed* relay, so any claim about what the
+ajam relay does rests on the measurements in this file and on
+`docs/relay-spec/`, which `scripts/fetch-relay-spec.sh` re-checks on a
+schedule. ⛔ That is the one class of doc claim here that cannot be settled from
+inside this repository, and R8's job is to make it visible rather than to settle
+it.
+
+### Review 5, what is NOT covered, as what was swept and what would have had to be true
+
+> **Reviewed 2026-09-28.** An empty result is a result; an empty result with a
+> statement of what was swept is worth more than a finding.
+
+**This session, and NOT established:**
+
+* ⛔ **A SOCKS5 forward has never carried a byte.** The listener binds an INET
+  socket and `dropssh#6` measured 24/24 that every INET bind is refused with
+  EACCES at uid 0, so on this machine the listener cannot be started at all.
+  What IS established is the POLICY, on the shipping function, and the two
+  configuration guards. What is not: the wire format parsed, the `open`
+  honoured by a node, the bytes moved. ⛔ A case that claimed the byte path
+  would be a case passing for a reason it cannot see.
+* ⛔ **R2's job has never run.** A pair is per-pair and per-role and cannot be
+  obtained from the outside; `--mint` answers 403 on a reverse upgrade. The
+  script exists, the diagnostics were measured against the live relay with a
+  deliberately wrong token, and the job reports "no credential" as its own
+  outcome. A green tick on that job is not a pass and the job says so.
+* ⛔ **No sanitizer was run, on any of this.** There is no `libasan` and no
+  `libtsan` anywhere on this machine, which was established at the start and
+  re-confirmed. Reviews 1 and 2 are therefore TRACES and not instruments, and
+  the two "unreachable" rows in review 3 are exactly the questions a sanitizer
+  would answer. ⛔ The next machine that has one should run this suite under it
+  before anything else is changed in `relay.c`.
+* ⛔ **The case-3 close-code flake is still unrooted.** 1/100 pre-change, 3/100
+  after. It is pre-existing, it is not from this work, and three samples is not
+  enough to call the rate unchanged.
+* ⛔ **`--retry-budget` was measured at 3 attempts against an absent relay.**
+  A budget that interacts with a slow-but-present relay, or with a relay that
+  accepts the upgrade and then drops the node, is not measured.
+* ⛔ **The cross-relay migration was measured between two of OUR relays with
+  the same key.** Against the ajam relay it cannot be, because the ajam relay
+  holds a different key, and a pair issued by the ajam relay is not one this
+  relay can honour. ⛔ So "a pair issued by our relay works against ours, and
+  migrates between ours" is established; "it works against the ajam relay" is
+  not, and no version of that claim is in these docs.
+
+**What WAS swept, and what would have had to be true for a finding to fire:**
+every writer and reader of `relay_key`, the three SOCKS strings, `Client.refs`
+and `NodeCtx.refs`; every place a `wlock` is taken and released, and the lock
+order between `tlock` and `wlock` was checked mechanically rather than by
+reading, because the early-data path takes both and it is exactly the shape
+that inverts. The two new pieces of shared state are written once in
+`dropssh_relay_main` before the accept loop and read only afterwards, so there
+is no lock on them and there does not need to be one.
 ### Review 2, concurrency: no defect in this work, and one area re-confirmed
 
 The question is specific: *what is freed while another thread holds a pointer to

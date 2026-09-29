@@ -45,7 +45,7 @@ This is the first thing to understand and the easiest to get wrong.
 | binary | libc | why |
 | --- | --- | --- |
 | `dropssh` | **static musl** | the one you download and run. A cage has no libc to link against. |
-| `dropbear` | **dynamic glibc** | the passwd shim is an `LD_PRELOAD` and needs `RTLD_NEXT`, which musl resolves to `NULL` for a libc symbol, so a musl dropbear cannot be interposed at all. Not static, not static-pie, and not with `-rdynamic`. |
+| `dropbear` | **dynamic glibc** | the passwd shim is an `LD_PRELOAD` and needs `RTLD_NEXT`, which musl resolves to `NULL` for a libc symbol, so a musl dropbear cannot be interposed at all. Not static, not static-pie, and not with `-rdynamic`. ⛔ **`dropbear -Y FILE` now removes the REQUIREMENT for the shim, so this row is a build choice and not a constraint** -- a server with no `LD_PRELOAD` in its environment authenticates, measured in the gate. What has not been done is building a static server; the default is unchanged. |
 
 Getting that wrong ships a server that compiles, links, passes every static
 check, and logs `Login attempt for nonexistent user` for `root`, which is
@@ -110,7 +110,7 @@ anyone in is the failure this project exists to prevent**, and `dropbear -t`,
 `file` and a green `make` are all incapable of seeing it: it appears at login,
 on a machine with no `/etc/passwd`, as a message that names the wrong thing.
 
-**Thirty-four** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
+**Thirty-five** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
 
 * dropbear is dynamically linked, so the shim can reach it
 * `dropbear -i` stays up on a **socketpair** waiting for a session
@@ -213,7 +213,8 @@ vendor/         does not exist, on purpose: inputs are fetched and pinned
 * `--disable-static-programs` **does not exist** in dropbear's configure. It
   warns and continues. The lever is the `STATIC=` value.
 * The passwd shim is **glibc-only**: musl's `RTLD_NEXT` is `NULL` for a libc
-  symbol.
+  symbol. ⛔ `dropbear -Y FILE` means you can now DROP the shim entirely, which
+  is the only way this stops being a constraint.
 * A **musl dropbear cannot be built** with zig cc: `-rdynamic` fails autoconf's
   `-c` probe, `-pie` gives static-pie. The builder refuses it by name.
 * zig 0.13 **cannot build glibc riscv64** (`.cfi_label`).

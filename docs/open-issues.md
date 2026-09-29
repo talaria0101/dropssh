@@ -19,8 +19,8 @@ in commit `67308d8`; the multiplexed reverse path is implemented and was
 measured live against `tcp.ssh.relay.ajam.dev` (two concurrent sessions on one
 node socket, a 270177-byte transfer byte for byte).
 
-**Updated 2026-09-28.** `tests/e2e.sh` is **34/34** and `tests/mux-probe.py`
-carries **thirteen** cases, up from the nine it started this session with. Five
+**Updated 2026-09-28.** `tests/e2e.sh` is **35/35** and `tests/mux-probe.py`
+carries **fourteen** cases, up from the nine it started this session with. Five
 of the new ones are for the three known-unguarded items, and **U1, U2 and U3
 are all closed**; see the three full entries at the end of
 [`relay-issues.md`](relay-issues.md), and read U3's for a claim in this tree
@@ -36,9 +36,29 @@ and three of them were **silent data loss or a wrong refusal**:
 | U2/U3's concurrency read | `NameSlot.node` was a bare pointer **into** a heap `NodeCtx` the node's own thread freed, so a writer used freed memory |
 | rebuilding the release | `scripts/build-dropbear.sh`'s idempotency marker was a string in **neither** the patch nor the patched source, so the **second `build.sh --full` in a clean checkout always failed** |
 
-What remains is **R9** (a `--passwd-file` patched into dropbear) and, from the
-relay list, **R2** and **R8** — both of which are now BUILT and both of which
-need something this repository does not have; see their entries.
+**Updated again the same day.** Six more items closed, each with its own entry:
+**R9** (`--passwd-file` patched into dropbear, so a server with **no
+`LD_PRELOAD` in its environment** authenticates — measured in the gate), **R7**
+(the release ships a CA bundle and the binary finds it beside itself, proven
+with a live verified handshake), **R8** (the relay's own document, fetched
+with its version, five measured facts re-checked), **R2** (a real-relay session
+job, built and needing a credential this repository does not have), **#4/#8**
+(an operator-side SOCKS5 that reaches exactly one named destination) and the
+ligolo reconnection budget from **#8**.
+
+⛔ **ONE CLAIM ABOVE IS NOW KNOWN TO BE TOO STRONG, AND IT IS CORRECTED WHERE
+IT LIVES.** "U2/U3's concurrency read: a writer used freed memory" states the
+defect correctly, but the implicit suggestion that the REFCOUNT is what stops
+it is wrong. `node_done` ends with `ws_close(ws)`, so the session's buffers are
+freed *before* the connection thread reaches the free, and `ws_write` on the
+already-closed session returns -1. Measured: a relay with the refcount removed
+served 379 writes across a node's disconnect without a crash. The refcount is
+defence in depth; the ORDERING is what holds. See review 3 in
+[`relay-issues.md`](relay-issues.md).
+
+What remains from the original list is **nothing but the two research issues
+that are deliberately not work** (**#3**, **#5**, **#6**, **#7**, **#12**),
+and **R2**'s credential.
 
 Every claim was checked against the source before it was written down, and one
 was wrong and is corrected in place: **B8** in the relay list originally said
@@ -111,11 +131,39 @@ had been shipping whatever the build host happened to have. 121 certificates
 in the shipped bundle, and the fetch retries three times because a transient
 429 is not a missing file.
 
-## R9. A `--passwd-file` option patched into dropbear
+## R9. A `--passwd-file` option patched into dropbear — DONE 2026-09-28
 
-The best remaining change to the product, and it removes the `LD_PRELOAD`
-dependency and the glibc/musl split with it. `dropbear` would read its passwd
-database from a file, `serve` would not need a shim, and a static server would
-become usable. The e2e case: a server with **no** `LD_PRELOAD` in its
-environment still authenticates.
+It was the best remaining change to the product, and it removes the
+`LD_PRELOAD` dependency and with it the glibc/musl split. `dropbear -Y FILE`
+reads its passwd database from a file, so a server needs no shim — and a static
+server becomes a thing to consider rather than a thing the build refuses.
+
+**The e2e case, and it is the one R9 asked for by name: a server with NO
+`LD_PRELOAD` in its environment still authenticates.** Measured, in the gate:
+a real `ssh` client logs in to a server whose environment contains no shim —
+absent, not unset — reading its user from a `passwd(5)` file.
+
+⛔ **AND THE CLIENT IS GIVEN THE SHIM AND THE SERVER IS NOT, BECAUSE THEY ARE
+DIFFERENT MACHINES IN THE SAME TEST.** `ssh(1)` on a host with no
+`/etc/passwd` cannot map its own uid and refuses to start, so the client needs
+one to exist. That is a fact about the sandbox and not about the server under
+test, and conflating them produced `No user exists for uid 0` — which is
+OpenSSH complaining about the *client*, and names the wrong process entirely.
+
+The parser is at `fill_passwd`, the single point every login passes through,
+and in `common-session.c` rather than a new file so the patch touches no
+generated `Makefile.in` on a tree pinned by commit. Four things are **refused**
+rather than guessed, and the uid is the one worth naming: `atoi` is not used,
+because its answer to a non-numeric string is 0 and 0 IS root. A line that is
+not seven fields is *skipped* rather than refused, so somebody else's typo
+gets a login failure naming the user instead of a refusal they cannot act on.
+A line longer than the buffer is refused rather than copied truncated, because
+the shell is the last field and a truncated line is a login with a shorter
+shell than the file says.
+
+⛔ **AND A STATIC SERVER IS NOT YET USABLE, WHICH THE DOC MUST NOT OVERCLAIM.**
+`dropbear` itself is still built dynamic glibc by `build.sh`, and the libc
+split still holds for the default path. What R9 removed is the *requirement*
+for the shim, not the build's choice: a server can now run with no `LD_PRELOAD`
+at all, and a static build is a follow-up that nobody has measured.
 
