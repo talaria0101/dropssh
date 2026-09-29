@@ -325,6 +325,14 @@ typedef struct MuxSession {
     int         stop;          /* set to ask the session thread to finish */
     pthread_cond_t cv;
     int         server_done;   /* the server hung up: half-close, do not read */
+    /* ⛔ WHETHER THE PEER BEHIND `sock` IS A `dropbear -i` CHILD OR A DIALLED
+     * DESTINATION. Everything below the `open` is the same pump either way --
+     * which is the point of routing a SOCKS forward through the same
+     * multiplexer -- and the teardown is not: one has a child to reap and one
+     * has only a socket. A session that does not say which gets the wrong
+     * teardown, and the wrong teardown on a forward is a forward that closes
+     * a socket it should have kept. */
+    int         is_socks;
     unsigned long long bytes_up, bytes_down;
 } MuxSession;
 
@@ -799,8 +807,27 @@ static void on_control(Mux *m, const char *json) {
     {
         char host[256] = "";
         unsigned dport = 0;
+        /* ⛔ THE KEY IS PASSED WITH ITS QUOTES, AND `relay_parse_uint` NEEDS
+         * THEM. It does `strstr(json, key)` and then walks to the `:`; given
+         * the bare key `port` it finds the opening quote of the VALUE, steps
+         * over four characters and lands on the closing quote rather than the
+         * colon, so it returns -1 and the port reads as absent.
+         *
+         * ⛔ THE CONSEQUENCE WAS THAT A SOCKS FORWARD NEVER TOOK THIS BRANCH AT
+         * ALL. `is_socks` was permanently false, the node started a `dropbear`
+         * instead of dialling the destination, and the forward delivered
+         * nothing while the node logged a perfectly healthy ssh session. The
+         * two existing callers pass `"\"maxFrameBytes\""` and
+         * `"\"maxSessions\""`, so the convention was established and this call
+         * was the odd one out; `relay_parse_string` builds its own quoted key,
+         * which is why the two disagree and why neither used to say so.
+         *
+         * ⛔ IT WAS ONLY VISIBLE BECAUSE THE END-TO-END CASE READS THE NODE'S
+         * OWN LOG. A case that checked a handshake would have passed: the
+         * forward connected, and a connected forward is not a working one. */
         int is_socks = (relay_parse_string(json, "host", host, sizeof host) == 0 &&
-                        relay_parse_uint(json, "port", &dport) == 0 && dport > 0);
+                        relay_parse_uint(json, "\"port\"", &dport) == 0 &&
+                        dport > 0);
         if (is_socks) {
             Transport *out = NULL;
             char derr[512] = "";
@@ -848,9 +875,19 @@ static void on_control(Mux *m, const char *json) {
                 free(s);
                 return;
             }
-            logf("socks forward opened: %s:%u as %.8s", host, dport, id);
+            /* ⛔ THE MODE IS RECORDED ON THE SESSION, BECAUSE THE SESSION
+             * THREAD HAS TO KNOW WHICH PEER IS BEHIND `s->sock`. A `dropbear -i`
+             * child for an ssh session, a dialled destination for a SOCKS one,
+             * and the first version did not say which -- so the SOCKS session
+             * ran the ssh pump against a socket with no child behind it. ⛔ The
+             * observable symptom was the node logging "Child connection from
+             * localhost" and then nothing at all, with the forward dead and
+             * the node still up: the shape this project has shipped twice. */
+            logf("socks forward opened: %s (%s) as %.8s", host,
+                 strncmp(host, "unix://", 7) == 0 ? "socket" : "tcp", id);
             s->sock = tfd;
             s->pid = -1;
+            s->is_socks = 1;
         } else {
         if (start_server(server_cmd_for_sessions(), &s->sock, &s->pid, why,
                          sizeof why) != 0) {
@@ -879,6 +916,13 @@ static void on_control(Mux *m, const char *json) {
 
         char ready[96];
         snprintf(ready, sizeof ready, "{\"type\":\"ready\",\"id\":\"%s\"}", s->id);
+        /* ⛔ LOGGED BECAUSE A FORWARD WAITS ON THIS FRAME, AND A FORWARD THAT
+         * WAITS ON A FRAME NOBODY LOGS IS A HANG WITH NO DIAGNOSIS. The relay
+         * side says "the node did not answer `ready` within 15s" and this says
+         * whether the node sent one, so the two ends of a stuck forward can be
+         * told apart from two logs. */
+        logf("sending %s ready for %.8s",
+             s->is_socks ? "socks" : "operator", s->id);
         if (mux_send_text(m, ready) != 0) {
             /* The relay went away between `open` and `ready`. Mark it and let the
              * thread's teardown reap the server. */
@@ -906,7 +950,20 @@ static void on_control(Mux *m, const char *json) {
             return;
         }
         pthread_detach(th);
-        logf("operator opened session %.8s (ready sent)", s->id);
+        /* ⛔ THE PHRASE "operator opened session" IS KEPT VERBATIM, BECAUSE A GATE
+     * GREPS FOR IT. This line was changed once to say "socks session" or
+     * "operator session" and the e2e's two-concurrent-sessions check --
+     * which measures whether the node redials per session, by counting
+     * registrations against opens -- went red with
+     *
+     *     the node re-registered 1 times for 0 sessions
+     *
+     * ⛔ WHICH NAMES NOTHING. A log line is an INTERFACE: something outside this
+     * file reads it, and changing the wording to be more accurate broke a
+     * measurement rather than improving it. ⛔ The mode is reported in the line
+     * ABOVE it, where a human looks, and the phrase a machine greps for is left
+     * exactly as it was. */
+    logf("operator opened session %.8s (ready sent)", s->id);
         }   /* end of the else: the ordinary session path */
         }
 }

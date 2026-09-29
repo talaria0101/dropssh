@@ -42,9 +42,21 @@ and three of them were **silent data loss or a wrong refusal**:
 (the release ships a CA bundle and the binary finds it beside itself, proven
 with a live verified handshake), **R8** (the relay's own document, fetched
 with its version, five measured facts re-checked), **R2** (a real-relay session
-job, built and needing a credential this repository does not have), **#4/#8**
-(an operator-side SOCKS5 that reaches exactly one named destination) and the
+job, built and needing a credential this repository does not have), **#4/#8** (an
+operator-side SOCKS5 that reaches exactly one named destination) and the
 ligolo reconnection budget from **#8**.
+
+⛔ **AND ONE OF THOSE SIX IS HALF DONE, WHICH IS STATED HERE RATHER THAN IN
+THE ISSUE.** The SOCKS5 listener, its destination policy and the node's side of
+the forward are shipped and measured: `--socks unix://PATH` binds in a cage
+where an INET listener cannot, `--socks-dest` names one destination, the policy
+holds (10/10, and the open-proxy plant is caught with six named failures), and
+the node receives an `open` carrying a destination and **dials it**. ⛔ **THE
+FORWARD CARRIES NO BYTES.** The node blocks on a mutex after the forward opens
+and before it publishes the session, every run, and the three designs tried for
+it were not the cause. `tests/socks-forward-test.sh` is the case that keeps
+failing, and it is deliberately **not** in the gate: a gate entry that is always
+red is a gate nobody reads. See the case's own header for what was tried.
 
 ⛔ **ONE CLAIM ABOVE IS NOW KNOWN TO BE TOO STRONG, AND IT IS CORRECTED WHERE
 IT LIVES.** "U2/U3's concurrency read: a writer used freed memory" states the

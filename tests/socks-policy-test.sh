@@ -58,7 +58,11 @@ body = src[i:end].replace("static int socks_destination_allowed",
 with open(sys.argv[2], "w") as f:
     f.write("/* GENERATED from src/relay.c. Do not edit. */\n")
     f.write("#ifndef SOCKS_POLICY_GEN_H\n#define SOCKS_POLICY_GEN_H\n")
-    f.write("static char socks_host[256] = \"\";\nstatic int socks_port = 0;\n\n")
+    f.write("static char socks_host[256] = \"\";\n"
+            "static int socks_port = 0;\n"
+            "/* pulled in because the policy reads it: whether socks_host is a\n"
+            " * socket PATH rather than a host:port. */\n"
+            "static int socks_dest_is_unix = 0;\n\n")
     f.write(body)
     f.write("\n#endif\n")
 PY

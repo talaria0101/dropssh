@@ -341,45 +341,38 @@ jobs:
           if-no-files-found: warn
 
 
-  # ⛔ R2: A SESSION AGAINST THE REAL RELAY, ON A SCHEDULE, AND IT IS NOT
-  # SKIPPED WHEN THE CREDENTIAL IS ABSENT -- IT SAYS SO.
+  # ⛔ R2: A SESSION AGAINST THE REAL RELAY, ON A SCHEDULE, WITH NO SECRET.
   #
-  # B3, B6 and B9 were all invisible to tests/e2e.sh, because the e2e's local
-  # relay does not multiplex, does not fork and does not enforce a session cap.
-  # They were found by hand, and hand verification is not a gate. This is the
-  # gate: a real relay, a real node, a real ssh client, real bytes.
+  # ⛔ AND THE PREVIOUS VERSION OF THIS JOB WAS WRONG ABOUT ITS OWN BLOCKER.
+  # It said a pair "is per-pair and per-role and cannot be obtained from the
+  # outside", needed three repository secrets, and reported "no credential" as
+  # an outcome a reader should accept. Read against the relay's OWN served
+  # documentation (llms.txt, version 2026-09-28-r12) that is false:
+  # `POST /v1/pair` with an empty body is SELF-SERVICE, the agent mints it
+  # itself, and `expires` is "never later than 72h after creation". R2 never
+  # needed a secret. It needed somebody to read the relay's documentation,
+  # which is the same failure as #8 of dropssh#10: a claim about someone else's
+  # service, made from memory and carried in prose, drifts from the service.
   #
-  # ⛔ IT NEEDS A CREDENTIAL THIS REPOSITORY DOES NOT HAVE, AND THE JOB SAYS SO
-  # INSTEAD OF PASSING QUIETLY. A pair is minted by the relay's POST /v1/pair
-  # and the two tokens are per-pair AND per-role. There is no way to obtain one
-  # from the outside, and `--mint` is the FORWARD path's endpoint: measured on
-  # 2026-09-28 it answers 403 on a reverse upgrade. So the job needs
-  # `RELAY_NODE_TOKEN`, `RELAY_CONNECT_TOKEN` and `RELAY_NAME` as repository
-  # secrets, and a pair expires -- so a secret set months ago is a job that has
-  # been quietly measuring nothing.
+  # So the job mints its own pair on every run and stores nothing: a stored pair
+  # is a credential in a repository, and a pair expires anyway. ⛔ AND THE
+  # RELAY'S VERSION IS FETCHED AND PRINTED, because every assertion in the
+  # script is a claim about a service whose specification can move under us.
   #
-  # The job therefore reports THREE distinct outcomes and never conflates them:
-  #   ran and passed            a real session, real bytes
-  #   ran and FAILED            red, and it is a real fault
-  #   could not run, no secret  yellow, naming what is missing and that a
-  #                             missing credential is not a pass
-  # A job that reports "green" for the third case is worse than no job, because
-  # it is a gate that never gated anything and says it did.
+  # Measured live on 2026-09-28 against r12, from a cage that cannot bind INET:
+  # a pubkey login to uid 0, 270528 bytes byte for byte, and two sessions alive
+  # at once on ONE node socket, with a server whose environment contains no
+  # LD_PRELOAD and which reads its passwd database from a file.
   relay-session:
-    name: a real session against the real relay
+    name: a real session against the real relay, on a pair it mints itself
     runs-on: ubuntu-latest
     needs: [dropssh, dropbear]
-    timeout-minutes: 20
-    # ⛔ continue-on-error FOR THE SAME REASON AS relay-spec: a third party's
-    # deployment is not this repository failing, and a scheduled job that goes
-    # red for reasons outside the tree teaches people to ignore it. The job
-    # still uploads its log, and `::error::` still shows on the run.
+    timeout-minutes: 25
+    # ⛔ continue-on-error, because a third party's deployment is not this
+    # repository failing, and a scheduled job that goes red for reasons outside
+    # the tree teaches people to ignore it. The build info is uploaded either
+    # way and `::error::` still shows on the run.
     continue-on-error: true
-    env:
-      RELAY: tcp.ssh.relay.ajam.dev
-      RELAY_NAME: ${{ secrets.RELAY_NAME }}
-      RELAY_NODE_TOKEN: ${{ secrets.RELAY_NODE_TOKEN }}
-      RELAY_CONNECT_TOKEN: ${{ secrets.RELAY_CONNECT_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -392,49 +385,25 @@ jobs:
           sudo apt-get install -y -qq openssh-client
       - name: build
         run: ./scripts/build.sh --target x86_64-linux-musl --out dist/x86_64-linux-musl
-      - name: check the credential, and name what is missing
-        id: cred
-        run: |
-          set -u
-          missing=""
-          [ -n "${RELAY_NAME:-}" ]          || missing="$missing RELAY_NAME"
-          [ -n "${RELAY_NODE_TOKEN:-}" ]    || missing="$missing RELAY_NODE_TOKEN"
-          [ -n "${RELAY_CONNECT_TOKEN:-}" ] || missing="$missing RELAY_CONNECT_TOKEN"
-          if [ -n "$missing" ]; then
-            echo "::warning title=R2 could not run::No pair is configured, so no"
-            echo "::warning session was carried against $RELAY. Missing:$missing"
-            echo "::warning A pair is minted by the relay's POST /v1/pair and is"
-            echo "::warning per-pair AND per-role, so it cannot be obtained from"
-            echo "::warning the outside. Mint one and set the three repository"
-            echo "::warning secrets. UNTIL THEN THIS JOB MEASURES NOTHING, and a"
-            echo "::warning green tick here is not a pass."
-            echo "missing=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "a pair is configured for $RELAY"
-            echo "missing=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: carry a session, and the bytes both ways
-        if: steps.cred.outputs.missing == 'false'
+      - name: carry a real session, on a pair this run mints
+        env:
+          RELAY: tcp.ssh.relay.ajam.dev
         run: |
           set -uo pipefail
-          D=dist/x86_64-linux-musl
-          ./tests/relay-session.sh "$D" "$RELAY" "$RELAY_NAME" \
-              "$RELAY_NODE_TOKEN" "$RELAY_CONNECT_TOKEN"
-      - name: what the relay says right now, credential or not
+          sh tests/relay-session.sh dist/x86_64-linux-musl "$RELAY"
+      - name: what the relay says right now
         if: always()
         run: |
           set -u
-          # ⛔ THE RELAY'S OWN /health IS FETCHED REGARDLESS, because it is the
-          # one measurement here that needs no credential and it is the one that
-          # says whether the other half of the job is even meaningful.
+          # ⛔ FETCHED REGARDLESS OF THE OUTCOME ABOVE, because it is the one
+          # measurement here that cannot be taken from this repository, and it
+          # says whether the rest was even measuring the thing it names.
           curl -fsSL --max-time 20 "https://$RELAY/health" || \
             echo "could not reach https://$RELAY/health"
-      - name: upload the log
+      - name: upload the build info
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: relay-session
-          path: |
-            relay-session.log
-            dist/x86_64-linux-musl/BUILDINFO
+          path: dist/x86_64-linux-musl/BUILDINFO
           if-no-files-found: warn
