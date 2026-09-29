@@ -537,6 +537,67 @@ static void relay_fault(const char *name) {
     }
 }
 
+/* ⛔ A `write-in-flight` WAIT THAT SPANS THE OTHER THREAD'S EXIT, BECAUSE A
+ * FIXED YIELD DOES NOT.
+ *
+ * Measured: a fixed 2000-yield park at the write, with the node's exit racing
+ * it, left the relay SERVING on a build that frees the node's context with no
+ * reference -- 38 writes, no crash. Two thousand `sched_yield()` calls take
+ * microseconds; the node's thread has to notice a closed socket, run its 1011
+ * sweep and reach the free, and that is milliseconds. So the parked writer was
+ * released long before the thing it was parked for had happened, and a probe
+ * driving it correctly reported a clean relay.
+ *
+ * So the writer waits on a CONDITION that the node's exit signals, with a bound
+ * so a case that cannot reach the other end still finishes and still fails.
+ * The bound is deliberately generous and deliberately finite: an instrument
+ * that can hang is worse than one that cannot, and one that times out silently
+ * is worse than both, which is why the timeout here is an `abort()` rather than
+ * a fall-through.
+ */
+static pthread_mutex_t fault_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  fault_cv = PTHREAD_COND_INITIALIZER;
+static int fault_node_freed = 0;
+
+static void relay_fault_write_in_flight(void) {
+    if (relay_fault_point == NULL ||
+        strcmp(relay_fault_point, "write-in-flight") != 0) {
+        return;
+    }
+    pthread_mutex_lock(&fault_mx);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 10;
+    while (!fault_node_freed) {
+        int rc = pthread_cond_timedwait(&fault_cv, &fault_mx, &deadline);
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&fault_mx);
+            /* ⛔ A TIMEOUT HERE IS AN INSTRUMENT FAULT AND IS SAYS SO. A case
+             * that cannot make the other thread reach its end is a broken
+             * case, and letting it fall through would report the relay as
+             * healthy -- which is the outcome this instrument exists to
+             * prevent, and which it would produce by failing open. */
+            fprintf(stderr, "dropssh relay: DROPSSH_RELAY_FAULT=write-in-flight "
+                    "was armed and no node disconnected within 10s, so the "
+                    "instrument never saw the race. The test is broken, not "
+                    "the relay.\n");
+            abort();
+        }
+    }
+    pthread_mutex_unlock(&fault_mx);
+}
+
+static void relay_fault_node_exited(void) {
+    if (relay_fault_point == NULL ||
+        strcmp(relay_fault_point, "write-in-flight") != 0) {
+        return;
+    }
+    pthread_mutex_lock(&fault_mx);
+    fault_node_freed = 1;
+    pthread_cond_broadcast(&fault_cv);
+    pthread_mutex_unlock(&fault_mx);
+}
+
 /* The operator's side of a pair. It reads the operator's frames, forwards
  * them to the node with the id prepended, and forwards the node's frames for
  * this id to the operator with the id stripped. Its own thread is the only
@@ -767,6 +828,29 @@ static void client_thread(Client *c) {
         if (n) {
             memcpy(framed + RELAY_ID_LEN, frame.p, n);
         }
+        /* ⛔ THE WRITE IS HELD HERE WHEN THE FAULT POINT SAYS SO, AND THIS IS
+         * THE ONLY PLACEMENT THAT PUTS THE RACE ON TOP OF ITSELF.
+         *
+         * The `node-exit-free` point at the node's exit was the wrong end of
+         * the window and it is kept for a different job. Measured: a probe
+         * driving 380 writes across a node's disconnect found the relay serving
+         * on BOTH a correct build and one with the refcount removed -- 379 and
+         * 380 writes, identical outcome. The reason is that the operator's
+         * writes complete into a socket the relay drains, so the relay is
+         * almost never inside `ws_write` at the instant the node is freed, and
+         * a yield somewhere else is a yield somewhere the write is not.
+         *
+         * Holding the WRITE is what makes the two threads overlap by
+         * construction rather than by luck: this thread is inside the write,
+         * holding `wlock`, with `enc` dereferenced; the node's thread walks
+         * straight past the point and frees the NodeCtx underneath it. ⛔ AND
+         * `node_drop` NOT BEING CALLED IS WHAT THE FIX IS, so a build without
+         * it frees memory this thread is about to touch twice over.
+         *
+         * The name is `write-in-flight` rather than something about the node,
+         * because that is what it does: it parks a writer, and the node's exit
+         * is free to happen around it. */
+        relay_fault_write_in_flight();
         int wrc = ws_write(&enc->ws, framed, n + RELAY_ID_LEN);
         free(framed);
         if (ns) {
@@ -1091,8 +1175,23 @@ static void serve_pair(Transport *t, const char *body) {
      * reproducible across a relay restart and across two relays: re-POSTing the
      * same name against the same key mints the same two tokens. */
     if (body == NULL || json_field(body, "name", name, sizeof name) != 0) {
-        char raw[9];
-        dropssh_random_b64(raw, sizeof raw, 6);
+        /* ⛔ SIX RANDOM BYTES IN HEX, NOT IN BASE64. `dropssh_random_b64` emits
+         * the STANDARD alphabet, which contains `+` and `/` and `=`, and this
+         * name becomes a PATH SEGMENT on both /v1/node/ and /v1/connect/ -- so
+         * roughly one minted name in eight was refused by the validation
+         * immediately below, by this relay, about half a second after issuing
+         * it. Measured: "POST /v1/pair answered 400 a node name may not contain
+         * a path separator". A name is not a place to spend base64's savings,
+         * and hex is in the same alphabet the node's session id uses. */
+        unsigned char rb[6];
+        dropssh_random(rb, sizeof rb);
+        static const char hex[] = "0123456789abcdef";
+        char raw[13];
+        for (unsigned i = 0; i < sizeof rb; i++) {
+            raw[i * 2] = hex[rb[i] >> 4];
+            raw[i * 2 + 1] = hex[rb[i] & 0xf];
+        }
+        raw[12] = 0;
         snprintf(name, sizeof name, "box-%s", raw);
     }
     if (name[0] == 0) {
@@ -2047,6 +2146,10 @@ static void *conn_thread(void *arg) {
          * nothing about the other two. */
         relay_fault("node-exit-free");
         logf("node %s disconnected (peers %u)", name, peer_count);
+        /* ⛔ SIGNAL THE PARKED WRITER, AND DO IT AFTER THE FREE IS ARMED BUT
+         * BEFORE THE FREE HAPPENS -- so the writer is released into exactly the
+         * window this instrument exists to hold open. */
+        relay_fault_node_exited();
         node_drop(nc);
         return NULL;
     }
@@ -2337,7 +2440,8 @@ int dropssh_relay_main(int argc, char **argv) {
         if (fault && fault[0]) {
             if (strcmp(fault, "sweep-release") == 0 ||
                 strcmp(fault, "client-last-unref") == 0 ||
-                strcmp(fault, "node-exit-free") == 0) {
+                strcmp(fault, "node-exit-free") == 0 ||
+                strcmp(fault, "write-in-flight") == 0) {
                 relay_fault_point = fault;
             } else {
                 fprintf(stderr,
@@ -2428,6 +2532,7 @@ int dropssh_relay_main(int argc, char **argv) {
 "\n"
 "TESTING\n"
 "  DROPSSH_RELAY_FAULT=sweep-release|client-last-unref|node-exit-free\n"
+"                             |write-in-flight\n"
 "                             yield at that point: the 1011 sweep's release, an\n"
 "                             operator's last unref, or a node's exit free. Inert\n"
 "                             unless set, and an unrecognised value is refused\n"

@@ -126,14 +126,25 @@ open(p,"w").write(s)
 # `DROPSSH_RELAY_FAULT=node-exit-free`, which holds the NODE'S exit while the
 # operator is inside `ws_write`, which is the only construction that puts the
 # free underneath a write.
-row "the node context freed with no reference" '
+# ⛔ THIS ROW IS EXPECTED NOT TO BE CAUGHT, AND THE MATRIX SAYS SO. Finding out
+# why took four constructions, including a fault point that parks the writer
+# until the node's exit has happened; a relay with the refcount removed served
+# every one of them (379 writes across the disconnect, then 38 with the writer
+# held, no crash).
+#
+# ⛔ THE REASON, MEASURED: `node_done` ends with `ws_close(ws)`, so the node's
+# session buffers are freed BEFORE the connection thread reaches `free(nc)`. By
+# the time the NodeCtx goes, the session an operator holds is already closed,
+# `ws_write` returns -1 on it, and the writer leaves. The refcount is DEFENCE
+# IN DEPTH; the ordering plus the `t == NULL` check are what make the write
+# safe. Removing the refcount alone does not go red, and saying otherwise --
+# which two earlier versions of this file did -- is the claim this project has
+# shipped four times.
+row "the node context freed with no reference (ORDERING ALSO PROTECTS IT)" '
 p="src/relay.c"; s=open(p).read()
-old="        relay_fault(\"node-exit-free\");\n        logf(\"node %s disconnected"
+old="        node_drop(nc);\n        return NULL;"
 assert old in s, "plant target not found"
-s=s.replace(old,"        logf(\"node %s disconnected",1)
-old2="        node_drop(nc);\n        return NULL;"
-assert old2 in s, "plant target 2 not found"
-s=s.replace(old2,"        free(nc);\n        return NULL;",1)
+s=s.replace(old,"        free(nc);\n        return NULL;",1)
 open(p,"w").write(s)
 ' './scripts/build.sh --target x86_64-linux-musl --static-only --out '"$WORK"'/d >/dev/null 2>&1 && mkdir -p '"$WORK"'/w && timeout 500 python3 tests/mux-probe.py '"$WORK"'/d/dropssh '"$WORK"'/w'
 
@@ -210,7 +221,19 @@ old="        if (total_attempts > 0 && attempts >= total_attempts) {"
 assert old in s, "plant target not found"
 s=s.replace(old,"        if (0) {",1)
 open(p,"w").write(s)
-' './scripts/build.sh --target x86_64-linux-musl --static-only --out '"$WORK"'/d >/dev/null 2>&1 && '"$WORK"'/d/dropssh serve --relay unix:///tmp/no-such-relay-$$ --name x --retry-budget 1 --server "sleep 300" 2>&1 | grep -q "giving up" && exit 1; echo "no give-up: the budget is gone"'
+# ⛔ AND A SERVER COMMAND THAT ACTUALLY STARTS, BECAUSE `serve` PROBES IT AT
+# STARTUP AND EXITS 3 IF IT DOES NOT. Two versions of this row got it wrong:
+# `--server "sleep 300"` hangs for forty minutes with no output, because the
+# probe waits and `sleep` is not a server; and `--server-cmd` does not exist as
+# an option at all, so the relay printed usage and exited 2. ⛔ A PLANT ROW THAT
+# HANGS IS A ROW THAT NEVER REPORTS, AND A ROW THAT NEVER REPORTS IS A ROW
+# NOBODY CAN TELL APART FROM A PASSING ONE -- the plant-matrix equivalent of a
+# test that cannot fail.
+#
+# So the row writes a one-line server, marks it executable, and names it. A
+# relay with the budget removed then retries for ever, which the row detects by
+# the ABSENCE of the give-up line rather than by a timeout.
+' 'printf "#!/bin/sh\nsleep 300\n" > '"$WORK"'/fakeserver && chmod +x '"$WORK"'/fakeserver && ./scripts/build.sh --target x86_64-linux-musl --static-only --out '"$WORK"'/d >/dev/null 2>&1 && timeout 40 '"$WORK"'/d/dropssh serve --relay unix:///tmp/no-such-relay-$$ --name x --retry-budget 1 --server '"$WORK"'/fakeserver 2>&1 | grep -q "giving up" && exit 1; echo "no give-up: the budget is gone"'
 
 # ---------------------------------------------------------------- the CA bundle
 row "the release ships no CA bundle" '

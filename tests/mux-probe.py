@@ -1399,14 +1399,35 @@ def _probe_body(dropssh, work):
 
         # ---- case 14: AN OPERATOR WRITING WHILE THE NODE DISCONNECTS.
         #
-        # ⛔ THIS IS THE CASE THE NODE REFCOUNT EXISTS FOR, AND IT IS THE ONE
-        # THE PLANT MATRIX FOUND MISSING. `NameSlot.node` was a `WsSession *`
-        # pointing INTO a heap NodeCtx that the node's own connection thread
-        # freed on its way out, while an operator held that pointer and was
-        # about to write through it -- on the data path and on the `!open_ok`
-        # path. `wlock` does not close it: the node's exit path never took
-        # `wlock`, so that lock only ever serialised OPERATORS against each
-        # other.
+        # ⛔ ⛔ AND THE FIRST THING TO SAY IS THAT THIS CASE DOES NOT CATCH THE
+        # DEFECT IT WAS WRITTEN FOR. Four constructions were tried, the last of
+        # them with a fault point that parks the writer until the node's exit
+        # has happened, and a relay with the refcount REMOVED still served
+        # every time -- 379 writes across the disconnect, then 38 with the
+        # writer held, no crash. ⛔ THE REASON, MEASURED AND NOT GUESSED:
+        # `node_done` ends with `ws_close(ws)`, so the node's session buffers
+        # are freed BEFORE the connection thread reaches `free(nc)`. By the
+        # time the NodeCtx goes, the session an operator is holding is already
+        # closed, `ws_write` returns -1 on it, and the operator's thread leaves.
+        # The refcount is therefore DEFENCE IN DEPTH and not the load-bearing
+        # guard; what makes the write safe today is the ordering plus the
+        # `t == NULL` check in the write paths.
+        #
+        # ⛔ SO WHAT IS THIS CASE FOR, AND WHY IT IS HERE ANYWAY. It holds the
+        # two threads on top of each other, which is the only way to OBSERVE
+        # that the ordering is what protects them. Remove either the ordering
+        # or the `t == NULL` check and this case is where it will show. Keeping
+        # it costs one relay and one case run; deleting it because it does not
+        # currently go red would be deleting the instrument that would go red
+        # if the protection were ever moved.
+        #
+        # ⛔ AND THE ORIGINAL DEFECT IS STILL REAL AND STILL DOCUMENTED.
+        # `NameSlot.node` was a `WsSession *` pointing INTO a heap NodeCtx, and
+        # `wlock` never protected it: the node's exit path never took that
+        # lock, so it only ever serialised OPERATORS against each other. What
+        # the measurement above adds is the ORDER in which two independent
+        # things protect it, and that is worth more than the claim that a
+        # refcount is load bearing when it is not.
         #
         # ⛔ AND CASE 4 DOES NOT CATCH IT, WHICH IS WHY IT WAS MISSED. Case 4's
         # operator is attached and IDLE -- it is parked in a read, holding no
@@ -1425,7 +1446,15 @@ def _probe_body(dropssh, work):
                                           int(time.time() * 1000) % 100000))
         uaf_log = open(os.path.join(work, "muxprobe-uaf.log"), "wb")
         uaf_env = dict(os.environ)
-        uaf_env["DROPSSH_RELAY_FAULT"] = "node-exit-free"
+        # ⛔ `write-in-flight`, NOT `node-exit-free`, and the difference is the
+        # whole case. Holding the node's exit only yields a thread that is not
+        # there: measured, a probe driving 380 writes across a disconnect found
+        # the relay serving on a correct build AND on one with the refcount
+        # removed, because the operator's writes complete into a socket the
+        # relay drains and it is almost never inside `ws_write` at that
+        # instant. ⛔ HOLDING THE WRITE PUTS THE TWO THREADS ON TOP OF EACH OTHER
+        # BY CONSTRUCTION INSTEAD OF BY LUCK.
+        uaf_env["DROPSSH_RELAY_FAULT"] = "write-in-flight"
         uaf_relay = subprocess.Popen(
             [dropssh, "relay", "--listen", "unix://" + uaf_sock],
             stdout=subprocess.DEVNULL, stderr=uaf_log, env=uaf_env)
@@ -1535,16 +1564,28 @@ def _probe_body(dropssh, work):
                     if f and f[0] == 0x1 and \
                             parse_json(f[1]).get("type") == "ready":
                         break
+                # ⛔ AND THE WRITER KEEPS ITS SOCKET. The first version closed
+                # the operator immediately after closing the node, which broke
+                # the writer at once -- measured, 379 writes and a
+                # BrokenPipeError -- so there was never a write in flight when
+                # the node was freed, and the case was green on a relay that
+                # frees the node's context with no reference at all. ⛔ THE
+                # ORDERING IS THE WHOLE CASE: the node leaves, and the operator
+                # carries on writing into a socket whose far end is gone, which
+                # is exactly the shape of a session that outlives its node.
                 th = threading.Thread(target=_writer, args=(uop, usid),
                                       daemon=True)
                 th.start()
-                time.sleep(0.4)
-                # ⛔ THE NODE VANISHES WHILE THE WRITER IS STILL WRITING. This
-                # is the ordering, and it is the only one in which the defect
-                # exists: a write in flight across the node's exit path.
+                deadline = time.time() + 5
+                while time.time() < deadline and uaf_state["wrote"] < 5:
+                    time.sleep(0.02)
                 unode.close()
-                uop.close()
+                time.sleep(0.5)
                 uaf_state["stop"] = True
+                try:
+                    uop.close()
+                except Exception:
+                    pass
                 time.sleep(1.5)
                 probe14 = connect_relay(uaf_path)
                 b14 = handshake(probe14, "/v1/node/uaf14-after")
