@@ -2028,6 +2028,24 @@ static void *conn_thread(void *arg) {
             fin->node_dead = 1;
         }
         pthread_mutex_unlock(&tlock);
+        /* ⛔ THE THIRD END OF THE WINDOW THE NODE REFCOUNT COVERS, and the one
+         * a probe could not reach by timing.
+         *
+         * The defect is a write to the node's session in flight while this
+         * thread frees the NodeCtx. A probe can put an operator in a write --
+         * five constructions were tried, and 185 completed writes across the
+         * disconnect still left the relay serving, because the operator's own
+         * socket absorbs the traffic faster than the relay forwards it. So the
+         * other end has to be held here rather than raced: the operator is
+         * inside `ws_write` with the node's `wlock`, this thread yields, and the
+         * free happens underneath it.
+         *
+         * ⛔ AND IT IS NOT WHAT CLOSES U3. U3 is the 1011 sweep, which is the
+         * `sweep-release` point above, and that one was closed by choosing a
+         * different scenario rather than by this hook. Three points are named
+         * because the race has three ends and a guard on one of them says
+         * nothing about the other two. */
+        relay_fault("node-exit-free");
         logf("node %s disconnected (peers %u)", name, peer_count);
         node_drop(nc);
         return NULL;
@@ -2318,7 +2336,8 @@ int dropssh_relay_main(int argc, char **argv) {
         const char *fault = getenv("DROPSSH_RELAY_FAULT");
         if (fault && fault[0]) {
             if (strcmp(fault, "sweep-release") == 0 ||
-                strcmp(fault, "client-last-unref") == 0) {
+                strcmp(fault, "client-last-unref") == 0 ||
+                strcmp(fault, "node-exit-free") == 0) {
                 relay_fault_point = fault;
             } else {
                 fprintf(stderr,
@@ -2408,14 +2427,14 @@ int dropssh_relay_main(int argc, char **argv) {
 "  --status                     print what this process is doing, and exit\n"
 "\n"
 "TESTING\n"
-"  DROPSSH_RELAY_FAULT=sweep-release|client-last-unref\n"
-"                             yield at that point in the 1011 sweep or in an\n"
-"                             operator's last unref. Inert unless set, and an\n"
-"                             unrecognised value is refused rather than\n"
-"                             ignored. It is an instrument for the race the\n"
-"                             sweep has twice crashed on, NOT the reason U3 was\n"
-"                             closed: the case that closed U3 reaches the race\n"
-"                             without it. See docs/relay-issues.md.\n"
+"  DROPSSH_RELAY_FAULT=sweep-release|client-last-unref|node-exit-free\n"
+"                             yield at that point: the 1011 sweep's release, an\n"
+"                             operator's last unref, or a node's exit free. Inert\n"
+"                             unless set, and an unrecognised value is refused\n"
+"                             rather than ignored. These are instruments for the\n"
+"                             races in this file, NOT the reason U3 was closed:\n"
+"                             the case that closed U3 reaches its race without any\n"
+"                             of them. See docs/relay-issues.md.\n"
 "\n"
 "ROLES\n"
 "  a node    -> /v1/node/<name>     dials out and waits to be paired\n"

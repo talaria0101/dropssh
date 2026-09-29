@@ -586,6 +586,34 @@ kill "$nokey_pid" 2>/dev/null
 wait "$nokey_pid" 2>/dev/null
 rm -f "$nosock"
 
+head_ "a server with no LD_PRELOAD authenticates (R9)"
+# ⛔ THIS IS THE E2E CASE R9 ASKED FOR BY NAME: "a server with NO LD_PRELOAD in
+# its environment still authenticates". The cage has no /etc/passwd, so the
+# answer used to be an LD_PRELOAD shim, and the shim is why the server half of
+# a release is dynamic glibc while the client half is static musl and why a musl
+# dropbear cannot be built here at all. `dropbear -Y FILE` reads the database
+# from a file instead.
+#
+# ⛔ IT IS A SEPARATE SCRIPT BECAUSE IT NEEDS ITS OWN WORK DIRECTORY AND ITS OWN
+# KEY PAIR, and because the assertion is about a PROCESS'S ENVIRONMENT rather
+# than about a flag: the server's env has no LD_PRELOAD IN IT, not an unset one.
+if [ -f "$HERE/passwd-file-test.sh" ]; then
+    r9dir="${TMPDIR:-/tmp}/dropssh-r9-$$"
+    rm -rf "$r9dir"; mkdir -p "$r9dir"
+    # ⛔ $TMPDIR, NOT $WORK: the suite's work directory is $HOME on a mount that
+    # will not execute a file created in it, and this case RUNS the server and a
+    # client out of a release directory. Same reason as wsmove-test.
+    if sh "$HERE/passwd-file-test.sh" "$DIST" "$r9dir" "$SHIM" >"$r9dir/out" 2>&1; then
+        ok "a server whose environment contains no LD_PRELOAD authenticated a real ssh client"
+    else
+        bad "a server with no LD_PRELOAD did not authenticate: see below"
+        sed 's/^/      /' "$r9dir/out" 2>/dev/null | head -8
+    fi
+    rm -rf "$r9dir"
+else
+    bad "tests/passwd-file-test.sh is missing, so the no-shim login is unasserted"
+fi
+
 head_ "the release ships a CA bundle and the binary finds it beside itself"
 # ⛔ R7. mbedTLS is fetched and built for the release's own sake and the CA
 # bundle was then DISCARDED, so a clean machine -- which is what a user

@@ -1397,6 +1397,217 @@ def _probe_body(dropssh, work):
                 pass
         failures.extend(sweep_failures)
 
+        # ---- case 14: AN OPERATOR WRITING WHILE THE NODE DISCONNECTS.
+        #
+        # ⛔ THIS IS THE CASE THE NODE REFCOUNT EXISTS FOR, AND IT IS THE ONE
+        # THE PLANT MATRIX FOUND MISSING. `NameSlot.node` was a `WsSession *`
+        # pointing INTO a heap NodeCtx that the node's own connection thread
+        # freed on its way out, while an operator held that pointer and was
+        # about to write through it -- on the data path and on the `!open_ok`
+        # path. `wlock` does not close it: the node's exit path never took
+        # `wlock`, so that lock only ever serialised OPERATORS against each
+        # other.
+        #
+        # ⛔ AND CASE 4 DOES NOT CATCH IT, WHICH IS WHY IT WAS MISSED. Case 4's
+        # operator is attached and IDLE -- it is parked in a read, holding no
+        # reference and about to write nothing -- so the node can be freed with
+        # nothing pointing at it. The window is a WRITE, so the operator has to
+        # be WRITING when the node leaves, and a case that closes the operator
+        # after the node cannot see a defect whose whole shape is the reverse.
+        #
+        # The construction: an operator attached and open, a node that is about
+        # to vanish, and the operator writing CONTINUOUSLY so that a write is
+        # in flight across the node's exit. The assertion is the cheap one a
+        # use-after-free cannot pass: the relay is still serving afterwards.
+        uaf_failures = []
+        uaf_sock = os.path.join(
+            work, "muxuaf-%d-%d.sock" % (os.getpid(),
+                                          int(time.time() * 1000) % 100000))
+        uaf_log = open(os.path.join(work, "muxprobe-uaf.log"), "wb")
+        uaf_env = dict(os.environ)
+        uaf_env["DROPSSH_RELAY_FAULT"] = "node-exit-free"
+        uaf_relay = subprocess.Popen(
+            [dropssh, "relay", "--listen", "unix://" + uaf_sock],
+            stdout=subprocess.DEVNULL, stderr=uaf_log, env=uaf_env)
+        try:
+            for _ in range(200):
+                if os.path.exists(uaf_sock):
+                    break
+                time.sleep(0.05)
+            # ⛔ A LOCAL, NOT `sock_path`. The first version rebound the shared
+            # name to the fault relay's socket, so every case AFTER this one
+            # looked for a socket that had been unlinked -- and the failures
+            # were "the stdin-EOF case could not run: No such file or
+            # directory", naming a case that had nothing to do with what
+            # changed. ⛔ A case must not move the ground the next one stands on.
+            uaf_path = uaf_sock
+            # The operator keeps writing for as long as the relay lives. Each
+            # write goes through the node's socket under wlock, which is the
+            # window the refcount covers.
+            import threading
+            uaf_state = {"stop": False, "wrote": 0, "err": None}
+
+            def _writer(sock, sid):
+                payload = b"UAF-PROBE-" * 64
+                frame = encode_frame(0x2, sid.encode() + payload, True)
+                while not uaf_state["stop"]:
+                    try:
+                        sock.sendall(frame)
+                        uaf_state["wrote"] += 1
+                    except Exception as e:
+                        uaf_state["err"] = e
+                        return
+                    time.sleep(0.001)
+
+            unode = connect_relay(uaf_path)
+            unb = handshake(unode, "/v1/node/uaf14")
+            unr = Reader(unode)
+            unr.buf = unb
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not unr.feed(0.2):
+                    break
+                f = unr.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "hello":
+                    break
+            # ⛔ THE OPERATOR'S UPGRADE IS RETRIED, AND THE RETRY IS THE WAIT.
+            #
+            # Two waits were tried and both were wrong in the same way. Waiting
+            # for the node's `hello` frame does not work, because `node_thread`
+            # writes `hello` as its FIRST statement, before the connection
+            # thread has published `ns->node` under `tlock` -- so a probe can
+            # see `hello` and still be refused with 503, and it was: the log
+            # said "node uaf14 connected" and the operator still got "the node
+            # is not connected". Waiting for the relay's own log line does not
+            # work either, because its stderr is block-buffered when it is a
+            # pipe and the probe cannot see a line that has not been flushed.
+            #
+            # Retrying the UPGRADE is the only wait that observes the thing
+            # being waited for: the relay answers 503 when the node is absent
+            # and 101 when it is there, so a refusal is a definite answer and a
+            # retry is the correct response to it. Both earlier waits inferred
+            # internal state from the outside and then reported their own race
+            # as a product fault -- "the write-across-disconnect case could not
+            # run: 503" is a case that failed to set itself up.
+            uop = None
+            for _ in range(40):
+                try:
+                    cand = connect_relay(uaf_path)
+                    cand.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF,
+                                     4 << 20)
+                    cand.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                                     4 << 20)
+                    uob = handshake(cand, "/v1/connect/uaf14")
+                    uop = cand
+                    break
+                except RuntimeError as e:
+                    if "503" not in str(e):
+                        raise
+                    time.sleep(0.1)
+            if uop is None:
+                raise RuntimeError("the node never became connectable on the "
+                                   "fault relay: 503 after 40 attempts")
+            uor = Reader(uop)
+            uor.buf = uob
+            usid = None
+            deadline = time.time() + 8
+            while time.time() < deadline and usid is None:
+                if not unr.feed(0.2):
+                    break
+                f = unr.take()
+                if f and f[0] == 0x1 and parse_json(f[1]).get("type") == "open":
+                    usid = parse_json(f[1]).get("id")
+            if not usid:
+                uaf_failures.append(
+                    "the operator never reached the node, so case 14 measured "
+                    "nothing about a write across a node's exit")
+            else:
+                unode.sendall(encode_frame(
+                    0x1, json_bytes({"type": "ready", "id": usid}), True))
+                # the operator must see `ready` before it may write at all: the
+                # relay refuses early data, and an early write would be closed
+                # 1008 rather than reaching the write path this case is about
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    if not uor.feed(0.2):
+                        break
+                    f = uor.take()
+                    if f and f[0] == 0x1 and \
+                            parse_json(f[1]).get("type") == "ready":
+                        break
+                th = threading.Thread(target=_writer, args=(uop, usid),
+                                      daemon=True)
+                th.start()
+                time.sleep(0.4)
+                # ⛔ THE NODE VANISHES WHILE THE WRITER IS STILL WRITING. This
+                # is the ordering, and it is the only one in which the defect
+                # exists: a write in flight across the node's exit path.
+                unode.close()
+                uop.close()
+                uaf_state["stop"] = True
+                time.sleep(1.5)
+                probe14 = connect_relay(uaf_path)
+                b14 = handshake(probe14, "/v1/node/uaf14-after")
+                p14 = Reader(probe14)
+                p14.buf = b14
+                alive14 = False
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    if not p14.feed(0.2):
+                        break
+                    f = p14.take()
+                    if f and f[0] == 0x1 and \
+                            parse_json(f[1]).get("type") == "hello":
+                        alive14 = True
+                        break
+                probe14.close()
+                if not alive14:
+                    uaf_failures.append(
+                        "a node that disconnected while an operator was WRITING "
+                        "took the relay down (the operator completed %d writes, "
+                        "err %r). The node's context is freed on its way out "
+                        "and an operator holding a pointer into it is writing "
+                        "through freed memory; `wlock` does not prevent it "
+                        "because the exit path never took that lock"
+                        % (uaf_state["wrote"], uaf_state["err"]))
+        except Exception as e:
+            # ⛔ AND A CRASH OF THE FAULT RELAY IS THE DEFECT, NAMED AS SUCH.
+            # The first version of this branch reported every exception as "the
+            # case could not run", and on a relay with the use-after-free
+            # restored that is a crash -- the relay process is gone, so its
+            # socket cannot be connected and every later step raises ENOENT.
+            # A case that reports a crash as a case that could not set itself up
+            # has hidden the very thing it exists to find, and it did so three
+            # runs in a row with a perfect 3/3.
+            msg = str(e)
+            if "No such file or directory" in msg or \
+               "Connection refused" in msg:
+                uaf_failures.append(
+                    "the fault relay is GONE (%s). A node disconnecting while an "
+                    "operator is writing freed the node's context under a write "
+                    "in flight, and the whole relay -- every other node and "
+                    "operator on it -- went with it. The operator completed %d "
+                    "writes before the crash." % (msg, uaf_state.get("wrote", 0))
+                    if "uaf_state" in dir() else
+                    "the fault relay is GONE (%s), which is the use-after-free "
+                    "this case exists to catch" % msg)
+            else:
+                uaf_failures.append(
+                    "the write-across-disconnect case could not run: %s" % e)
+        finally:
+            try:
+                uaf_relay.terminate()
+                uaf_relay.wait(timeout=5)
+            except Exception:
+                uaf_relay.kill()
+            uaf_log.close()
+            try:
+                os.unlink(uaf_sock)
+            except OSError:
+                pass
+        failures.extend(uaf_failures)
+
+
         # ---- case 11: A LARGE TRANSFER REACHES THE FAR SIDE WITH THE SOCKET
         # OPEN, AND THIS IS A CASE ABOUT A REAL DATA-LOSS DEFECT.
         #

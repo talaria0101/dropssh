@@ -145,6 +145,24 @@ else
     apply_patch dropbear-inetd-pipe-tolerance.patch src/netio.c "ENOTSOCK"
 fi
 
+# R9: --passwd-file. A cage has no /etc/passwd, and the answer used to be an
+# LD_PRELOAD shim -- which is why the server half of a release is dynamic glibc
+# while the client half is static musl, and why a musl dropbear cannot be built
+# here at all. This removes the shim and with it the libc split.
+#
+# ⛔ THE MARKER IS A LINE THE PATCH ADDS, CHECKED IN THE SAME WAY AND FOR THE
+# SAME REASON AS THE ONE ABOVE: the login-shell marker was a string in neither
+# the patch nor the patched source, so the "already applied?" grep never matched
+# and the second build in a clean checkout always failed. This marker is copied
+# out of the patch's own text, and if somebody edits the patch without it, the
+# build says so on the next run rather than failing with a patch error on a
+# tree that is fine.
+if grep -q "a passwd(5) file in place of the system database" "$WORK/src/common-session.c" 2>/dev/null; then
+    log "  passwd file: already present"
+else
+    apply_patch dropbear-passwd-file.patch src/common-session.c "a passwd(5) file in place of the system database"
+fi
+
 # ------------------------------------------------------------------ configure
 # ⚠ STATIC IS THE ONLY LEVER THAT MATTERS AND IT IS A CONFIGURE VALUE.
 # `--disable-static-programs` is NOT an option this configure knows; it warns

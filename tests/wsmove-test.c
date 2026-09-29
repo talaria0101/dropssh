@@ -55,7 +55,20 @@ int tls_post(const char *b, const char *p, const char *b2, const char *h,
 
 static int pass = 0, fail = 0;
 static void ok(const char *what)  { printf("  ok    %s\n", what); pass++; }
-static void bad(const char *what) { printf("  FAIL  %s\n", what); fail++; }
+/* ⛔ VARIADIC, BECAUSE EVERY NEGATIVE CASE NAMES WHAT IT WAS REFUSED FOR. A
+ * fixed-argument `bad()` forces each into a formatted buffer, and a `bad()` call
+ * with a `%s` in it and no argument prints a literal `%s` and looks like a pass.
+ * Making the formatter the only way in removes that. */
+#include <stdarg.h>
+static void bad(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    printf("  FAIL  ");
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+    fail++;
+}
 
 /* A transport that records writes and never blocks, so a write to a live
  * session is observable and a write to an inert one is not. */
@@ -211,7 +224,6 @@ int main(void) {
             bad("the source was not inert, so the source's close freed a "
                 "buffer the destination still owns: this is the aliasing, and "
                 "it is why the two closes above are not both safe");
-            printf("== %d passed, %d failed\n", pass, fail);
             return 1;
         }
         if (ft.writes != before) {
@@ -291,6 +303,86 @@ int main(void) {
         }
     }
 
-    printf("== %d passed, %d failed\n", pass, fail);
+    /* ---- 4. A SESSION WHOSE DECODER FAILED, WHICH IS A DIFFERENT STATE FROM
+     * A CLOSED ONE AND IS THE ONLY ONE THAT NEEDS `ws->closed`.
+     *
+     * ⛔ THIS CASE EXISTS BECAUSE REVIEW 3 PLANTED THE ABSENCE OF `ws->closed`
+     * AND EVERY EARLIER ASSERTION STILL PASSED. That is the finding: the guard
+     * could not fail, and it is the same shape this project has shipped four
+     * times.
+     *
+     * The two write paths test `ws->closed` AND `ws->t == NULL`, and every
+     * state this file built until now had BOTH set, because every one of them
+     * was produced by `ws_close`, which nulls `t`. So `closed` was untested
+     * next to a well-tested pair of braces.
+     *
+     * The states are genuinely different and the difference is load bearing. A
+     * framing error sets `ws->closed = 1` and LEAVES `t` alone, because the
+     * transport is still perfectly usable and the session is over for a
+     * protocol reason rather than a socket one. Remove the flag and a write
+     * onto that session goes out on a socket whose reader has already declared
+     * the framing invalid, which is how a half-decoded stream gets answered
+     * with data the peer cannot parse.
+     *
+     * ⛔ AND A REVIEWER SHOULD KNOW WHAT THIS CASE DOES NOT ESTABLISH, BECAUSE
+     * THE PLANT MATRIX FOUND IT OUT BY FAILING TO CATCH A PLANT.
+     *
+     * `ws_close` no longer setting `ws->closed` is a plant this case does NOT
+     * catch, and the reason is a fact about the product rather than a weakness
+     * in the test: **a WsSession is never re-armed after `ws_close`.** Nothing
+     * calls `ws_client` or `ws_server_peek` on a closed session; the only
+     * transitions are fresh-init and `ws_move`. So "closed, and `t` is live
+     * again" cannot be constructed by any path in the product, which means the
+     * state the plant would create is UNREACHABLE and there is nothing for a
+     * test to observe.
+     *
+     * Two ways to read that, and the second is the one to hold:
+     *
+     *   flattering  "the flag is redundant, drop it"
+     *   correct     the flag and the pointer are TWO representations of one
+     *               fact, set by DIFFERENT paths, and only the combination is
+     *               safe. `ws_close` nulls `t`; a framing error sets `closed`
+     *               and leaves `t`, because the transport is fine and the
+     *               session is over for a protocol reason. Removing `closed`
+     *               makes the second path unsound for a reason no test in
+     *               this repository can currently demonstrate, because
+     *               demonstrating it needs a decoder stub that feeds bytes on
+     *               demand and the first attempt at one took an illegal
+     *               instruction out of the run.
+     *
+     * So the case is here because the flag is load-bearing TODAY and the
+     * assertion that would prove it needs an instrument this file does not
+     * have. Saying so here is the point; a comment claiming the flag is
+     * covered would be the claim this repository has shipped four times. */
+    {
+        WsSession ws;
+        FakeT ft;
+        memset(&ft, 0, sizeof ft);
+        ft.t.write = fake_write;
+        ft.t.close = fake_close;
+        ft.t.read = fake_read;
+        memset(&ws, 0, sizeof ws);
+        ws.t = &ft.t;                 /* ⛔ THE TRANSPORT IS STILL LIVE */
+        ws.closed = 1;                /* ⛔ ONLY THE DECODER FAILED */
+
+        int rc = ws_write(&ws, (const unsigned char *)"x", 1);
+        int rct = ws_write_text(&ws, (const unsigned char *)"y", 1);
+        if (rc != -1 || rct != -1) {
+            bad("a write on a session whose DECODER failed was accepted "
+                "(%d/%d). `closed` and `t == NULL` are two different ways of "
+                "being finished and only this one sets the first without the "
+                "second, so a write here goes out on a socket the reader has "
+                "already declared invalid", rc, rct);
+        } else {
+            ok("a write on a session whose decoder failed is refused, which is "
+               "the only thing `ws->closed` is for");
+        }
+        if (ws.t != &ft.t) {
+            bad("the test itself is wrong: it must leave the transport live, "
+                "or it is re-testing the moved-from case and is asserting "
+                "nothing about `closed`");
+        }
+    }
+
     return fail ? 1 : 0;
 }

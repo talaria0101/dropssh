@@ -1,0 +1,316 @@
+diff --git a/src/common-session.c b/src/common-session.c
+index 6108aba..d0edf54 100644
+--- a/src/common-session.c
++++ b/src/common-session.c
+@@ -653,6 +653,223 @@ const char* get_user_shell() {
+ 		return ses.authstate.pw_shell;
+ 	}
+ }
++
++/* ------------------------------------------------------------------ -Y, a
++ * passwd(5) file in place of the system database.
++ *
++ * WHY THIS IS HERE AND NOT AN LD_PRELOAD SHIM
++ * ============================================
++ * A cage has no /etc/passwd, so this server used to ship with an LD_PRELOAD
++ * shim answering getpwnam() for one user. The shim was a hard constraint on the
++ * whole project rather than a convenience:
++ *
++ *   it needs RTLD_NEXT, which musl resolves to NULL for a libc symbol, so a
++ *     musl dropbear cannot be interposed AT ALL -- not static, not static-pie,
++ *     not with -rdynamic;
++ *   so the server half of a release had to be dynamic glibc while the client
++ *     half was static musl, and an operator who got that wrong shipped a server
++ *     that compiles, links, passes every static check, and logs
++ *
++ *     Login attempt for nonexistent user from localhost:...
++ *
++ *     for a user that is there.
++ *
++ * Reading a FILE removes the shim and with it the libc split, and it is a
++ * function this program already owns rather than a libc function it would have
++ * to interpose.
++ *
++ * WHY IT IS ABOVE fill_passwd AND NOT INSTEAD OF getpwnam
++ * ========================================================
++ * `fill_passwd` is the single point every login passes through: checkusername()
++ * calls it, and every later use of pw_name, pw_uid, pw_gid, pw_dir and
++ * pw_shell reads the session state it fills. One lookup here covers every path,
++ * and a second one elsewhere would be the "two read paths for the same bytes"
++ * shape this codebase keeps warning about.
++ *
++ * ⛔ IT IS IN THIS FILE RATHER THAN A NEW ONE SO THE PATCH TOUCHES NO BUILD
++ * FILE. The dropbear this project builds against is pinned by COMMIT, and
++ * adding a .c file means editing a generated Makefile.in as well as adding a
++ * patch that has to apply to a tree the next `build.sh --full` re-fetches. The
++ * fewer files this touches, the fewer ways the pin and the patch can disagree.
++ */
++#define DROPSSH_PASSWD_FIELDS 7
++#define DROPSSH_PASSWD_FIELD_MAX 256
++
++/* Parse ONE already-read line for `username`.
++ *
++ * ⛔ A BROKEN ENTRY FOR THE NAMED USER IS A REFUSAL AND NOT A MISS, and
++ * `matched` is what keeps those apart. A miss would fall through to the system
++ * database, and a cage asking for a user it named must never be handed
++ * whatever the host happens to have under that name.
++ *
++ * ⛔ AND A LINE THAT IS NOT SEVEN FIELDS IS SKIPPED, NOT REFUSED. A six-field
++ * line is a real possibility in a hand-edited file and is somebody else's
++ * mistake; skipping it gives that person a login failure naming the user, which
++ * is the useful answer, where refusing the whole file would be a refusal they
++ * cannot act on.
++ *
++ * ⛔ AND A uid OR gid THAT DOES NOT PARSE IS A REFUSAL RATHER THAN A DEFAULT.
++ * `atoi` is not used: its answer to a non-numeric string is 0, and a uid of 0
++ * IS root. A typo in a uid must fail the login, not produce a login as a
++ * different user. */
++static int dropssh_passwd_line(const char *line, unsigned int srclen,
++                               const char *username,
++                               struct passwd *out, int *matched,
++                               const char **why) {
++	char buf[1024];
++	/* ⛔ THE LENGTH IS TAKEN FROM THE READER AND NOT FROM strlen, and a line
++	 * with no terminator inside it is refused. `buf_getline` NUL-terminates,
++	 * so this is belt on what the reader already does -- and the alternative,
++	 * strlen on a buffer the reader did not terminate, reads past the end of
++	 * that buffer, which is the kind of thing a pinned dependency's signature
++	 * changes underneath. */
++	if (srclen >= sizeof(buf)) {
++		*why = "the line is longer than 1023 characters";
++		return DROPBEAR_FAILURE;
++	}
++	size_t linelen = 0;
++	while (linelen < srclen && line[linelen] != '\0') { linelen++; }
++	if (linelen != srclen) {
++		*why = "the line was not terminated by the reader";
++		return DROPBEAR_FAILURE;
++	}
++	*matched = 0;
++	/* ⛔ A LINE LONGER THAN THE BUFFER IS MALFORMED AND IS REFUSED RATHER
++	 * THAN COPIED TRUNCATED. A truncated copy parses as a complete line with
++	 * the tail missing, and the shell is the LAST field, so a truncated line
++	 * is a login with a shorter shell than the file says. */
++	if (linelen >= sizeof(buf)) {
++		*why = "the line is longer than 1023 characters";
++		return DROPBEAR_FAILURE;
++	}
++	memcpy(buf, line, linelen + 1);
++
++	const char *c = buf;
++	while (*c == ' ' || *c == '\t') { c++; }
++	if (*c == '\0' || *c == '#') {
++		return DROPBEAR_SUCCESS;
++	}
++
++	const char *field[DROPSSH_PASSWD_FIELDS + 1];
++	int nf = 0;
++	char *w = buf;
++	field[nf++] = w;
++	for (; *w; w++) {
++		if (*w == ':') {
++			if (nf >= DROPSSH_PASSWD_FIELDS) {
++				return DROPBEAR_SUCCESS;   /* more separators than fields */
++			}
++			*w = 0;
++			field[nf++] = w + 1;
++		}
++	}
++	if (nf != DROPSSH_PASSWD_FIELDS) {
++		return DROPBEAR_SUCCESS;
++	}
++	if (strcmp(field[0], username) != 0) {
++		return DROPBEAR_SUCCESS;
++	}
++	*matched = 1;
++
++	unsigned long uid = 0, gid = 0;
++	const char *d;
++	int ok = 1;
++	for (d = field[2]; *d; d++) {
++		if (*d < '0' || *d > '9') { ok = 0; break; }
++		uid = uid * 10 + (unsigned long)(*d - '0');
++		if (uid > 0xFFFFFFFFUL) { ok = 0; break; }
++	}
++	if (!ok || d == field[2]) {
++		*why = "the uid is not a plain decimal number in range";
++		return DROPBEAR_FAILURE;
++	}
++	ok = 1;
++	for (d = field[3]; *d; d++) {
++		if (*d < '0' || *d > '9') { ok = 0; break; }
++		gid = gid * 10 + (unsigned long)(*d - '0');
++		if (gid > 0xFFFFFFFFUL) { ok = 0; break; }
++	}
++	if (!ok || d == field[3]) {
++		*why = "the gid is not a plain decimal number in range";
++		return DROPBEAR_FAILURE;
++	}
++	for (int i = 1; i < DROPSSH_PASSWD_FIELDS; i++) {
++		if (strlen(field[i]) >= DROPSSH_PASSWD_FIELD_MAX) {
++			*why = "a field is longer than 255 characters";
++			return DROPBEAR_FAILURE;
++		}
++	}
++	/* ⛔ "x" IS LEFT ALONE. A shadow marker means "the password is elsewhere"
++	 * and fill_passwd's existing shadow handling deals with it; rewriting it to
++	 * "!!" would lock every account whose file says "x". Password checking is
++	 * not what this option is for. */
++	out->pw_passwd = m_strdup(field[1][0] ? field[1] : "!!");
++	out->pw_name   = m_strdup(field[0]);
++	/* passwd(5): an empty shell means /bin/sh, substituted here so the
++	 * /etc/shells check downstream sees the real value. */
++	out->pw_shell  = field[6][0] ? m_strdup(field[6]) : "/bin/sh";
++	out->pw_gecos  = m_strdup(field[4]);
++	out->pw_dir    = m_strdup(field[5][0] ? field[5] : "/");
++	out->pw_uid    = (uid_t)uid;
++	out->pw_gid    = (gid_t)gid;
++	return DROPBEAR_SUCCESS;
++}
++
++/* ⛔ THE FILE IS READ ON EVERY LOGIN AND IS NOT CACHED. A cage has one user, a
++ * login is a human-speed event, and a cache is a second thing that can hold a
++ * stale copy of a file the operator just edited. */
++static int dropssh_passwdfile_lookup(const char *path, const char *username,
++                                     struct passwd *out, const char **why) {
++	unsigned ulen = strlen(username);
++	if (ulen == 0 || ulen > 128) {
++		*why = "the requested name is empty or longer than 128 characters";
++		return DROPBEAR_FAILURE;
++	}
++	FILE *f = fopen(path, "r");
++	if (f == NULL) {
++		*why = "the file could not be opened, so no user can be named from it";
++		return DROPBEAR_FAILURE;
++	}
++	buffer *line = buf_new(DROPBEAR_MAX_LINE_LENGTH);
++	int rc = DROPBEAR_FAILURE;
++	*why = "the file has no entry for that name";
++	while (buf_getline(line, f) == DROPBEAR_SUCCESS) {
++		int matched = 0;
++		const char *lwhy = "";
++		/* ⛔ THE LINE IS READ THE WAY cli-readconf AND cli-kex READ ONE: with
++		 * `buf->data` and the buffer's length, NOT with `buf_getstring`.
++		 *
++		 * `buf_getstring` reads a 4-BYTE LENGTH PREFIX and a malloced copy --
++		 * it is for the wire format, not for a line in a file. The first
++		 * version of this used it, and the symptom was
++		 *
++		 *     Exit before auth from <localhost:...>: String too long
++		 *
++		 * from `buffer.c:208`, which is `buf_getstring` refusing a length it
++		 * read out of the first four bytes of a passwd LINE. ⛔ THAT ERROR
++		 * NAMED AN OVERLONG BANNER AND NOTHING ELSE, and the real fault was a
++		 * function called with the wrong contract, several steps earlier. It is
++		 * the same shape as every other message in this file that has cost an
++		 * afternoon: a symptom three layers from the cause. */
++		char *rawline = (char *)line->data;
++		unsigned int linelen = line->len;
++		int prc = dropssh_passwd_line(rawline, linelen, username, out,
++				&matched, &lwhy);
++		if (matched) {
++			/* ⛔ A BROKEN ENTRY FOR THE NAMED USER ENDS THE LOOKUP. The next
++			 * line might be well formed for the same user, and picking that
++			 * one would make a malformed entry mean "use the other one"
++			 * rather than "this file is wrong". */
++			*why = lwhy;
++			rc = prc;
++			break;
++		}
++	}
++	buf_free(line);
++	fclose(f);
++	return rc;
++}
++
+ void fill_passwd(const char* username) {
+ 	struct passwd *pw = NULL;
+ 	if (ses.authstate.pw_name)
+@@ -664,6 +881,45 @@ void fill_passwd(const char* username) {
+ 	if (ses.authstate.pw_passwd)
+ 		m_free(ses.authstate.pw_passwd);
+ 
++	/* ⛔ WHEN -Y GAVE A FILE, IT IS THE DATABASE, AND THE SYSTEM ONE IS NOT
++	 * EVEN CONSULTED. A cage asking for a user it named must not be handed
++	 * whatever the host happens to have under that name, and "fall back if the
++	 * file does not answer" is exactly that: it turns a miss in a file the
++	 * operator controls into a hit in a database the operator does not.
++	 *
++	 * A MALFORMED LINE IS A REFUSAL AND NOT A MISS, and it is logged with the
++	 * file and the line number, because the difference is invisible otherwise:
++	 * both are "that login did not work". */
++	if (svr_opts.passwdfile) {
++		const char *why = "";
++		struct passwd dpw;
++		memset(&dpw, 0, sizeof dpw);
++		if (dropssh_passwdfile_lookup(svr_opts.passwdfile, username,
++				&dpw, &why) != DROPBEAR_SUCCESS) {
++			dropbear_log(LOG_WARNING, "passwd file '%s': %s",
++				svr_opts.passwdfile, why);
++			ses.authstate.checkusername_failed = 1;
++			return;
++		}
++		/* ⛔ THE FIVE STRINGS ARE COPIED OUT OF THE STRUCT dropbear owns, and
++		 * the struct is a LOCAL. `fill_passwd`'s contract is that the session
++		 * state owns every string it fills and frees them on the next call, so
++		 * handing it pointers into a local would be a pointer to a dead frame
++		 * by the time anything read them. */
++		ses.authstate.pw_name   = m_strdup(dpw.pw_name);
++		ses.authstate.pw_dir    = m_strdup(dpw.pw_dir);
++		ses.authstate.pw_shell  = m_strdup(dpw.pw_shell);
++		ses.authstate.pw_passwd = m_strdup(dpw.pw_passwd);
++		ses.authstate.pw_uid    = dpw.pw_uid;
++		ses.authstate.pw_gid    = dpw.pw_gid;
++		m_free(dpw.pw_name);
++		m_free(dpw.pw_dir);
++		m_free(dpw.pw_shell);
++		m_free(dpw.pw_passwd);
++		m_free(dpw.pw_gecos);
++		return;
++	}
++
+ 	pw = getpwnam(username);
+ 	if (!pw) {
+ 		return;
+diff --git a/src/runopts.h b/src/runopts.h
+index 166ad4a..8d2d452 100644
+--- a/src/runopts.h
++++ b/src/runopts.h
+@@ -68,6 +68,11 @@ typedef struct svr_runopts {
+ 
+ 	char * bannerfile;
+ 
++	/* -Y, a passwd(5) file to read the user database from, or NULL for the
++	 * system database. See dbutil-passwdfile.c for why this is here
++	 * rather than an LD_PRELOAD shim. */
++	char * passwdfile;
++
+ 	int forkbg;
+ 
+ 	/* ports and addresses are arrays of the portcount
+diff --git a/src/svr-runopts.c b/src/svr-runopts.c
+index 2baec6b..1e034bf 100644
+--- a/src/svr-runopts.c
++++ b/src/svr-runopts.c
+@@ -165,6 +165,7 @@ void svr_getopts(int argc, char ** argv) {
+ 
+ 	/* see printhelp() for options */
+ 	svr_opts.bannerfile = NULL;
++	svr_opts.passwdfile = NULL;
+ 	svr_opts.banner = NULL;
+ 	svr_opts.forced_command = NULL;
+ 	svr_opts.forkbg = 1;
+@@ -245,6 +246,13 @@ void svr_getopts(int argc, char ** argv) {
+ 				case 'R':
+ 					svr_opts.delay_hostkey = 1;
+ 					break;
++				case 'Y':
++					/* -Y FILE: read the passwd database from here. The
++					 * letter is unused upstream; a long name is not
++					 * available because this option table is hand-rolled
++					 * and has no getopt_long. */
++					next = &svr_opts.passwdfile;
++					break;
+ 				case 'F':
+ 					svr_opts.forkbg = 0;
+ 					break;
