@@ -62,7 +62,12 @@ else
         ''|*[!a-zA-Z0-9._-]*) ME_NAME=testuser ;;
     esac
 fi
-printf '%s:x:%s:%s:test:/tmp:/bin/sh\n' "$ME_NAME" "$ME_UID" "$ME_GID" >"$passwd"
+ME_HOME="$W/home"
+mkdir -p "$ME_HOME"
+# The home must be owned by the login user: dropbear refuses a login whose
+# home is owned by someone else and writable ("must be owned by user or
+# root"). /tmp fails that check for any non-root login.
+printf '%s:x:%s:%s:test:%s:/bin/sh\n' "$ME_NAME" "$ME_UID" "$ME_GID" "$ME_HOME" >"$passwd"
 
 export SANDHOME_PASSWD="$passwd"
 LD_PRELOAD="$SHIM" ssh-keygen -q -t ed25519 -N '' -f "$akdir/id" 2>/dev/null

@@ -28,7 +28,11 @@ ME_UID=$(id -u)
 # ⛔ THE LOGIN IS WHOEVER RUNS THE TEST, NOT root. dropbear refuses a login
 # whose uid differs from the server's, so the passwd entry carries the
 # current uid under a fixed name (there is no /etc/passwd to ask for one).
-printf 'testuser:x:%s:%s:test:/tmp:/bin/sh\n' "$ME_UID" "$ME_UID" >"$WORK/passwd"
+ME_HOME="$WORK/home"
+mkdir -p "$ME_HOME"
+# The home must be owned by the login user: dropbear refuses a login whose
+# home is owned by someone else and writable. /tmp fails that for non-root.
+printf 'testuser:x:%s:%s:test:%s:/bin/sh\n' "$ME_UID" "$ME_UID" "$ME_HOME" >"$WORK/passwd"
 LD_PRELOAD="$SHIM" SANDHOME_PASSWD="$WORK/passwd" \
     ssh-keygen -q -t ed25519 -N '' -f "$WORK/k" >/dev/null 2>&1 \
     || fail "ssh-keygen failed"

@@ -81,7 +81,12 @@ else
         ''|*[!a-zA-Z0-9._-]*) ME_NAME=testuser ;;
     esac
 fi
-printf '%s:x:%s:%s:test:/tmp:/bin/sh\n' "$ME_NAME" "$ME_UID" "$ME_GID" >"$WORK/passwd"
+ME_HOME="$WORK/home"
+mkdir -p "$ME_HOME"
+# The home must be owned by the login user: dropbear refuses a login whose
+# home is owned by someone else and writable ("must be owned by user or
+# root"). /tmp fails that check for any non-root login.
+printf '%s:x:%s:%s:test:%s:/bin/sh\n' "$ME_NAME" "$ME_UID" "$ME_GID" "$ME_HOME" >"$WORK/passwd"
 # ⛔ ssh-keygen NEEDS A PASSWD ENTRY FOR ITS OWN UID, and a cage has none, so
 # the CLIENT gets the shim even though the SERVER -- which is the thing under
 # test -- does not. On this sandbox "No user exists for uid 0" is OpenSSH

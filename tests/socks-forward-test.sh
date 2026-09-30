@@ -112,7 +112,9 @@ step "keys, and a passwd file for the node"
 # and key generation fails. e2e names its user the same way.
 ME_UID=$(id -u)
 ME_GID=$(id -g 2>/dev/null || echo "$ME_UID")
-printf 'testuser:x:%s:%s:test:/tmp:/bin/sh\n' "$ME_UID" "$ME_GID" >"$WORK/passwd"
+ME_HOME="$WORK/home"
+mkdir -p "$ME_HOME"
+printf 'testuser:x:%s:%s:test:%s:/bin/sh\n' "$ME_UID" "$ME_GID" "$ME_HOME" >"$WORK/passwd"
 LD_PRELOAD="$D/fakepwd.so" SANDHOME_PASSWD="$WORK/passwd" \
     ssh-keygen -q -t ed25519 -N '' -f "$WORK/k" >/dev/null 2>&1 \
     || fail "ssh-keygen could not make a key even with the shim; install openssh-client"
