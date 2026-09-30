@@ -109,7 +109,25 @@ wait $serve_pid $relay_pid 2>/dev/null
 echo "ssh rc=$rc"
 echo "stdout: $(cat "$W/r9.out" 2>/dev/null)"
 echo "stderr: $(head -c 300 "$W/r9.err" 2>/dev/null)"
-echo "serve:  $(head -c 300 "$W/r9-serve.log" 2>/dev/null | tr '\n' '|')"
+echo "---- serve log, in full (the server names its reason):"
+cat "$W/r9-serve.log" 2>/dev/null
+echo "---- akdir:"
+ls -la "$akdir" 2>/dev/null
+echo "---- passwd entry:"
+cat "$passwd" 2>/dev/null
+echo "---- who runs this:"
+id 2>&1
+echo "---- every component of the ak path (dropbear walks them all):"
+if command -v namei >/dev/null 2>&1; then
+    namei -l "$akdir/authorized_keys" 2>&1
+else
+    p="$akdir/authorized_keys"
+    while [ "$p" != "/" ] && [ -n "$p" ]; do
+        stat -c '%a %u:%g %n' "$p" 2>&1
+        p=$(dirname "$p")
+    done
+    stat -c '%a %u:%g %n' / 2>&1
+fi
 if [ "$rc" = 0 ] && grep -qx R9-LOGIN-OK "$W/r9.out" 2>/dev/null; then
     echo "R9: a server with NO LD_PRELOAD in its environment authenticated a real ssh client"
     exit 0

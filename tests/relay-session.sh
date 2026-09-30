@@ -151,6 +151,18 @@ if [ "$rc" != 0 ]; then
     cat "$WORK/session.err" >&2
     echo "---- the node's log, in full:" >&2
     cat "$WORK/serve.log" >&2
+    echo "---- who runs this:" >&2; id >&2 2>&1
+    echo "---- every component of the ak path:" >&2
+    if command -v namei >/dev/null 2>&1; then
+        namei -l "$WORK/authorized_keys" >&2 2>&1
+    else
+        p="$WORK/authorized_keys"
+        while [ "$p" != "/" ] && [ -n "$p" ]; do
+            stat -c '%a %u:%g %n' "$p" >&2 2>&1
+            p=$(dirname "$p")
+        done
+        stat -c '%a %u:%g %n' / >&2 2>&1
+    fi
     fail "ssh exited $rc. The operator's stderr is the diagnosis and it is the
   only channel this has: \`dropssh connect\` IS the ProxyCommand, so stdout is
   the byte pipe to ssh and everything the client knows arrives on stderr."
