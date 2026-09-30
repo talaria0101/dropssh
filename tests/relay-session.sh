@@ -62,6 +62,26 @@ DROPBEARKEY="$D/dropbearkey"
 step "a host key and a client key"
 "$DROPBEARKEY" -t ed25519 -f "$WORK/hostkey" >/dev/null 2>&1 \
     || fail "dropbearkey could not make a host key; the build is incomplete"
+# ⛔ THE FILE NAMES THE CURRENT UID AND COMES BEFORE KEYGEN, AND THE LOGIN
+# USER IS THE CURRENT USER. The shim REPLACES the passwd database rather
+# than adding to it, so on a host that HAS one (CI runs as uid 1001) a
+# root-only file hides the very user ssh-keygen runs as. And dropbear
+# refuses a login whose uid differs from the server's, so root@ only works
+# where the server runs as root.
+ME_UID=$(id -u)
+ME_GID=$(id -g 2>/dev/null || echo "$ME_UID")
+# `id -un` with no passwd database prints the numeric id AND fails, which
+# poisons a plain `||` fallback with a two-line name ssh rejects. So uid 0
+# is root by rule, and anything else must look like a name to be used.
+if [ "$ME_UID" = 0 ]; then
+    ME_NAME=root
+else
+    ME_NAME=$(id -un 2>/dev/null)
+    case "$ME_NAME" in
+        ''|*[!a-zA-Z0-9._-]*) ME_NAME=testuser ;;
+    esac
+fi
+printf '%s:x:%s:%s:test:/tmp:/bin/sh\n' "$ME_NAME" "$ME_UID" "$ME_GID" >"$WORK/passwd"
 # ⛔ ssh-keygen NEEDS A PASSWD ENTRY FOR ITS OWN UID, and a cage has none, so
 # the CLIENT gets the shim even though the SERVER -- which is the thing under
 # test -- does not. On this sandbox "No user exists for uid 0" is OpenSSH
@@ -70,7 +90,6 @@ step "a host key and a client key"
 LD_PRELOAD="$D/fakepwd.so" SANDHOME_PASSWD="$WORK/passwd" \
     ssh-keygen -q -t ed25519 -N '' -f "$WORK/user_ed25519" >/dev/null 2>&1 \
     || fail "ssh-keygen could not make a client key; with the shim preloaded this is a real fault"
-printf 'root:x:0:0:root:/root:/bin/sh\n' >"$WORK/passwd"
 cp "$WORK/user_ed25519.pub" "$WORK/authorized_keys"
 chmod 600 "$WORK/authorized_keys"
 
@@ -119,7 +138,7 @@ timeout 60 ssh \
     -o "ProxyCommand=$DROPSSH connect --relay $RELAY --name $NAME --token $CONN_TOKEN" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR \
-    -i "$WORK/user_ed25519" "root@$NAME" 'echo RELAY-LOGIN-OK' \
+    -i "$WORK/user_ed25519" "$ME_NAME@$NAME" 'echo RELAY-LOGIN-OK' \
     >"$WORK/session.out" 2>"$WORK/session.err"
 rc=$?
 if [ "$rc" != 0 ]; then
@@ -138,7 +157,7 @@ if ! grep -qx RELAY-LOGIN-OK "$WORK/session.out"; then
   that OPENS and delivers nothing is the shape this project has shipped
   twice, and exit 0 is what made it look like a success."
 fi
-echo "relay-session: a pubkey login to uid 0 completed through $RELAY"
+echo "relay-session: a pubkey login to uid $ME_UID completed through $RELAY"
 
 step "a 270 KB transfer, byte for byte, over the same session"
 # ⛔ 270528 rather than the 270177 of the 2026-09-28 measurement, and that is
@@ -152,7 +171,7 @@ timeout 120 ssh \
     -o "ProxyCommand=$DROPSSH connect --relay $RELAY --name $NAME --token $CONN_TOKEN" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR \
-    -i "$WORK/user_ed25519" "root@$NAME" 'cat' \
+    -i "$WORK/user_ed25519" "$ME_NAME@$NAME" 'cat' \
     <"$WORK/payload" >"$WORK/payload.back" 2>"$WORK/transfer.err"
 rc=$?
 if [ "$rc" != 0 ]; then
@@ -194,7 +213,7 @@ env SANDHOME_PASSWD="$WORK/passwd" LD_PRELOAD="$D/fakepwd.so" \
     -o "ProxyCommand=$DROPSSH connect --relay $RELAY --name $NAME --token $CONN_TOKEN" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR \
-    -i "$WORK/user_ed25519" "root@$NAME" \
+    -i "$WORK/user_ed25519" "$ME_NAME@$NAME" \
     'echo SESSION-A; sleep 8; echo SESSION-A-DONE' >"$W1" 2>"$WORK/s1.err" &
 FIRST=$!
 # The second session starts while the first is inside its sleep, so both are
@@ -205,7 +224,7 @@ timeout 40 ssh \
     -o "ProxyCommand=$DROPSSH connect --relay $RELAY --name $NAME --token $CONN_TOKEN" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR \
-    -i "$WORK/user_ed25519" "root@$NAME" 'echo SESSION-B' >"$W2" 2>"$WORK/s2.err" &
+    -i "$WORK/user_ed25519" "$ME_NAME@$NAME" 'echo SESSION-B' >"$W2" 2>"$WORK/s2.err" &
 SECOND=$!
 wait "$SECOND" 2>/dev/null; second_rc=$?
 wait "$FIRST" 2>/dev/null; first_rc=$?
@@ -238,7 +257,7 @@ fi
 echo "relay-session: the node held one socket"
 
 echo ""
-echo "relay-session: $RELAY (version $ver) carried a real pubkey login to uid 0,"
+echo "relay-session: $RELAY (version $ver) carried a real pubkey login to uid $ME_UID,"
 echo "  a 270 KB transfer byte for byte, and two concurrent sessions on one node"
 echo "  socket -- with a pair this run minted for itself, and a server with no"
 echo "  LD_PRELOAD in its environment."

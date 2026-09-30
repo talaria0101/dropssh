@@ -44,6 +44,26 @@ sock="$W/r9.sock"
 mkdir -p "$akdir"
 rm -f "$hostkey" "$sock"
 
+# The file names the current uid and comes before keygen: the shim REPLACES
+# the passwd database, so a root-only file on a host that has a real one
+# hides the user ssh-keygen runs as (CI runs as uid 1001). The login user is
+# the current user for the same reason dropbear demands: login uid must equal
+# the server's.
+ME_UID=$(id -u)
+ME_GID=$(id -g 2>/dev/null || echo "$ME_UID")
+# `id -un` with no passwd database prints the numeric id AND fails, which
+# poisons a plain `||` fallback with a two-line name ssh rejects. So uid 0
+# is root by rule, and anything else must look like a name to be used.
+if [ "$ME_UID" = 0 ]; then
+    ME_NAME=root
+else
+    ME_NAME=$(id -un 2>/dev/null)
+    case "$ME_NAME" in
+        ''|*[!a-zA-Z0-9._-]*) ME_NAME=testuser ;;
+    esac
+fi
+printf '%s:x:%s:%s:test:/tmp:/bin/sh\n' "$ME_NAME" "$ME_UID" "$ME_GID" >"$passwd"
+
 export SANDHOME_PASSWD="$passwd"
 LD_PRELOAD="$SHIM" ssh-keygen -q -t ed25519 -N '' -f "$akdir/id" 2>/dev/null
 # ⛔ `dropbear -D DIR` looks for the authorized_keys FILE in DIR, not for a
@@ -53,7 +73,7 @@ LD_PRELOAD="$SHIM" ssh-keygen -q -t ed25519 -N '' -f "$akdir/id" 2>/dev/null
 cp "$akdir/id.pub" "$akdir/authorized_keys"
 chmod 600 "$akdir/authorized_keys"
 LD_PRELOAD="$SHIM" "$D/dropbearkey" -t ed25519 -f "$hostkey" >/dev/null 2>&1
-printf 'root:x:0:0:root:/root:/bin/sh\n' >"$passwd"
+cp "$akdir/id.pub" "$akdir/authorized_keys"
 
 "$D/dropssh" relay --listen "unix://$sock" >"$W/r9-relay.log" 2>&1 &
 relay_pid=$!
@@ -74,7 +94,7 @@ LD_PRELOAD="$SHIM" SANDHOME_PASSWD="$passwd" timeout 40 ssh \
     -o "ProxyCommand=$D/dropssh connect --relay unix://$sock --name r9box" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o BatchMode=yes -o ConnectTimeout=15 -o LogLevel=ERROR \
-    -i "$akdir/id" root@r9box 'echo R9-LOGIN-OK' \
+    -i "$akdir/id" "$ME_NAME@r9box" 'echo R9-LOGIN-OK' \
     >"$W/r9.out" 2>"$W/r9.err"
 rc=$?
 

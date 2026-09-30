@@ -106,7 +106,13 @@ while [ $i -lt 50 ]; do [ -S "$DEST" ] && break; sleep 0.1; i=$((i+1)); done
 step "keys, and a passwd file for the node"
 "$DROPBEARKEY" -t ed25519 -f "$WORK/hostkey" >/dev/null 2>&1 \
     || fail "dropbearkey could not make a host key; the build is incomplete"
-printf 'root:x:0:0:root:/root:/bin/sh\n' >"$WORK/passwd"
+# ⛔ THE FILE NAMES THE CURRENT UID, NOT root. The shim REPLACES the passwd
+# database rather than adding to it, so on a host that HAS one (CI runs as
+# uid 1001) a root-only file hides the very user ssh-keygen is running as
+# and key generation fails. e2e names its user the same way.
+ME_UID=$(id -u)
+ME_GID=$(id -g 2>/dev/null || echo "$ME_UID")
+printf 'testuser:x:%s:%s:test:/tmp:/bin/sh\n' "$ME_UID" "$ME_GID" >"$WORK/passwd"
 LD_PRELOAD="$D/fakepwd.so" SANDHOME_PASSWD="$WORK/passwd" \
     ssh-keygen -q -t ed25519 -N '' -f "$WORK/k" >/dev/null 2>&1 \
     || fail "ssh-keygen could not make a key even with the shim; install openssh-client"
