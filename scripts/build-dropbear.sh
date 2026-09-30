@@ -145,6 +145,17 @@ else
     apply_patch dropbear-inetd-pipe-tolerance.patch src/netio.c "ENOTSOCK"
 fi
 
+# AF_UNIX: a server carried on a socketpair has a peer getnameinfo cannot
+# format on musl (glibc prints the path, musl refuses AF_UNIX outright), so a
+# static server exits here before any session. dropssh serve always runs the
+# server on a socketpair, so without this no static server can serve. Harmless
+# where glibc already formats the peer: the branch is never reached there.
+if grep -q "Name the peer plainly" "$WORK/src/netio.c" 2>/dev/null; then
+    log "  unix peer tolerance: already present"
+else
+    apply_patch dropbear-unix-peer-tolerance.patch src/netio.c "Name the peer plainly"
+fi
+
 # R9: --passwd-file. A cage has no /etc/passwd, and the answer used to be an
 # LD_PRELOAD shim -- which is why the server half of a release is dynamic glibc
 # while the client half is static musl, and why a musl dropbear cannot be built

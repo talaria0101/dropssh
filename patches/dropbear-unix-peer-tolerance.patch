@@ -1,0 +1,27 @@
+diff --git a/src/netio.c b/src/netio.c
+index 6249f85..31592a1 100644
+--- a/src/netio.c
++++ b/src/netio.c
+@@ -741,6 +741,22 @@ void getaddrstring(struct sockaddr_storage* addr,
+ 		len = sizeof(struct sockaddr_in6);
+ 	}
+ #endif
++#endif
++#ifdef HAVE_STRUCT_SOCKADDR_STORAGE_SS_FAMILY
++	/* A peer on a unix socket has no address for getnameinfo to format:
++	 * musl refuses AF_UNIX outright while glibc prints the path, so a
++	 * server carried on a socketpair -- which is how dropssh serve always
++	 * runs it -- exits here on musl and only on musl, with "Failed lookup:
++	 * Unrecognized address family". Name the peer plainly instead. */
++	if (addr->ss_family == AF_UNIX) {
++		if (ret_host) {
++			*ret_host = m_strdup("unix");
++		}
++		if (ret_port) {
++			*ret_port = m_strdup("0");
++		}
++		return;
++	}
+ #endif
+ 
+ 	ret = getnameinfo((struct sockaddr*)addr, len, host, sizeof(host)-1, 

@@ -123,12 +123,21 @@ plant-matrix rows that cannot go red are exactly what one would answer.
   is the opposite of what the B-list says.
 
 **4. A static dropbear.** R9 removed the *requirement* for the shim;
-`build.sh` still builds dynamic glibc.
+`build.sh` still builds dynamic glibc. UPDATE 2026-09-30: a static-pie musl
+server is proven feasible (`tests/static-server-test.sh`, real login, no
+shim) with one new patch (unix-peer tolerance, wired into the builder).
+What remains is builder support for producing it, scale proof, CI, and the
+release decision. NEXT SESSION (see below).
 
 **5. The case-3 close-code flake is unrooted.** 1/100 pre-change, 3/100 after.
 Pre-existing. Never investigated.
 
-**6. `--retry-budget` measured only against an absent relay.**
+**6. `--retry-budget` measured only against an absent relay.** UPDATE
+2026-09-30: measured against a present-but-stalling relay with
+`tests/slow-relay-probe.py`. The node pings unanswered x3, declares the relay
+dead at ~60 s, tears down, retries, exits 4 with the give-up line. Doing that
+measurement found and fixed a teardown double-close in `serve.c` (`ws_close`
+frees the transport; `t->close(t)` after it is use-after-free).**
 
 ---
 
@@ -231,3 +240,39 @@ What is still not done, unchanged: the ladder's third line (cross-relay
 session migration), a sanitizer run (no libasan/libtsan on this machine
 either, re-confirmed), a static dropbear, and `--retry-budget` against a
 present-but-slow relay. The case-3 flake is sampled, not rooted.
+
+---
+
+## Next session: publish test static binaries
+
+The static server is proven feasible but nothing produces or ships it. Work,
+in order:
+
+1. Builder support: teach `build-dropbear.sh` a static musl path (`STATIC=1`,
+   assert static linkage, keep refusing dynamic musl). The unix-peer patch is
+   already wired for all targets.
+2. Scale proof: full e2e plus the live relay session with the static server
+   swapped in (one login is proven; the transfer, concurrency and all 36 cases
+   are not). `tests/static-server-test.sh` is the single-case instrument.
+3. CI: static-server build plus prove job in the matrix.
+4. Docs: the default stays dynamic glibc until this lands; `decisions-tls.md`
+   carries the measurement.
+5. Publish: tag a test pre-release with the static server inside. Needs a
+   version string from the operator.
+
+## Session after next: the remainder
+
+* Case-3 flake root cause: sampled 0/100 twice, then a 500-run died around
+  iter 293 with refused connections. Prime suspect is relay thread
+  accumulation under churn; rerun with thread sampling to confirm, then fix.
+  (`tests/case3-loop.py`.)
+* Ladder's third line: cross-relay session migration. Blocked on a mechanism
+  decision first (tokens are key-bound by design, so migration means re-pair
+  plus id remap, not token sharing). No third party needed: two local relays
+  with different keys are the fixture.
+* Static as the default: release decision, operator's call. Proof exists;
+  packaging, CI and docs changes do not.
+* Release tag for the SOCKS work and the static test binaries: operator's
+  version string, then push and publish.
+* Issue closes with proof: #4 (SOCKS capability fully delivered) is ready to
+  close with the gate log; the rest need maintainer verdict calls.

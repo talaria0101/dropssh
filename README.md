@@ -16,8 +16,10 @@ Two binaries, built for two libcs, on purpose:
 | `dropbear` | **dynamic glibc** | the passwd shim is an `LD_PRELOAD`, and musl's `RTLD_NEXT` resolves to `NULL` for a libc symbol, so a musl dropbear cannot be interposed at all. |
 
 The full measurement behind that split is in
-[`docs/decisions-tls.md`](docs/decisions-tls.md). It is the opposite of the
-obvious guess, and getting it wrong ships a server that cannot log anyone in.
+[`docs/decisions-tls.md`](docs/decisions-tls.md). The split is the default,
+not a constraint: with `dropbear -Y` (no shim) plus the unix-peer patch, a
+static-pie musl server serves a real login, measured 2026-09-30. Getting the
+default wrong the old way ships a server that cannot log anyone in.
 
 ## Get a shell
 

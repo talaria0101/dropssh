@@ -1224,15 +1224,22 @@ int dropssh_serve(dropssh_opts *o) {
         pthread_t reader;
         if (pthread_create(&reader, NULL, mux_reader, &m) != 0) {
             logf("could not start the node's reader thread");
+            /* ws_close owns the transport from here: ws_client handed it
+             * over, so closing it again would be a double close of freed
+             * memory (measured: heap-use-after-free under ASan on the
+             * stall-teardown path, 2026-09-30). */
             ws_close(&ws);
-            t->close(t);
+            t = NULL;
             goto wait_and_retry;
         }
         pthread_join(reader, NULL);
         pthread_mutex_destroy(&m.list_lock);
         pthread_mutex_destroy(&m.wlock);
+        /* The transport went with ws_close: a second close would read the
+         * freed Transport (serve.c:1235, heap-use-after-free, 2026-09-30).
+         * NULLing t is what keeps the retry path below from touching it. */
         ws_close(&ws);
-        t->close(t);
+        t = NULL;
         if (o->once) {
             return sessions > 0 ? 0 : 1;
         }

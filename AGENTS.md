@@ -45,7 +45,7 @@ This is the first thing to understand and the easiest to get wrong.
 | binary | libc | why |
 | --- | --- | --- |
 | `dropssh` | **static musl** | the one you download and run. A cage has no libc to link against. |
-| `dropbear` | **dynamic glibc** | the passwd shim is an `LD_PRELOAD` and needs `RTLD_NEXT`, which musl resolves to `NULL` for a libc symbol, so a musl dropbear cannot be interposed at all. Not static, not static-pie, and not with `-rdynamic`. ⛔ **`dropbear -Y FILE` now removes the REQUIREMENT for the shim, so this row is a build choice and not a constraint** -- a server with no `LD_PRELOAD` in its environment authenticates, measured in the gate. What has not been done is building a static server; the default is unchanged. |
+| `dropbear` | **dynamic glibc** | the passwd shim is an `LD_PRELOAD` and needs `RTLD_NEXT`, which musl resolves to `NULL` for a libc symbol, so a musl dropbear cannot be interposed at all. Not static, not static-pie, and not with `-rdynamic`. ⛔ **`dropbear -Y FILE` now removes the REQUIREMENT for the shim, so this row is a build choice and not a constraint** -- a server with no `LD_PRELOAD` in its environment authenticates, measured in the gate. A static server is proven feasible too (2026-09-30: static-pie musl serves a real login with `-Y`, no shim, plus the unix-peer patch); the default is unchanged. |
 
 Getting that wrong ships a server that compiles, links, passes every static
 check, and logs `Login attempt for nonexistent user` for `root`, which is
@@ -181,7 +181,7 @@ src/            the C.
                 util.c       randomness, base64, sha1 for the ws accept
                 buffer.c     the one growable buffer every layer moves bytes through
 scripts/        build.sh, build-dropbear.sh, build-mbedtls.sh
-patches/        three diffs against dropbear; no dropbear code is copied
+patches/        four diffs against dropbear; no dropbear code is copied
 tests/e2e.sh    the gate
 tests/mux-probe.py
                 the relay's framing rules as a gate: the prepend/strip
@@ -224,6 +224,15 @@ tests/socks-wait-probe.py
                 a node that never answers `ready` gets a bounded SOCKS
                 refusal (20 s), not a hang. Manual check for the relay's
                 ready wait, not in the gate: it takes 20 s by construction.
+tests/slow-relay-probe.py
+                `--retry-budget` against a PRESENT but stalling relay: the
+                node pings unanswered x3, declares the relay dead at ~60 s,
+                tears down, retries, exits 4. Manual: ~100 s a run, and it
+                found the serve-teardown double-close (fixed 2026-09-30).
+tests/static-server-test.sh
+                a static-pie musl server serves a real login with `-Y` and no
+                shim in its environment. Manual: needs a static server build,
+                which the builder does not produce yet.
 docs/           the measurements, which are the real documentation
 vendor/         does not exist, on purpose: inputs are fetched and pinned
 ```

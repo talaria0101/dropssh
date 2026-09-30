@@ -1009,6 +1009,11 @@ it.
   the two "unreachable" rows in review 3 are exactly the questions a sanitizer
   would answer. ⛔ The next machine that has one should run this suite under it
   before anything else is changed in `relay.c`.
+
+  **Update 2026-09-30:** run on this machine after all. Clang ships its own
+  runtimes, so the suite ran under ASan+UBSan (e2e 36/36, mux-probe 14/14,
+  SOCKS, wsmove, token) and under TSan (mux-probe 14/14, SOCKS): no
+  findings. LSan stayed off (ptrace). See the ten-review section.
 * ⛔ **The case-3 close-code flake is still unrooted.** 1/100 pre-change, 3/100
   after. It is pre-existing, it is not from this work, and three samples is not
   enough to call the rate unchanged.
@@ -1342,8 +1347,18 @@ section. Historical reviews keep their dates; corrections are dated in place.
 * Cross-relay session migration: unbuilt. Proven only between two of ours
   sharing a key; against the ajam relay it cannot work (different key), and
   no design is adopted here.
-* A sanitizer: still none on this machine. No libasan/libtsan anywhere,
-  `zig cc -fsanitize` links nothing. Reviews 1–3 are traces.
+* A sanitizer: DONE 2026-09-30, with one stated limit. Clang on this
+  machine ships its own runtimes (`asan`, `tsan` under its resource dir),
+  so `zig cc` lacking them was never the blocker: dropssh builds clean with
+  `clang -fsanitize=address,undefined` and `-fsanitize=thread` (glibc host
+  build, test-only). Measured: wsmove-test and token-test clean under
+  ASan+UBSan; `mux-probe.py` 14/14 clean under ASan+UBSan AND under TSan
+  (the 1011 sweep with fault injection, the 300 KB transfer, concurrent
+  sessions — the exact areas traces could not settle); SOCKS forward clean
+  under both; **full e2e 36/36 exit 0 under ASan+UBSan**. No findings.
+  Limit: LeakSanitizer is off (`detect_leaks=0`) because it refuses under
+  this sandbox's ptrace restrictions, so leak coverage is absent and the
+  Transport-husk class was caught by review 1, not by instrument.
 * A static dropbear: unbuilt. R9 removed the requirement, not the build
   choice; nobody has measured a static server.
 * `--retry-budget` against a present-but-slow relay: measured only against
@@ -1387,3 +1402,75 @@ were dead after the rewrite (no callers) and the design comment above them
 described the third, failed shape as current. Both removed/rewritten; the
 comment now names all three failed shapes and the rule each broke. Nothing
 else found: no second caller of the removed code, no doc referencing it.
+
+---
+
+# Supplement, 2026-09-30: stall teardown, static server, slow relay
+
+Three instruments built after the ten reviews above, and what each found.
+
+## A use-after-free in the serve teardown, found by a stalling relay
+
+`tests/slow-relay-probe.py` measures `--retry-budget` against a PRESENT but
+stalling relay (the gate only covers an absent one). First run: instead of
+exiting 4, the node died with SIGSEGV after ~60 s. ASan named it:
+heap-use-after-free READ in `dropssh_serve` (`src/serve.c`, the `t->close(t)`
+after the reader join), freed by `ws_close` (`src/ws.c`, which closes and
+frees the transport it was handed). The full chain: the fixture stalls, the
+node's own ping policy (3 unanswered x 20 s) declares the relay dead at ~60 s
+— that half works as designed — then teardown closes the transport twice.
+
+Why the gate never saw it: e2e kills the node with a signal, so the relay-end
+teardown path never runs there; a stall is the only shape that reaches it, and
+no fixture produced one. Fixed by NULLing `t` after `ws_close`, both sites
+(the reader-create-failure path had the same double close). After the fix the
+node tears down cleanly, retries consume the budget, and it reaches the
+give-up line and exits 4 (musl measured end to end; ASan reached the same
+give-up line with no abort). e2e re-run 36/36.
+
+The `upgrade-stall` mode (accepted socket, never answers the upgrade) was
+measured too: the 20 s upgrade wait times out per attempt and the budget
+counts retries after the first dial. That semantic is recorded in the probe's
+header, not judged.
+
+## A static server serves (experiment, not the default)
+
+`dropbear -Y` removed the shim requirement, which removed the only reason the
+server had to be dynamic glibc. Built static-pie musl (`STATIC=1`, setgroups
+and passwd-file patches): it died before any session with `Failed lookup:
+Unrecognized address family`, because musl `getnameinfo` refuses AF_UNIX and
+`serve` always runs the server on a socketpair. New fourth patch
+(`patches/dropbear-unix-peer-tolerance.patch`) names a unix peer plainly;
+wired into `build-dropbear.sh` for all targets, inert where glibc already
+formats the peer. `tests/static-server-test.sh` proves a real pubkey login
+with no shim in the server's environment. Full story in
+`docs/decisions-tls.md`. The default build is unchanged; switching it is a
+release decision in HANDOFF's next-session list.
+
+## Sanitizer, finished
+
+Clang on this machine ships its own runtimes, so `zig cc` lacking them was
+never the blocker. ASan+UBSan: e2e 36/36, mux-probe 14/14, SOCKS forward,
+wsmove, token — clean. TSan: mux-probe 14/14 (including the race-injected
+1011 cases), SOCKS — clean. LeakSanitizer stays off: it refuses under this
+sandbox's ptrace restrictions, so leak coverage is absent and the
+Transport-husk class was caught by review, not by instrument.
+
+## Two reviews before pushing to main, 2026-09-30
+
+Review A, docs consistency: every live claim touched this session rechecked
+against code or captured output. One claim softened (ASan stall run reached
+the give-up line with no abort; exit code 4 end to end measured on musl).
+Rest verified: R9 gated, static login exit 0 twice, builder applies the new
+patch on a pristine pin, default unchanged, four patches on disk, new test
+files present, e2e still 36 with no gate changes since the count was written.
+
+Review B, second pass on the uncommitted diff: `t` is declared fresh NULL at
+the top of each retry iteration, so the NULL-after-close cannot leak anywhere
+and the retry block never touches it — the fix is airtight, not merely
+correct on the observed path. The builder marker matches a line the patch
+adds verbatim. The experiment tree (static musl build, MARK probes) lives
+under `$TMPDIR`, outside the repo; nothing generated is committed (`dist/`,
+`.deps` ignored, no credentials). No missing pieces: plant row, loop, probes
+and SOCKS work are already committed; this push carries the UAF fix, the
+fourth patch plus its builder wiring, two instruments, and the doc updates.

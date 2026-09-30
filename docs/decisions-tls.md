@@ -179,17 +179,19 @@ Two consequences, both of which are the opposite of the obvious guess:
    that must be dynamically linked to be useful at all.
 
 The alternative, which was considered and measured against: make dropbear not
-need the shim, by giving it a passwd database through the filesystem. A cage
-has no writable `/etc`, so that means either a `--passwd-file` option patched
-into dropbear or an environment variable it reads at startup. That is a better
-design and it is the obvious next step, because it removes the LD_PRELOAD
-dependency entirely. It is not what this release does, and the reason is
-recorded rather than hidden: the patch is not written yet, so the release
-ships the shim, and the shim works only against a glibc dropbear.
+need the shim, by giving it a passwd database through the filesystem. That is
+`dropbear -Y FILE`, shipped as R9: a server with no `LD_PRELOAD` in its
+environment authenticates, measured in the gate. The release still ships the
+shim and still builds the server dynamic glibc by default; what changed is
+that the split is now a build choice rather than a constraint. (This paragraph
+once said the patch was not written yet. It is written, shipped, and gated.)
 
-## A musl dropbear is not buildable, and zig 0.13 cannot do glibc riscv64
+## A dynamic musl dropbear is not buildable; a static one serves (2026-09-30)
 
 Both measured 2026-09-27 in CI, and both are why the release matrix is split.
+The heading above once said a musl dropbear is not buildable at all. That was
+true while the server needed the shim, and it is still true of a DYNAMIC musl
+server. It is no longer true of a STATIC one, measured 2026-09-30:
 
 **musl dropbear.** The shim needs a dynamically linked server, and under
 `zig cc` a musl binary is dynamic only with `-rdynamic`:
@@ -268,3 +270,26 @@ distinguishes refused from broken. Two more defects were in the same case: a
 which reports "Binary file matches" and exits 0; and an ssh user that the test
 harness computed and then never passed to `ssh`, so every login was attempted as
 root.
+
+---
+
+## 2026-09-30: a static-pie musl server serves a real login
+
+Built with `zig cc -target x86_64-linux-musl`, `STATIC=1`, the setgroups and
+passwd-file patches, and one new patch, `patches/dropbear-unix-peer-tolerance.patch`:
+
+* musl `getnameinfo` refuses AF_UNIX outright while glibc prints the path.
+  `serve` always runs the server on a socketpair, so a static server exited
+  in `getaddrstring` before any session, with `Failed lookup: Unrecognized
+  address family`. The patch names a unix peer plainly (`unix:0`); it is wired
+  into `build-dropbear.sh` for all targets and is inert where glibc already
+  formats the peer.
+* Measured with `tests/static-server-test.sh`: a real pubkey login through a
+  local relay as the running uid, server environment with no shim, exit 0.
+
+What this does not change: the default build stays dynamic glibc, the builder
+still refuses a musl target (a static server is a flag that does not exist
+yet, not a target the matrix builds), and static-pie is still refused as a
+*silent* artefact — the difference is that with `-Y` and the peer patch it is
+no longer silent about the wrong thing. Switching the default is a release
+decision recorded in HANDOFF, not a follow-up measurement.
