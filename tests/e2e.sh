@@ -613,7 +613,7 @@ head_ "a server with no LD_PRELOAD authenticates (R9)"
 # KEY PAIR, and because the assertion is about a PROCESS'S ENVIRONMENT rather
 # than about a flag: the server's env has no LD_PRELOAD IN IT, not an unset one.
 if [ -f "$HERE/passwd-file-test.sh" ]; then
-    r9dir="${TMPDIR:-/tmp}/dropssh-r9-$$"
+    r9dir="$WORK/r9-$$"
     rm -rf "$r9dir"; mkdir -p "$r9dir"
     # ⛔ $TMPDIR, NOT $WORK: the suite's work directory is $HOME on a mount that
     # will not execute a file created in it, and this case RUNS the server and a

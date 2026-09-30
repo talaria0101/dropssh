@@ -22,7 +22,16 @@ D="${1:?usage: relay-session.sh DISTDIR [RELAY]}"
 RELAY="${2:-tcp.ssh.relay.ajam.dev}"
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/relay-session.XXXXXX")
+# Work lives under the login user's own home when there is one, else under
+# the checkout: dropbear walks every component of the authorized_keys path
+# and refuses group/other-writable ones, so a work dir under a loose /tmp
+# fails every non-root login (measured on CI). Same rule as tests/e2e.sh.
+if [ -n "${HOME:-}" ] && [ "$HOME" != "/" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
+    WORK_BASE="$HOME"
+else
+    WORK_BASE="$(pwd)"
+fi
+WORK=$(mktemp -d "$WORK_BASE/relay-session.XXXXXX")
 chmod 700 "$WORK"
 trap 'rm -rf "$WORK"' EXIT
 

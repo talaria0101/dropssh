@@ -141,6 +141,17 @@ frees the transport; `t->close(t)` after it is use-after-free).**
 
 ## Things a next session will trip over, in the order they will
 
+* ⛔ **Test work dirs must live where dropbear's permission walk passes.**
+  `checkpubkeyperms` walks EVERY component of the authorized_keys path up to
+  the home dir or `/`, refusing group/other-writable ones. A work dir under a
+  loose `/tmp` (mode 1777) fails every non-root login with `Permission denied
+  (publickey)` and a server line naming `/tmp` -- while e2e session1 passes
+  on the same runner, because e2e works under `$HOME`. Measured on CI
+  2026-09-30 across three red cycles that blamed the shim, the file content,
+  and the home entry in turn. All login tests base their work dir at `$HOME`
+  when writable, else the checkout. A root-only failure that passes as root
+  is this until proven otherwise.
+
 * ⛔ **`/tmp` is cleared between turns.** Every build artefact and every
   `mktemp` work dir disappears. Rebuild before concluding anything from a
   previous turn's `/tmp`.

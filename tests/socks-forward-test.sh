@@ -61,7 +61,16 @@ set -u
 
 D="${1:?usage: socks-forward-test.sh DISTDIR}"
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/socks-forward.XXXXXX")
+# Work lives under the login user's own home when there is one, else under
+# the checkout: dropbear walks every component of the authorized_keys path
+# and refuses group/other-writable ones, so a work dir under a loose /tmp
+# fails every non-root login (measured on CI). Same rule as tests/e2e.sh.
+if [ -n "${HOME:-}" ] && [ "$HOME" != "/" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
+    WORK_BASE="$HOME"
+else
+    WORK_BASE="$(pwd)"
+fi
+WORK=$(mktemp -d "$WORK_BASE/socks-forward.XXXXXX")
 [ -n "${KEEP:-}" ] && echo "socks-forward: work kept at $WORK"
 chmod 700 "$WORK"
 
