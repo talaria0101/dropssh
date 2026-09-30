@@ -252,37 +252,29 @@ present-but-slow relay. The case-3 flake is sampled, not rooted.
 
 ---
 
-## Next session: publish test static binaries -- DONE 2026-09-30 except the tag
+## Next session: publish test static binaries -- DONE 2026-09-30 (v0.2.3)
 
-1. Builder support: DONE. `build-dropbear.sh` builds static musl by default
-   (`STATIC=1`, linkage asserted), dynamic glibc on explicit request; shim
-   built for the GNU sibling when it compiles, skipped with a note otherwise.
-2. Scale proof: DONE for x86_64 (full e2e 36/36 on the default dist); all six
-   arch servers compile. Live-relay session against the static server: 2/3
-   green 2026-09-30. The first run failed (1003 unknown session id, ssh 255)
-   inside the relay's own redeploy window (r12 to 2026-09-30-r1, same hour);
-   two reruns with identical artefacts passed, and the re-fetched spec holds
-   5/5 with additive-only changes (capacity accounting, reason truncation
-   refined). No client change indicated; treat run 1 as deploy churn unless
-   it recurs.
-3. CI: DONE in-tree (matrix builds six static servers, glibc-optout job,
-   flipped linkage asserts, updated release notes). Runs on push.
-4. Docs: DONE (this file, decisions-tls, AGENTS, README, open-issues, CI text).
-5. Publish: tag v0.2.0 and push the tag. The release job publishes from it.
+1. Builder support: DONE. Static musl default with linkage asserts; dynamic
+   glibc on explicit request; shim from the GNU sibling or skipped with note.
+2. Scale proof: DONE (e2e 36/36 on the default dist, ASan 36/36, live relay
+   2/3 with the one failure inside the relay's redeploy window).
+3. CI: DONE and green (six static servers, glibc-optout, flipped asserts).
+4. Docs: DONE.
+5. Publish: DONE. v0.2.3 tagged and released; tarball verified static-pie
+   server + static client on download.
 
 ## Session after next: the remainder
 
-* Case-3 flake root cause: sampled 0/100 twice, then a 500-run died around
-  iter 293 with refused connections. Prime suspect is relay thread
-  accumulation under churn; rerun with thread sampling to confirm, then fix.
+* Case-3 flake: ROOTED 2026-09-30 (probe raced its own OP-BARE against the
+  expected close; cases expecting a node close send nothing after the fault).
+  The 500-run relay death around iter 293 is still unexplained -- prime
+  suspect thread accumulation; rerun with sampling if it ever matters again.
   (`tests/case3-loop.py`.)
 * Ladder's third line: cross-relay session migration. Blocked on a mechanism
   decision first (tokens are key-bound by design, so migration means re-pair
   plus id remap, not token sharing). No third party needed: two local relays
   with different keys are the fixture.
-* Static as the default: release decision, operator's call. Proof exists;
-  packaging, CI and docs changes do not.
-* Release tag for the SOCKS work and the static test binaries: operator's
-  version string, then push and publish.
-* Issue closes with proof: #4 (SOCKS capability fully delivered) is ready to
-  close with the gate log; the rest need maintainer verdict calls.
+* Static as the default: DONE 2026-09-30, released in v0.2.3.
+* Release tag: DONE (v0.2.3, published with a verified static tarball).
+* Issue closes with proof: #4 closed 2026-09-30 with the gate log; the rest
+  need maintainer verdict calls.
