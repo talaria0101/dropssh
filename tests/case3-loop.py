@@ -40,7 +40,8 @@ try:
         # per iter would exhaust the table at 32 and measure the cap.
         try:
             s = mux.run_case(sock_path, "c3-%d" % (i % 4),
-                             node_sends_id_prefix=True, node_text=True)
+                             node_sends_id_prefix=True, node_text=True,
+                             expect_node_close=True)
         except Exception as e:
             bad += 1
             print("iter %d: harness error %r" % (i, e))

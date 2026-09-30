@@ -98,7 +98,7 @@ sleep 2.5
 LD_PRELOAD="$SHIM" SANDHOME_PASSWD="$passwd" timeout 40 ssh \
     -o "ProxyCommand=$D/dropssh connect --relay unix://$sock --name r9box" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o BatchMode=yes -o ConnectTimeout=15 -o LogLevel=ERROR \
+    -o BatchMode=yes -o ConnectTimeout=15 -o LogLevel=VERBOSE \
     -i "$akdir/id" "$ME_NAME@r9box" 'echo R9-LOGIN-OK' \
     >"$W/r9.out" 2>"$W/r9.err"
 rc=$?
@@ -108,7 +108,11 @@ wait $serve_pid $relay_pid 2>/dev/null
 
 echo "ssh rc=$rc"
 echo "stdout: $(cat "$W/r9.out" 2>/dev/null)"
-echo "stderr: $(head -c 300 "$W/r9.err" 2>/dev/null)"
+echo "---- client stderr (VERBOSE: offered keys, proxy fate):"
+cat "$W/r9.err" 2>/dev/null
+echo "---- the key the client offered:"
+LD_PRELOAD="$SHIM" SANDHOME_PASSWD="$passwd" ssh-keygen -y -f "$akdir/id" 2>&1 | head -c 120
+echo
 echo "---- serve log, in full (the server names its reason):"
 cat "$W/r9-serve.log" 2>/dev/null
 echo "---- akdir:"

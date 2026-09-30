@@ -622,7 +622,7 @@ if [ -f "$HERE/passwd-file-test.sh" ]; then
         ok "a server whose environment contains no LD_PRELOAD authenticated a real ssh client"
     else
         bad "a server with no LD_PRELOAD did not authenticate: see below"
-        sed 's/^/      /' "$r9dir/out" 2>/dev/null | head -8
+        sed 's/^/      /' "$r9dir/out" 2>/dev/null | tail -45
     fi
     rm -rf "$r9dir"
 else

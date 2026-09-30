@@ -189,7 +189,8 @@ class Session:
         self.node_text = []
 
 
-def run_case(relay_path, name, node_sends_id_prefix, node_text=False):
+def run_case(relay_path, name, node_sends_id_prefix, node_text=False,
+            expect_node_close=False):
     """One pair. Returns the Session with everything both sides observed."""
     node = connect_relay(relay_path)
     node.settimeout(15)
@@ -316,7 +317,15 @@ def run_case(relay_path, name, node_sends_id_prefix, node_text=False):
     # worse than one that fails, and this one would have kept passing while the
     # ordering regressed. Sending the node's frame first and draining a turn
     # before the operator's makes the ordering explicit and deterministic.
-    s.op.sendall(encode_frame(0x2, b"OP-BARE", True))
+    # The operator's bytes go after the node's frame, except when the case
+    # expects the node to be CLOSED for that frame (bare id, text on a data
+    # leg). Sending them anyway races the close: the relay may forward the
+    # bytes first and the probe then parses a DATA frame as the close it is
+    # waiting for -- a garbage code like 33319 -- and reports a relay bug
+    # that is really probe timing. Measured on CI 2026-09-30. A case that
+    # expects a close sends nothing after the fault.
+    if not expect_node_close:
+        s.op.sendall(encode_frame(0x2, b"OP-BARE", True))
 
     # ⛔ THE DATA WINDOW AND THE CLOSE WINDOW ARE SEPARATE, AND THE CLOSE GETS
     # A BOUNDED WAIT OF ITS OWN. The first version drained for a fixed 3 s and
@@ -581,7 +590,8 @@ def _probe_body(dropssh, work):
         # 2026-09-28 it is code 1009 "bad multiplex frame", and then 1011 on
         # the operator. A relay that drops it quietly is the bug.
         try:
-            s = run_case(sock_path, "case2", node_sends_id_prefix=False)
+            s = run_case(sock_path, "case2", node_sends_id_prefix=False,
+                         expect_node_close=True)
         except (BrokenPipeError, ConnectionResetError) as e:
             failures.append("the pair was torn down before case %s completed (%s)" % ("case2", e))
             return 1
@@ -614,7 +624,8 @@ def _probe_body(dropssh, work):
         # DIFFERENT code from case 2, so the two are logged distinctly rather
         # than collapsed into "framing error".
         try:
-            s = run_case(sock_path, "case3", node_sends_id_prefix=True, node_text=True)
+            s = run_case(sock_path, "case3", node_sends_id_prefix=True,
+                         node_text=True, expect_node_close=True)
         except (BrokenPipeError, ConnectionResetError) as e:
             failures.append("the pair was torn down before case %s completed (%s)" % ("case3", e))
             return 1
