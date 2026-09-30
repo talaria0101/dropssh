@@ -182,9 +182,9 @@ A line longer than the buffer is refused rather than copied truncated, because
 the shell is the last field and a truncated line is a login with a shorter
 shell than the file says.
 
-⛔ **AND A STATIC SERVER IS NOT YET USABLE, WHICH THE DOC MUST NOT OVERCLAIM.**
-`dropbear` itself is still built dynamic glibc by `build.sh`, and the libc
-split still holds for the default path. What R9 removed is the *requirement*
-for the shim, not the build's choice: a server can now run with no `LD_PRELOAD`
-at all, and a static build is a follow-up that nobody has measured.
+⛔ **UPDATE 2026-09-30: the static server serves, and is now the default.**
+`build.sh` builds a static musl server unless `--dropbear-target` names a
+gnu triple; the e2e gate proves logins on the default path, and the R9 case
+above proves the shimless shape explicitly. What was "a follow-up nobody has
+measured" is measured (`tests/static-server-test.sh`) and shipped.
 

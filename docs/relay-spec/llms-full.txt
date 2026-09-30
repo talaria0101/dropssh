@@ -132,10 +132,12 @@ an unknown session is a node-side fault: the relay logs it and closes the node `
 One name holds one node socket: a second node connection is refused HTTP 409 before
 accept, so the live node and its sessions are undisturbed. Hitting `/v1/node/<name>`
 or `/v1/connect/<name>` without a WebSocket upgrade answers 426.
+Closing sockets no longer count toward presence or session capacity. Replacement nodes
+receive new sessions; late callbacks and old operator frames cannot affect those sessions.
 Nothing in this protocol assumes SSH, a specific client implementation, or a fixed local
 port. See `docs/08-reverse.md` in the source.
 
-## Reverse close codes (version 2026-09-28-r12)
+## Reverse close codes (version 2026-09-30-r1)
 
 Every close above, in one table. "Observed by" is the leg whose socket is
 closed — with one exception: when the relay itself closed the node socket for
@@ -168,7 +170,7 @@ operator leg. Generated from `worker/src/reverse.js` at this version and checked
 | 1011 | socket error | either | Transport-level socket error. Reconnect. |
 | 1013 | node open timeout | operator | No `ready` within 15 s of `open`. The node must answer promptly or the session is reaped. |
 | 1013 | reverse message rate cap | either | The optional per-name message fuse tripped. Back off. Production leaves it off (`REVERSE_MAX_MESSAGES_PER_MINUTE=0`). |
-| 1000 or 1011 | node-supplied | operator | Per-session refusal, not a fixed pair: node `close` relays as `1000`, node `reject` as `1011`, both carrying the node's own reason — or the literal type string when the node sent none — truncated to 100 chars (`worker/src/reverse.js:354`). Parse the reason, not the code. |
+| 1000 or 1011 | node-supplied | operator | Per-session refusal, not a fixed pair: node `close` relays as `1000`, node `reject` as `1011`, both carrying the node's own reason — or the literal type string when the node sent none — limited to 100 chars and 123 UTF-8 bytes without splitting a code point (`worker/src/reverse.js:364`). The `reject` text frame preserves the full reason. Parse the reason, not the code. |
 | 1000 | session ended | either | Answer to a client-initiated socket Close. The relay never leaves a closing socket hanging: the initiator gets a clean handshake instead of timing out to `1006`. |
 
 ## Request knobs (connect)

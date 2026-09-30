@@ -30,16 +30,17 @@ On the machine you want into, with the release unpacked:
 mkdir -p ak && cp ~/.ssh/id_ed25519.pub ak/authorized_keys && chmod 600 ak/authorized_keys
 
 ./dropssh serve --name mycage \
-    --passwd ./passwd --preload ./fakepwd.so \
-    --server './dropbear -i -E -F -r hostkey -D ak'
+    --server './dropbear -i -E -F -r hostkey -D ak -Y ./passwd'
 ```
 
-`--passwd` and `--preload` are what make it work in a cage: the first supplies
-the passwd database `dropbear` cannot find, the second is the shim that
-intercepts the lookup. Without them dropbear logs `Login attempt for
-nonexistent user` for `root`, which is there. Both the shim and the isatty
-shim live in [`sandhome`](https://github.com/talaria0101/sandhome); the builder
-fetches them pinned, so there is one copy of each and not a stale one here.
+`-Y ./passwd` is what makes it work in a cage: the static server reads its
+passwd database from a file, with no shim in its environment. Without it
+dropbear logs `Login attempt for
+nonexistent user` for `root`, which is there. `--passwd` and `--preload`
+remain for the dynamic glibc server (`--dropbear-target`), whose shim is an
+`LD_PRELOAD` the builder fetches pinned from
+[`sandhome`](https://github.com/talaria0101/sandhome), so there is one copy
+of it and not a stale one here.
 
 From your own machine:
 

@@ -8,19 +8,18 @@
 #             relay, and the node supervisor. It has to run in a cage with no
 #             libc to link against, so it is musl + fully static. This is the
 #             binary a user downloads and runs.
-#   dropbear  a DYNAMICALLY LINKED glibc ssh server. It has to be dynamic
-#             because the cage's passwd shim is an LD_PRELOAD and needs
-#             RTLD_NEXT, which musl resolves to NULL for a libc symbol. A
-#             musl dropbear cannot be interposed at all, whether static,
-#             static-pie, or built with -rdynamic. Measured, in
+#   dropbear  a STATIC musl ssh server by default, served with `-Y FILE`
+#             and no shim. Dynamic glibc stays available with an explicit
+#             --dropbear-target *gnu* for --preload users. Measured, in
 #             docs/decisions-tls.md.
 #
-# So "a single static binary" is true of the dropssh side, and the dropbear
-# side is dynamic FOR A MEASURED REASON, not by oversight. A release that ships
-# one static binary which is also the server ships a server that cannot log
-# anyone in, and the symptom ("Login attempt for nonexistent user" for root) is
-# the single most misleading line in this whole project: it names a user who
-# does not exist, for a user who does.
+# Both halves are static now, and for different measured reasons: dropssh
+# must run with no libc at all, and the server reads its user database from
+# a file instead of through a preloaded shim. What still ships a server that
+# cannot log anyone in is the old combination: a dynamic server with no shim
+# in its environment, whose symptom ("Login attempt for nonexistent user"
+# for root) is the single most misleading line in this whole project: it
+# names a user who does not exist, for a user who does.
 #
 # USAGE
 #   scripts/build.sh [--target T] [--out DIR] [--static-only|--full]
@@ -41,20 +40,23 @@ ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
 TARGET=""
 OUT=""
 MODE=full
-# ⛔ THE TWO ARTEFACTS ARE BUILT FOR DIFFERENT LIBCS AND THAT IS NOT A
+# ⛔ THE TWO ARTEFACTS ARE BUILT FOR DIFFERENT PURPOSES AND THAT IS NOT A
 # CONFIGURATION DETAIL.
 #
 #   dropssh   musl, static. It is the binary a user downloads, and it has to
 #             run in a cage that has no libc to link against.
-#   dropbear  glibc, dynamically linked. The passwd shim is an LD_PRELOAD and
-#             musl's RTLD_NEXT resolves to NULL for a libc symbol, so a musl
-#             dropbear cannot be interposed at all. Measured, in
-#             docs/decisions-tls.md.
+#   dropbear  static musl by default, served with `-Y FILE` and no shim.
+#             Dynamic glibc stays available with an explicit
+#             --dropbear-target *gnu* for --preload users.
 #
-# So --target names the DROPBear target and the dropssh target is derived from
-# it, rather than one --target being stretched across both and quietly
-# producing a server that cannot log anyone in.
+# So --target names the DROPSsh target and the dropbear target defaults to
+# the same triple when it is musl (static path) and to x86_64-linux-gnu
+# otherwise. Anything else is named explicitly with --dropbear-target.
+# See docs/decisions-tls.md.
+TARGET=""
 DROPBEAR_TARGET=""
+OUT=""
+MODE=full
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) TARGET="${2:-}"; shift 2 ;;
@@ -72,21 +74,14 @@ die() { log "FAIL: $*"; exit 1; }
 
 command -v zig >/dev/null 2>&1 || die "zig is not on PATH (needed for the cross C compiler)"
 [ -n "$TARGET" ] || TARGET="x86_64-linux-musl"
-# ⛔ THE DROPBear TARGET DEFAULTS TO x86_64-linux-gnu AND IS NOT DERIVED FROM
-# THE DROPSSH TARGET.
-#
-# Deriving it looked right -- the glibc sibling of the musl target -- and it is
-# wrong for every musl architecture dropssh builds. A musl dropbear cannot be
-# built with zig cc at all: `-rdynamic` is the only flag that yields a dynamic
-# musl binary and it fails autoconf's `-c` probe, while `-pie` gives static-pie,
-# which the passwd shim cannot preload. So there is no musl sibling to derive,
-# and zig 0.13 cannot even build a glibc riscv64 target (its bundled glibc
-# startup uses an assembler directive lld rejects).
-#
-# The default is therefore the one target that is known to work, and anything
-# else is named explicitly with --dropbear-target. See docs/decisions-tls.md.
+# The dropbear target defaults to the dropssh target on musl (static
+# server) and to x86_64-linux-gnu otherwise. Anything else is named
+# explicitly with --dropbear-target. See docs/decisions-tls.md.
 if [ -z "$DROPBEAR_TARGET" ]; then
-    DROPBEAR_TARGET="x86_64-linux-gnu"
+    case "$TARGET" in
+        *musl*) DROPBEAR_TARGET="$TARGET" ;;
+        *)            DROPBEAR_TARGET="x86_64-linux-gnu" ;;
+    esac
 fi
 [ -n "$OUT" ] || OUT="$ROOT/dist/$TARGET"
 mkdir -p "$OUT" || die "cannot create $OUT"
@@ -95,7 +90,7 @@ MBED_PREFIX="${DROPSSH_MBEDTLS_PREFIX:-$ROOT/.deps/mbedtls/$TARGET}"
 DROPBEAR_COMMIT="${DROPBEAR_COMMIT:-59870ad43153fe8d4f1c96f5d5752116c94f31ff}"
 
 log "dropssh  $TARGET (static, musl)"
-log "dropbear $DROPBEAR_TARGET (dynamic, glibc: the shim needs RTLD_NEXT)"
+log "dropbear $DROPBEAR_TARGET (static musl default, dynamic glibc on request)"
 log "out      $OUT"
 log "mbedtls  $MBED_PREFIX"
 
@@ -167,7 +162,8 @@ log "dropssh built: $(du -h "$OUT/dropssh" | cut -f1)"
 # cage it exists for, and the failure is on the operator's machine, not here.
 # So a gnu target is refused for the dropssh side unless the operator has
 # explicitly provided a static libc, and the musl targets are the supported
-# ones. The dropbear side is a different artefact and is deliberately dynamic.
+# ones. The dropbear side is static musl by default and dynamic glibc on
+# request.
 case "$TARGET" in
     *-linux-gnu)
         log "NOTE: $TARGET has no static libc under zig cc; dropssh will need"
@@ -225,7 +221,7 @@ fi
 
 # ---------------------------------------------------------------- dropbear
 if [ "$MODE" = full ]; then
-    log "building dropbear (dynamic, glibc: the shim needs RTLD_NEXT) for $DROPBEAR_TARGET"
+    log "building dropbear for $DROPBEAR_TARGET (static musl default, dynamic glibc on request)"
     "$HERE/build-dropbear.sh" "$DROPBEAR_TARGET" "$OUT" "$DROPBEAR_COMMIT" \
         || die "dropbear build failed"
     # ⛔ THE SHIM IS PROVEN AGAINST THE ARTEFACT, NOT ASSUMED. This is the one

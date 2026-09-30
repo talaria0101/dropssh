@@ -122,12 +122,10 @@ plant-matrix rows that cannot go red are exactly what one would answer.
   ⛔ **The refcount is defence in depth and the ORDERING is what holds**, which
   is the opposite of what the B-list says.
 
-**4. A static dropbear.** R9 removed the *requirement* for the shim;
-`build.sh` still builds dynamic glibc. UPDATE 2026-09-30: a static-pie musl
-server is proven feasible (`tests/static-server-test.sh`, real login, no
-shim) with one new patch (unix-peer tolerance, wired into the builder).
-What remains is builder support for producing it, scale proof, CI, and the
-release decision. NEXT SESSION (see below).
+**4. A static dropbear.** R9 removed the *requirement* for the shim.
+DONE 2026-09-30 as the default: `build.sh` builds a static musl server
+unless `--dropbear-target` names gnu; all six arch servers build; the e2e
+gate proves logins on the default path. Dynamic glibc is the opt-out.
 
 **5. The case-3 close-code flake is unrooted.** 1/100 pre-change, 3/100 after.
 Pre-existing. Never investigated.
@@ -243,22 +241,23 @@ present-but-slow relay. The case-3 flake is sampled, not rooted.
 
 ---
 
-## Next session: publish test static binaries
+## Next session: publish test static binaries -- DONE 2026-09-30 except the tag
 
-The static server is proven feasible but nothing produces or ships it. Work,
-in order:
-
-1. Builder support: teach `build-dropbear.sh` a static musl path (`STATIC=1`,
-   assert static linkage, keep refusing dynamic musl). The unix-peer patch is
-   already wired for all targets.
-2. Scale proof: full e2e plus the live relay session with the static server
-   swapped in (one login is proven; the transfer, concurrency and all 36 cases
-   are not). `tests/static-server-test.sh` is the single-case instrument.
-3. CI: static-server build plus prove job in the matrix.
-4. Docs: the default stays dynamic glibc until this lands; `decisions-tls.md`
-   carries the measurement.
-5. Publish: tag a test pre-release with the static server inside. Needs a
-   version string from the operator.
+1. Builder support: DONE. `build-dropbear.sh` builds static musl by default
+   (`STATIC=1`, linkage asserted), dynamic glibc on explicit request; shim
+   built for the GNU sibling when it compiles, skipped with a note otherwise.
+2. Scale proof: DONE for x86_64 (full e2e 36/36 on the default dist); all six
+   arch servers compile. Live-relay session against the static server: 2/3
+   green 2026-09-30. The first run failed (1003 unknown session id, ssh 255)
+   inside the relay's own redeploy window (r12 to 2026-09-30-r1, same hour);
+   two reruns with identical artefacts passed, and the re-fetched spec holds
+   5/5 with additive-only changes (capacity accounting, reason truncation
+   refined). No client change indicated; treat run 1 as deploy churn unless
+   it recurs.
+3. CI: DONE in-tree (matrix builds six static servers, glibc-optout job,
+   flipped linkage asserts, updated release notes). Runs on push.
+4. Docs: DONE (this file, decisions-tls, AGENTS, README, open-issues, CI text).
+5. Publish: tag v0.2.0 and push the tag. The release job publishes from it.
 
 ## Session after next: the remainder
 

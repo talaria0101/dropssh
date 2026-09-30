@@ -16,21 +16,25 @@
 # as a dropssh bug. dropbear has no privsep chroot. The full measurement is in
 # docs/decisions-tls.md.
 #
-# ⛔ AND IT IS BUILT DYNAMICALLY, WHICH IS THE PART THAT IS EASY TO GET WRONG
-# AND IS INVISIBLE. A STATIC dropbear carries its own libc, so LD_PRELOAD
-# cannot reach it, its passwd lookups fail against a cage with no /etc/passwd,
-# and it logs "Login attempt for nonexistent user" for root, which is there.
-# Measured here, same patched source, built both ways, through a real session:
+# ⛔ THE DEFAULT SERVER IS STATIC MUSL, AND DYNAMIC GLIBC IS THE OPT-OUT.
+# A static server carries its own libc and reads its passwd database from a
+# file (`-Y`), so it needs no shim: measured, a static-pie musl server serves
+# a real login. A DYNAMIC dropbear without a shim is the failure this used to
+# guard unconditionally: it logs "Login attempt for nonexistent user" for a
+# user that is there. Measured here, same patched source, built both ways,
+# through a real session:
 #
 #   dynamic, no shim     Login attempt for nonexistent user from localhost
 #   dynamic, +shim       User 'root' has invalid shell, rejected   (shell)
 #   dynamic, +shim+passwd Pubkey auth succeeded, uid 0, exit 0
+#   static, -Y file      Pubkey auth succeeded, no shim in the environment
 #
-# The build asserts the artefact is dynamic. The flag is the `STATIC=` value
-# that dropbear's configure computes, and passing an unknown
-# `--disable-static-programs` to it is a no-op that autoconf warns about but
-# does not fail on, which is exactly the kind of thing that leaves you with a
-# static binary and no error. The assertion below is the real guard.
+# The linkage assertion below follows the target: static expected for musl,
+# dynamic for glibc. The flag is the `STATIC=` value that dropbear's
+# configure computes, and passing an unknown `--disable-static-programs` to
+# it is a no-op that autoconf warns about but does not fail on, which is
+# exactly the kind of thing that leaves you with a static binary and no
+# error. The assertion is the real guard.
 #
 # USAGE: build-dropbear.sh TARGET OUTDIR [COMMIT]
 set -uo pipefail
@@ -245,36 +249,36 @@ fi
 # The flag is appended after the Makefile's own LDFLAGS so it wins, and the
 # artefact is checked afterwards either way, because a flag that produces the
 # right thing is a convenience and a check is a guarantee.
-# ⛔ A musl dropbear IS NOT BUILDABLE WITH zig cc, AND THE REASON IS MEASURED,
-# SO THE BUILD REFUSES IT HERE RATHER THAN SHIPPING static-pie.
+# ⛔ A DYNAMIC musl dropbear IS NOT BUILDABLE WITH zig cc, AND STATIC IS THE
+# DEFAULT, SO NOTHING HERE NEEDS ONE.
 #
 #   zig cc -target riscv64-linux-musl -rdynamic -c x.c
 #     ld.lld: error: -r and --export-dynamic may not be used together
 #
 # `-rdynamic` is the only flag that yields a dynamically linked musl binary
-# (`-pie` gives static-pie, which the shim cannot preload), and it fails on the
-# relocatable link that autoconf's "cannot compute suffix of object files" probe
-# performs. The same source with `-pie` compiles and links, and produces exactly
-# the artefact this build exists to refuse.
-#
-# So the two sides of this project have different libc requirements, and they
-# are not negotiable: dropssh must be musl to run in a cage, and dropbear must
-# be glibc to be preloaded. A musl dropbear is refused, with this, rather than
-# produced and found broken at login.
+# and it fails autoconf's `-c` probe, so a musl target builds STATIC (`-Y`
+# reads the passwd database from a file, so no shim is needed: measured,
+# a static-pie musl server serves a real login, 2026-09-30). A glibc target
+# still builds dynamic, for `--preload` users and for hosts where the
+# operator prefers it. Ask for one explicitly with --dropbear-target.
+STATIC_BUILD=0
 case "$TARGET" in
-    *-linux-musl)
-        die "a musl dropbear cannot be built: zig cc has no flag that yields a
-       dynamically linked musl binary AND survives autoconf's -c probe.
-       -pie gives static-pie, which LD_PRELOAD cannot reach; -rdynamic gives a
-       dynamic binary but fails the -c probe with '-r and --export-dynamic may
-       not be used together'. Build the server for a glibc target
-       (--dropbear-target x86_64-linux-gnu) and the dropssh side for this one.
-       See docs/decisions-tls.md."
+    *musl*)
+        STATIC_BUILD=1
+        log "static musl server: no shim needed (-Y reads the passwd file)"
         ;;
 esac
 
 CC_WRAP="$WORK/zigcc-$TARGET"
-if [ -n "$DL" ]; then
+if [ "$STATIC_BUILD" -eq 1 ]; then
+    # Static musl: plain zig cc, no -pie wrapper games. What comes out is
+    # static-pie on most arches; the linkage assertion below names what it
+    # must be rather than how it got there.
+    cat >"$CC_WRAP" <<WRAP
+#!/bin/sh
+exec zig cc -target $TARGET "\$@"
+WRAP
+elif [ -n "$DL" ]; then
     cat >"$CC_WRAP" <<WRAP
 #!/bin/sh
 exec zig cc -target $TARGET -pie -Wl,--dynamic-linker=$DL "\$@"
@@ -328,7 +332,11 @@ cat >"$WORK/localoptions.h" <<'LOCAL'
 #define DROPBEAR_CLI 0
 LOCAL
 
-log "configure (dynamic on purpose)"
+if [ "$STATIC_BUILD" -eq 1 ]; then
+    log "configure (static musl: -Y reads the passwd file, no shim)"
+else
+    log "configure (dynamic on purpose: the shim needs RTLD_NEXT)"
+fi
 # ⛔ _FORTIFY_SOURCE IS TURNED OFF, AND THE REASON IS A LINK ERROR THAT NAMES
 # A SYMBOL NOBODY ASKED FOR.
 #
@@ -364,6 +372,8 @@ case "$TARGET" in
     arm-linux-gnueabihf) HOST_TRIPLE="arm-unknown-linux-gnueabihf" ;;
     x86_64-linux-musl)  HOST_TRIPLE="x86_64-pc-linux-musl" ;;
     aarch64-linux-musl) HOST_TRIPLE="aarch64-pc-linux-musl" ;;
+    arm-linux-musleabihf) HOST_TRIPLE="arm-unknown-linux-musleabihf" ;;
+    arm-linux-musleabi) HOST_TRIPLE="arm-unknown-linux-musleabi" ;;
     x86-linux-musl)     HOST_TRIPLE="i686-pc-linux-musl" ;;
     riscv64-linux-musl) HOST_TRIPLE="riscv64-unknown-linux-musl" ;;
     powerpc64le-linux-musl) HOST_TRIPLE="powerpc64le-unknown-linux-musl" ;;
@@ -377,12 +387,20 @@ CONFIGURE_HOST=""
       --prefix="$WORK/inst" >configure.log 2>&1 ) \
     || { tail -20 "$WORK/configure.log" >&2; die "configure failed"; }
 
-# ⛔ STATIC IS FORCED OFF HERE, EXPLICITLY, AND THE RESULT IS CHECKED AFTERWARDS.
+# ⛔ STATIC IS FORCED HERE, EXPLICITLY, AND THE RESULT IS CHECKED AFTERWARDS.
 # dropbear's configure sets STATIC=1 when it decides a static link is possible.
 # In a cross build with zig cc that decision is made from the WRONG compiler's
-# answer, so the build passes STATIC=0 to make() and then checks the artefact.
-sed -i 's/^STATIC=.*/STATIC=0/' "$WORK/Makefile" 2>/dev/null || true
-grep -q '^STATIC=0' "$WORK/Makefile" || die "could not force STATIC=0 in the Makefile"
+# answer, so the build forces the value itself: STATIC=1 for a musl target
+# (the static default, served with -Y), STATIC=0 for glibc (dynamic, for the
+# shim). Then it checks the artefact, because a flag is a convenience and a
+# check is a guarantee.
+if [ "$STATIC_BUILD" -eq 1 ]; then
+    sed -i 's/^STATIC=.*/STATIC=1/' "$WORK/Makefile" 2>/dev/null || true
+    grep -q '^STATIC=1' "$WORK/Makefile" || die "could not force STATIC=1 in the Makefile"
+else
+    sed -i 's/^STATIC=.*/STATIC=0/' "$WORK/Makefile" 2>/dev/null || true
+    grep -q '^STATIC=0' "$WORK/Makefile" || die "could not force STATIC=0 in the Makefile"
+fi
 
 log "make"
 ( cd "$WORK" && make -j"$(nproc 2>/dev/null || echo 2)" dropbear dropbearkey \
@@ -402,6 +420,13 @@ bad()  { log "  FAIL: $1"; fail=1; }
 # the wrong thing. So it is checked here, on the artefact, before it ships.
 if command -v file >/dev/null 2>&1; then
     KIND=$(file -b "$WORK/dropbear")
+    if [ "$STATIC_BUILD" -eq 1 ]; then
+        case "$KIND" in
+            *"statically linked"*|*"static-pie linked"*)
+                note "static, as a shimless -Y server must be" ;;
+            *) bad "a musl server that is not static cannot serve here: $KIND" ;;
+        esac
+    else
     case "$KIND" in
         *"statically linked"*|*"static-pie linked"*)
             bad "dropbear is STATIC (or static-pie): LD_PRELOAD cannot reach
@@ -410,6 +435,7 @@ if command -v file >/dev/null 2>&1; then
         *"dynamically linked"*) note "dynamic, as the shim requires" ;;
         *) note "could not classify: $KIND" ;;
     esac
+    fi
 fi
 
 # The setgid exit string must still be in the binary: its PRESENCE is correct
@@ -501,16 +527,43 @@ if [ ! -f "$SHIM" ]; then
     fi
 fi
 [ -f "$SHIM" ] || die "no shims/fakepwd.c in sandhome at $SANDHOME_DIR"
-CC_WRAP2="$WORK/zigcc-shared-$TARGET"
+# The shim must match the libc of whatever it preloads into, which is the
+# SERVER's libc on a glibc target and nobody's on a static one. So a musl
+# target builds the shim for its GNU sibling when that compiles, and ships
+# without one when it does not (riscv64 glibc is unbuildable under zig 0.13).
+# The static server never needs it; the remaining users are legacy --preload
+# servers and passwd-less test clients, which take it from a gnu dist.
+SHIM_TARGET="$TARGET"
+if [ "$STATIC_BUILD" -eq 1 ]; then
+    case "$TARGET" in
+        x86_64-linux-musl)    SHIM_TARGET="x86_64-linux-gnu" ;;
+        aarch64-linux-musl)   SHIM_TARGET="aarch64-linux-gnu" ;;
+        arm-linux-musleabihf) SHIM_TARGET="arm-linux-gnueabihf" ;;
+        x86-linux-musl)       SHIM_TARGET="x86-linux-gnu" ;;
+        *)                    SHIM_TARGET="" ;;
+    esac
+fi
+if [ -z "$SHIM_TARGET" ]; then
+    note "no shim for $TARGET: the static server needs none (see above)"
+else
+CC_WRAP2="$WORK/zigcc-shared-$SHIM_TARGET"
 cat >"$CC_WRAP2" <<WRAP
 #!/bin/sh
-exec zig cc -target $TARGET -shared -fPIC "\$@"
+exec zig cc -target $SHIM_TARGET -shared -fPIC "\$@"
 WRAP
 chmod +x "$CC_WRAP2"
-"$CC_WRAP2" -O2 -o "$OUTDIR/fakepwd.so" "$SHIM" 2>"$OUTDIR/fakepwd.build.log" \
-    || { cat "$OUTDIR/fakepwd.build.log" >&2; die "the passwd shim did not build"; }
-[ -f "$OUTDIR/fakepwd.so" ] || die "no fakepwd.so after the build"
-note "passwd shim built for this target"
+if "$CC_WRAP2" -O2 -o "$OUTDIR/fakepwd.so" "$SHIM" 2>"$OUTDIR/fakepwd.build.log"; then
+    note "passwd shim built for $SHIM_TARGET"
+elif [ "$STATIC_BUILD" -eq 1 ]; then
+    cat "$OUTDIR/fakepwd.build.log" >&2
+    rm -f "$OUTDIR/fakepwd.so"
+    note "no shim for $TARGET (sibling $SHIM_TARGET did not compile): the static server needs none"
+else
+    cat "$OUTDIR/fakepwd.build.log" >&2
+    die "the passwd shim did not build, and a dynamic server without one cannot log anyone in"
+fi
+fi
+[ -f "$OUTDIR/fakepwd.so" ] || note "shipping without fakepwd.so"
 
 # The version goes into the artefact so BUILDINFO can report what was actually
 # built, read from the tree the build fetched rather than from a constant here.

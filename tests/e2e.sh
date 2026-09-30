@@ -57,12 +57,25 @@ DROPSSH="$DIST/dropssh"
 DROPBEAR="$DIST/dropbear"
 DROPBEARKEY="$DIST/dropbearkey"
 SHIM="$DIST/fakepwd.so"
+# The shim is for the TEST CLIENT on hosts with no passwd database, and for
+# legacy --preload servers. The static default server needs neither: it is
+# served with -Y and the probe below runs it bare. A dist without a shim
+# still gates on any host that has /etc/passwd; on one that has neither,
+# the suite says so instead of failing forty lines later in ssh-keygen.
+if [ ! -f "$SHIM" ]; then
+    if [ -f /etc/passwd ]; then
+        SHIM=""
+    else
+        echo "e2e: no $DIST/fakepwd.so and no /etc/passwd; the client cannot start here" >&2
+        exit 2
+    fi
+fi
 
 # ⛔ THE EXIT STATUS IS READ FROM THE SCRIPT, NEVER THROUGH A PIPE. A pipe
 # reports the LAST command's status, so a failing test piped to `tee` looks
 # green. Every case below uses `rc=$?` immediately after the command.
 
-for f in "$DROPSSH" "$DROPBEAR" "$DROPBEARKEY" "$SHIM"; do
+for f in "$DROPSSH" "$DROPBEAR" "$DROPBEARKEY"; do
     [ -e "$f" ] || { echo "e2e: missing $f; run scripts/build.sh first" >&2; exit 2; }
 done
 
@@ -164,16 +177,17 @@ chmod 600 "$WORK/ak/authorized_keys"
 printf '== dropssh e2e: logging in as %s (uid %s), server runs as the same uid\n' \
     "$LOGIN_USER" "$CUR_UID"
 
-head_ "the shim answers for a user a cage does not have"
-# ⛔ THIS IS THE STATIC-BINARY TRAP, ASSERTED RATHER THAN DESCRIBED. A static
-# dropbear carries its own libc, LD_PRELOAD cannot reach it, and every login
-# fails with a message that names the wrong thing. The check is made against
-# the artefact on disk, because that is the only place the property exists.
+head_ "the server is static and needs no shim"
+# ⛔ THE DEFAULT SERVER IS STATIC, ASSERTED RATHER THAN DESCRIBED. A static
+# server reads its user database from a file (-Y), so LD_PRELOAD cannot and
+# need not reach it. The check is made against the artefact on disk, because
+# that is the only place the property exists; the R9 case below then proves
+# the property carries a login.
 if command -v file >/dev/null 2>&1; then
     KIND=$(file -b "$DROPBEAR")
     case "$KIND" in
-        *"dynamically linked"*) ok "dropbear is dynamically linked, so the shim can reach it" ;;
-        *) bad "dropbear is not dynamically linked: $KIND" ;;
+        *"statically linked"*|*"static-pie linked"*) ok "dropbear is static, so there is no shim to reach for" ;;
+        *) bad "dropbear is not static: $KIND" ;;
     esac
 fi
 
@@ -192,14 +206,18 @@ head_ "the ssh server starts here"
 # AF_UNIX socketpair. Probing the shape the server will actually be given is
 # the difference between a test that measures the tool and one that measures a
 # detail of how a shell redirects stdin.
-python3 - "$DROPBEAR" "$WORK/hostkey" "$WORK/ak" "$SHIM" "$WORK/passwd" <<'PYPROBE'
+# The probe runs the server the way serve runs it: no shim in the
+# environment (static default), -Y for the user database. A server that only
+# starts preloaded is not the default anymore and is covered by the R9 case.
+python3 - "$DROPBEAR" "$WORK/hostkey" "$WORK/ak" "$WORK/passwd" <<'PYPROBE'
 import os, socket, subprocess, sys, time
-binary, hostkey, akdir, shim, passwd = sys.argv[1:6]
+binary, hostkey, akdir, passwd = sys.argv[1:5]
 a, b = socket.socketpair()
 env = dict(os.environ)
-env["LD_PRELOAD"] = shim
-env["SANDHOME_PASSWD"] = passwd
-p = subprocess.Popen([binary, "-i", "-E", "-F", "-r", hostkey, "-D", akdir],
+env.pop("LD_PRELOAD", None)
+env.pop("SANDHOME_PASSWD", None)
+p = subprocess.Popen([binary, "-i", "-E", "-F", "-r", hostkey, "-D", akdir,
+                      "-Y", passwd],
                      stdin=b.fileno(), stdout=b.fileno(),
                      stderr=subprocess.PIPE, env=env, close_fds=False)
 b.close()
@@ -250,8 +268,7 @@ run_session_with_passwd() {
     [ -S "$sock" ] || { bad "$name: the relay never bound $sock"; kill $relay_pid 2>/dev/null; return 1; }
 
     "$DROPSSH" serve --relay "unix://$sock" --name "$name" \
-        --passwd "$passwdfile" --preload "$SHIM" \
-        --server "$DROPBEAR -i -E -F -r $WORK/hostkey -D $WORK/ak" \
+        --server "$DROPBEAR -i -E -F -r $WORK/hostkey -D $WORK/ak -Y $passwdfile" \
         >"$WORK/$1-serve.log" 2>&1 &
     local serve_pid=$!
     sleep 0.8
@@ -429,8 +446,7 @@ if [ ! -S "$WORK/mux.sock" ]; then
     bad "the multiplexer relay never bound $WORK/mux.sock"
 else
     "$DROPSSH" serve --relay "unix://$WORK/mux.sock" --name muxbox \
-        --passwd "$WORK/passwd" --preload "$SHIM" \
-        --server "$DROPBEAR -i -E -F -r $WORK/hostkey -D $WORK/ak" \
+        --server "$DROPBEAR -i -E -F -r $WORK/hostkey -D $WORK/ak -Y $WORK/passwd" \
         >"$WORK/mux-serve.log" 2>&1 &
     mux_serve_pid=$!
     # the node needs its socket up before an operator can attach to it: a
@@ -588,11 +604,10 @@ rm -f "$nosock"
 
 head_ "a server with no LD_PRELOAD authenticates (R9)"
 # ⛔ THIS IS THE E2E CASE R9 ASKED FOR BY NAME: "a server with NO LD_PRELOAD in
-# its environment still authenticates". The cage has no /etc/passwd, so the
-# answer used to be an LD_PRELOAD shim, and the shim is why the server half of
-# a release is dynamic glibc while the client half is static musl and why a musl
-# dropbear cannot be built here at all. `dropbear -Y FILE` reads the database
-# from a file instead.
+# its environment still authenticates". Since the static switch it is also the
+# shape of the DEFAULT path, asserted here explicitly rather than only
+# incidentally: every session above already runs it. `dropbear -Y FILE` reads
+# the database from a file instead.
 #
 # ⛔ IT IS A SEPARATE SCRIPT BECAUSE IT NEEDS ITS OWN WORK DIRECTORY AND ITS OWN
 # KEY PAIR, and because the assertion is about a PROCESS'S ENVIRONMENT rather

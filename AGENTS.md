@@ -22,8 +22,8 @@ All of it is C. No python at runtime, nothing to install.
 ./dropbearkey -t ed25519 -f hostkey
 mkdir -p ak && cp ~/.ssh/id_ed25519.pub ak/authorized_keys && chmod 600 ak/authorized_keys
 
-./dropssh serve --name N --passwd ./passwd --preload ./fakepwd.so \
-                --server './dropbear -i -E -F -r hostkey -D ak'
+./dropssh serve --name N \
+                --server './dropbear -i -E -F -r hostkey -D ak -Y ./passwd'
 
 # from your own machine
 ssh -o ProxyCommand='./dropssh connect --name N' root@N
@@ -45,7 +45,7 @@ This is the first thing to understand and the easiest to get wrong.
 | binary | libc | why |
 | --- | --- | --- |
 | `dropssh` | **static musl** | the one you download and run. A cage has no libc to link against. |
-| `dropbear` | **dynamic glibc** | the passwd shim is an `LD_PRELOAD` and needs `RTLD_NEXT`, which musl resolves to `NULL` for a libc symbol, so a musl dropbear cannot be interposed at all. Not static, not static-pie, and not with `-rdynamic`. ⛔ **`dropbear -Y FILE` now removes the REQUIREMENT for the shim, so this row is a build choice and not a constraint** -- a server with no `LD_PRELOAD` in its environment authenticates, measured in the gate. A static server is proven feasible too (2026-09-30: static-pie musl serves a real login with `-Y`, no shim, plus the unix-peer patch); the default is unchanged. |
+| `dropbear` | **static musl** | served with `-Y FILE` and no shim, measured carrying logins. Dynamic glibc stays available with `--dropbear-target` for `--preload` users. |
 
 Getting that wrong ships a server that compiles, links, passes every static
 check, and logs `Login attempt for nonexistent user` for `root`, which is
@@ -102,7 +102,9 @@ git can resolve.
 
 * `dropssh`, static musl: `x86_64`, `aarch64`, `armv7`, `x86-32`, `riscv64`,
   `powerpc64le`
-* `dropbear`, dynamic glibc: `x86_64-gnu`, `aarch64-gnu`, `arm-gnueabihf`
+* `dropbear`, static musl: `x86_64`, `aarch64`, `armv7`, `x86-32`, `riscv64`,
+  `powerpc64le` (same triples as dropssh); dynamic glibc on request:
+  `x86_64-gnu`, `aarch64-gnu`, `arm-gnueabihf`
 
 ## Testing
 
@@ -114,7 +116,7 @@ on a machine with no `/etc/passwd`, as a message that names the wrong thing.
 
 **Thirty-six** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
 
-* dropbear is dynamically linked, so the shim can reach it
+* dropbear is static, so there is no shim to reach for (dynamic glibc on request)
 * `dropbear -i` stays up on a **socketpair** waiting for a session
 * a pubkey session to uid 0, through relay, serve, dropbear and connect
 * a 270 KB transfer that comes back byte for byte
@@ -259,7 +261,7 @@ vendor/         does not exist, on purpose: inputs are fetched and pinned
 * The passwd shim is **glibc-only**: musl's `RTLD_NEXT` is `NULL` for a libc
   symbol. ⛔ `dropbear -Y FILE` means you can now DROP the shim entirely, which
   is the only way this stops being a constraint.
-* A **musl dropbear cannot be built** with zig cc: `-rdynamic` fails autoconf's
+* A **dynamic musl dropbear cannot be built** with zig cc: `-rdynamic` fails autoconf's
   `-c` probe, `-pie` gives static-pie. The builder refuses it by name.
 * zig 0.13 **cannot build glibc riscv64** (`.cfi_label`).
 * **cmake writes into the mbedTLS source tree**, so one tree per target, or
