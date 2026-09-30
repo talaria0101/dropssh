@@ -13,12 +13,13 @@ else. This document is for whoever picks the work up, not for the code.
 
 | gate | what it proves | last run |
 | --- | --- | --- |
-| `tests/e2e.sh` | a release artefact carries a **real session** | **35/35, exit 0** |
+| `tests/e2e.sh` | a release artefact carries a **real session** | **36/36, exit 0** (2026-09-30; case 36 is the SOCKS byte path) |
 | `tests/mux-probe.py` | the relay's framing rules, locally, 14 cases | green |
 | `tests/wsmove-test.c` | one owner per websocket session (U2) | 7/7 |
 | `tests/token-test.c` | the bearer-token contract (issue #13) | 14/14 |
 | `tests/socks-policy-test.sh` | the SOCKS destination decision | 10/10 |
-| `tests/plant-matrix.sh` | every guard fails when its defect returns | 13 of 15 rows red |
+| `tests/socks-forward-test.sh` | a SOCKS forward carries bytes, gated via e2e | 3/3, then 36/36 in the gate |
+| `tests/plant-matrix.sh` | every guard fails when its defect returns | 14 of 16 rows red (SOCKS publish row added) |
 | `tests/relay-session.sh` | a **real session against the real relay** | green against r12 |
 
 ```sh
@@ -190,13 +191,43 @@ a **crash as its own setup failure**, three runs in a row with a perfect 3/3.
 
 ## If you pick up the SOCKS forward
 
-The lock, in `src/serve.c`'s `on_control`, between `s->is_socks = 1` and
-`pthread_mutex_lock(&m->list_lock)`. Reproduce with:
+Done 2026-09-30; see the entry above. The lock described below never
+existed: the publish path sat inside the ssh-spawn branch, so a SOCKS
+session never reached any mutex. Reproduce (now green) with:
 
 ```sh
 sh tests/socks-forward-test.sh dist/x86_64-linux-musl
 ```
 
+The section below is kept so the wrong diagnosis stays visible next to
+the correction.
+
 ⛔ Read the node's own log, not the client. A connected SOCKS forward is not a
 working one, and the client's silence cannot tell you which end failed — that
 distinction cost most of the debugging.
+
+---
+
+## 2026-09-30: the SOCKS forward carries bytes
+
+Item 1 of "what is NOT done" is done. The `futex_do_wait` diagnosis in the
+section above was wrong: the node never reached a mutex at all. The publish
+path in `src/serve.c`'s `on_control` sat inside the ssh-spawn `else` branch,
+so a SOCKS session was dialled, logged, leaked, and never published, never
+sent `ready`, never pumped. The relay half had a second defect of its own: a
+raw byte pump wrote into a socketpair where `client_thread` reads websocket
+frames. Both fixed, both proven:
+
+* `sh tests/socks-forward-test.sh dist/x86_64-linux-musl` — 225 bytes each
+  way through a live destination, 3/3 runs, then gated as e2e case 36
+  (**36/36, exit 0**).
+* Plant P1 (the session dropped before publish) fails the forward test,
+  exit 1; the fix passes. Row added to `tests/plant-matrix.sh`.
+* A node that never answers `ready` gets a bounded SOCKS refusal (20 s),
+  not a hang (`tests/socks-wait-probe.py`, manual check).
+* Case-3 flake sampled 0/100 on this build (`tests/case3-loop.py`).
+
+What is still not done, unchanged: the ladder's third line (cross-relay
+session migration), a sanitizer run (no libasan/libtsan on this machine
+either, re-confirmed), a static dropbear, and `--retry-budget` against a
+present-but-slow relay. The case-3 flake is sampled, not rooted.

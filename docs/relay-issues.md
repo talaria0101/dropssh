@@ -993,6 +993,11 @@ it.
   configuration guards. What is not: the wire format parsed, the `open`
   honoured by a node, the bytes moved. ⛔ A case that claimed the byte path
   would be a case passing for a reason it cannot see.
+
+  **Update 2026-09-30: done.** `--socks unix://` binds in a cage, the node
+  publishes the SOCKS session and sends `ready`, the relay waits bounded
+  before answering CONNECT, and bytes move both ways. 3/3 runs, gated as
+  e2e case 36. See the ten-review section at the end of this file.
 * ⛔ **R2's job has never run.** A pair is per-pair and per-role and cannot be
   obtained from the outside; `--mint` answers 403 on a reverse upgrade. The
   script exists, the diagnostics were measured against the live relay with a
@@ -1007,6 +1012,14 @@ it.
 * ⛔ **The case-3 close-code flake is still unrooted.** 1/100 pre-change, 3/100
   after. It is pre-existing, it is not from this work, and three samples is not
   enough to call the rate unchanged.
+
+  **Update 2026-09-30:** 0/100 on this build (`tests/case3-loop.py`, 100
+  iterations reusing 4 names against one relay, all closed 1003). The flake
+  did not reproduce, which at a 3% rate is weak evidence, not a root cause.
+  The loop also found, and the fix records, that a fresh name per iteration
+  exhausts the relay's 32-name table at exactly 32: 32/32 good, then every
+  later upgrade answered with no hello. That is the name cap working, not a
+  leak, and the loop reuses names for exactly that reason.
 * ⛔ **`--retry-budget` was measured at 3 attempts against an absent relay.**
   A budget that interacts with a slow-but-present relay, or with a relay that
   accepts the upgrade and then drops the node, is not measured.
@@ -1245,3 +1258,132 @@ the node's own uses and false of every operator's. The table now holds a
 `NodeCtx *` and readers hold a reference, the same mechanism `Client` already
 used, because two rules have to agree and this file has had three double frees
 from one rule being applied in one place and forgotten in another.
+
+---
+
+# Ten deep reviews, 2026-09-30: the SOCKS forward carries bytes
+
+The work: `src/serve.c` publishes SOCKS sessions on the common path (they
+were dialled, logged, leaked, never published), and `src/relay.c` drives a
+forward with its own two halves behind a bounded `ready` wait instead of a
+raw pump into `client_thread`. Gated as e2e case 36. Each review states what
+was swept; an empty result is a result.
+
+| # | angle | over | verdict |
+| --- | --- | --- | --- |
+| 1 | correctness, node side | the `serve.c` diff | 1 defect found and fixed (Transport husk leak) |
+| 2 | correctness, relay side | the `relay.c` diff | 3 defects found and fixed (double close, goto over init, missing close-to-node) |
+| 3 | concurrency | every lock and refcount the change touches | no defect; ordering matches the existing rules |
+| 4 | the tests | plant P1 + wait probe | both proven: plant fails, fix passes, silence refused bounded |
+| 5 | the docs | every live SOCKS/multiplex claim | 6 stale claims corrected |
+| 6 | what is NOT covered | the handoff's open items | 4 still open, each with what would settle it |
+| 7 | resource lifecycle | every fd, thread and malloc on the forward paths | 1 leak found and fixed (the husk); the rest close once |
+| 8 | protocol conformance | ready/reject/close against the measured table | conforms; SOCKS open stays ours-only |
+| 9 | error paths and diagnostics | every refusal on the forward | each names its fault; codes checked |
+| 10 | second pass, novelty only | the whole diff re-read for what is not above | 1 finding (dead pump removed, comment rewritten) |
+
+## Review 1, the node: one leak
+
+Candidates before reading: (a) the converged publish breaks the ssh path's
+ordering — refuted, the publish-before-ready order is unchanged and shared;
+(b) the dialled fd blocks the pump — refuted, `wrap_fd` sets non-blocking and
+`on_control` now asserts it; (c) a failure path leaks — confirmed for one:
+`transport_detach_fd` hands the fd out but the `Transport` husk was never
+freed, one husk per forward. Fixed with `out->close(out)` after detach, which
+is safe because detach parks the fd at -1 and `sock_close` only closes a live
+one. The `tfd < 0` refusal, the dial-failure reject, and the `pid == -1`
+teardown (no child to reap) were all read and hold.
+
+## Review 2, the relay: three defects, all fixed before the gate ran
+
+(a) The socketpair's far end is closed twice: `socks_n2s_thread` closes it
+via `ws_close` on exit, and `socks_cleanup` closed it again — a close of a
+reused fd number. Fixed: the thread owns it, cleanup closes it only when no
+thread started. (b) `have_n2s` was declared after the ready-timeout `goto`,
+so that path read an indeterminate value. Fixed: declared at the top with the
+reason stated. (c) A forward that ends normally never told the node, leaving
+the dialled session to linger until the destination's EOF propagated. Fixed:
+`socks_close_node` on every end, sharing one helper with the timeout path;
+a close for an unknown id is dropped by the node, so the race is harmless.
+
+## Review 3, concurrency: no defect
+
+Swept: the `is_socks` flag (written once before publish, read under `tlock`
+in node_thread — published before readable, so no race); `ready_seen`
+(written under `tlock`, polled under `tlock`); the s2n write path (tlock,
+then wlock, reference held across the write — the same order as
+`client_thread`); the 1011 sweep (closes the pair, which wakes the forward
+loop; `client_release` is idempotent); shutdown-then-join ordering (no join
+without a thread, no close of a thread-owned fd). The `ws_released` poll
+without a lock is benign: an int flag on a wait loop that re-reads it.
+
+## Review 4, the tests: both counterfactuals run
+
+P1: the session dropped before publish fails `tests/socks-forward-test.sh`
+with exit 1 (the relay waits 20 s for a `ready` that never comes). Fix
+passes 3/3. Added as a plant-matrix row with the stale-`.deps` checkout and
+a build-error guard that reports "skipped" rather than "caught". P2: a node
+that never answers `ready` gets SOCKS 0x04 after 20.0 s
+(`tests/socks-wait-probe.py`), not a hang. The relay-side close special-case
+has no plant: removing it only drops a text frame the forward loop already
+ignores, so the defect is unobservable by design, and it is recorded as such
+rather than covered by a case that cannot fail.
+
+## Review 5, the docs: six stale claims corrected
+
+README's "one session at a time" and "forward and rendezvous only";
+`open-issues.md`'s HALF DONE entry, its case count, and its "what remains";
+`relay-issues.md`'s review-5 SOCKS bullet; AGENTS.md's case count, SOCKS
+bullets, layout, and plant-matrix count; HANDOFF's gate table and SOCKS
+section. Historical reviews keep their dates; corrections are dated in place.
+
+## Review 6, what is NOT covered
+
+* Cross-relay session migration: unbuilt. Proven only between two of ours
+  sharing a key; against the ajam relay it cannot work (different key), and
+  no design is adopted here.
+* A sanitizer: still none on this machine. No libasan/libtsan anywhere,
+  `zig cc -fsanitize` links nothing. Reviews 1–3 are traces.
+* A static dropbear: unbuilt. R9 removed the requirement, not the build
+  choice; nobody has measured a static server.
+* `--retry-budget` against a present-but-slow relay: measured only against
+  an absent relay. Needs a relay that accepts then stalls, which no fixture
+  provides.
+* The case-3 flake: sampled 0/100, not rooted. At 3% that is weak evidence.
+
+## Review 7, lifecycle: every fd, thread and malloc
+
+SOCKS client fd: closed once in cleanup, only shutdown elsewhere. Pair far
+end: thread-owned once started (review 2a), cleanup-owned otherwise.
+Pair near end: `Client.ws`, freed by `client_unref`/`client_release` exactly
+once via the refcount. Node-to-node `close` text: short-lived mallocs freed
+on every path. n2s arg struct: freed by the thread at entry, by the starter
+when creation fails. Dialled Transport husk: review 1. No path leaks a
+thread: n2s is joined on every path that started one.
+
+## Review 8, protocol: conforms
+
+Node leg: id-prefixed binary frames, `ready`/`reject`/`close` text — the
+measured asymmetry is unchanged. The SOCKS `open` with a host still only
+ever arrives from a dropssh relay (an ajam relay never sends one), so the
+branch is unreachable from upstream and the help text saying a SOCKS forward
+works against a dropssh node stands. Reject maps to SOCKS 0x04, refusal of a
+wrong destination stays 0x02, missing `--socks-dest` still refuses at
+startup. Close codes on the ssh legs are untouched.
+
+## Review 9, errors: each names its fault
+
+Node: dial failure logs host, port and the transport error and sends
+`reject`; detach failure likewise; session-limit `reject` names the count.
+Relay: no node gives HOST_UNREACHABLE at once; silent node gives the same
+after 20 s with a log line naming the id; n2s start failure gives 0x01 and a
+1011 release. The test's rc=4 branch still distinguishes "connected but dead"
+from "could not run".
+
+## Review 10, second pass: one finding
+
+Re-read for what is not above: the raw `socks_pump_thread` and its struct
+were dead after the rewrite (no callers) and the design comment above them
+described the third, failed shape as current. Both removed/rewritten; the
+comment now names all three failed shapes and the rule each broke. Nothing
+else found: no second caller of the removed code, no doc referencing it.

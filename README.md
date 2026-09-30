@@ -119,14 +119,18 @@ builder refuses a musl server target by name rather than producing one.
 
 ## What it does not do, and what is known broken
 
-`dropssh serve` carries one session at a time and does not yet speak the
-relay's multiplexed reverse protocol. Every open defect and every requested
-feature is numbered in [`docs/relay-issues.md`](docs/relay-issues.md); B1 to B5
-are the reverse path, and B4 is the root cause of most of the rest. The
+`dropssh serve` holds one websocket and carries many sessions on it, told
+apart by the relay's 32-hex id. Every open defect and every requested feature
+is numbered in [`docs/relay-issues.md`](docs/relay-issues.md); B1 to B5 were
+the reverse path, and B4 was the root cause of most of the rest. The
 server-side items are in [`docs/open-issues.md`](docs/open-issues.md).
 
-The paths that are implemented are the **forward** relay and the
-**rendezvous**, and both are proven with a real session.
+Three paths are implemented and proven with real sessions: the **forward**
+relay, the **rendezvous**, and the **multiplexed reverse** path (two
+concurrent sessions on one node socket, measured live). An operator-side
+**SOCKS5** listener forwards through a named node to exactly one configured
+destination, over INET where binding is allowed and over `unix://` sockets in
+a cage; the byte path is in the gate.
 
 - **No pty.** A cage has no `/dev/ptmx` and nothing in userspace can create
   one, so `ssh -t` is refused rather than silently degraded. A full-screen TUI

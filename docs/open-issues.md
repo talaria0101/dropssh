@@ -19,12 +19,12 @@ in commit `67308d8`; the multiplexed reverse path is implemented and was
 measured live against `tcp.ssh.relay.ajam.dev` (two concurrent sessions on one
 node socket, a 270177-byte transfer byte for byte).
 
-**Updated 2026-09-28.** `tests/e2e.sh` is **35/35** and `tests/mux-probe.py`
-carries **fourteen** cases, up from the nine it started this session with. Five
-of the new ones are for the three known-unguarded items, and **U1, U2 and U3
-are all closed**; see the three full entries at the end of
-[`relay-issues.md`](relay-issues.md), and read U3's for a claim in this tree
-that measurement falsified.
+**Updated 2026-09-30.** `tests/e2e.sh` is **36/36** (the SOCKS byte path is
+case 36, gated 2026-09-30) and `tests/mux-probe.py` carries **fourteen**
+cases. The SOCKS forward's last mile is done: the node publishes the session,
+sends `ready`, and pumps it, and the relay waits on that `ready` bounded
+before answering CONNECT. What follows is the history, kept because the
+record of what was tried is what stops the next redesign retrying it.
 
 Four defects were found by writing the cases rather than by reading the code,
 and three of them were **silent data loss or a wrong refusal**:
@@ -46,17 +46,27 @@ job, built and needing a credential this repository does not have), **#4/#8** (a
 operator-side SOCKS5 that reaches exactly one named destination) and the
 ligolo reconnection budget from **#8**.
 
-⛔ **AND ONE OF THOSE SIX IS HALF DONE, WHICH IS STATED HERE RATHER THAN IN
-THE ISSUE.** The SOCKS5 listener, its destination policy and the node's side of
-the forward are shipped and measured: `--socks unix://PATH` binds in a cage
-where an INET listener cannot, `--socks-dest` names one destination, the policy
-holds (10/10, and the open-proxy plant is caught with six named failures), and
-the node receives an `open` carrying a destination and **dials it**. ⛔ **THE
-FORWARD CARRIES NO BYTES.** The node blocks on a mutex after the forward opens
-and before it publishes the session, every run, and the three designs tried for
-it were not the cause. `tests/socks-forward-test.sh` is the case that keeps
-failing, and it is deliberately **not** in the gate: a gate entry that is always
-red is a gate nobody reads. See the case's own header for what was tried.
+⛔ **AND THE HALF-DONE ONE IS DONE 2026-09-30, WHICH CORRECTS TWO CLAIMS IN
+THIS FILE.** The SOCKS5 listener, its destination policy and the node's side
+of the forward were shipped and measured, and the last mile now carries
+bytes: the node publishes the SOCKS session, sends `ready`, and pumps it
+through the ordinary session path, and the relay waits on that `ready`
+bounded (20 s) before answering CONNECT. 3/3 runs, 225 bytes each way
+through a live destination, and the case is in the gate
+(`tests/socks-forward-test.sh` via `tests/e2e.sh`).
+
+⛔ The `futex_do_wait` diagnosis below was wrong. The node never reached a
+mutex at all: the publish path sat inside the ssh-spawn branch, so a SOCKS
+session never reached it, never sent `ready`, and the relay's wait was the
+only thing that moved. Read the braces before the stacks. The relay half had
+a second defect of its own: a raw byte pump wrote into a socketpair where
+`client_thread` reads websocket frames, so the first payload parsed as a
+frame header. The forward keeps the table entry, the id, the ready gate, the
+refcount and the sweep, and drives the bytes with its own two halves. What
+was written here about three designs tried stands; what it concluded about a
+lock does not, and the paragraph below is kept so the correction is visible.
+
+The node receives an `open` carrying a destination and **dials it**. What was:
 
 ⛔ **ONE CLAIM ABOVE IS NOW KNOWN TO BE TOO STRONG, AND IT IS CORRECTED WHERE
 IT LIVES.** "U2/U3's concurrency read: a writer used freed memory" states the
@@ -68,9 +78,8 @@ served 379 writes across a node's disconnect without a crash. The refcount is
 defence in depth; the ORDERING is what holds. See review 3 in
 [`relay-issues.md`](relay-issues.md).
 
-What remains from the original list is **nothing but the two research issues
-that are deliberately not work** (**#3**, **#5**, **#6**, **#7**, **#12**),
-and the SOCKS forward's last mile, which does not yet carry bytes.
+What remains from the original list is **nothing but the research issues
+that are deliberately not work** (**#3**, **#5**, **#6**, **#7**, **#12**).
 
 Every claim was checked against the source before it was written down, and one
 was wrong and is corrected in place: **B8** in the relay list originally said

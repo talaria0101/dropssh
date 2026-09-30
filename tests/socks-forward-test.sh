@@ -24,37 +24,39 @@
 #     destination -- so this is a forward and not a handshake
 #   the node's own log shows the SOCKS mode arriving as an `open` with a host in
 #     it, which is the only place the destination is decided
-# ⛔⛔⛔ THIS CASE IS NOT IN THE GATE AND IT IS NOT PASSING. Read this before
-# believing anything below. ⛔⛔⛔
+# IN THE GATE SINCE 2026-09-30: a SOCKS5 forward carries bytes end to end.
 #
-# It exists because a SOCKS5 forward "has never carried a byte": the INET
+# This case used to fail in the open (the node never published a SOCKS
+# session or sent `ready` for it, and a raw pump wrote bytes where the relay
+# reads websocket frames). Both halves are fixed and the case is green, so it
+# runs in tests/e2e.sh rather than rotting here. A gate entry that is always
+# red is a gate nobody reads; a case that is green and ungated is a guard
+# nobody runs.
+#
+# It exists because a SOCKS5 forward once "never carried a byte": the INET
 # listener cannot bind in a cage (dropssh#6 measured 24/24), so the feature was
 # unprovable on the machine it was written on. Adding `unix://` to BOTH ends --
 # the listener and the destination -- makes the whole forward provable here, and
 # that part is shipped and works: the listener binds, the policy holds, the node
 # receives an `open` carrying a destination, and it DIALS it.
 #
-# The last mile does not work yet, and the case is here rather than deleted
-# precisely so that it keeps failing in the open instead of being quietly
-# dropped. Measured, against a live destination and a live node:
+# The last mile works now (2026-09-30): the node publishes the session,
+# sends `ready`, and pumps it, and the relay waits on that `ready` bounded
+# before answering CONNECT. What follows is the history of the failure, kept
+# because the next reader will otherwise redesign the forward again. Measured
+# when it was still broken, against a live destination and a live node:
 #
 #   socks forward opened: unix:///.../dest.sock (socket) as 8cb1b48c
 #   N1 after is_socks                                     <- the last line the node logs
 #   the operator's bytes then never arrive
 #
-# ⛔ THE NODE BLOCKS ON A MUTEX AFTER THE FORWARD OPENS AND BEFORE IT PUBLISHES
-# THE SESSION. `futex_do_wait`, every run, at the same line. The three things
-# tried and rejected: the destination is announced once AND the session id is
-# still prefixed on every frame, because a frame on a multiplexed socket with no
-# id belongs to no session and the node said so; the forward is an ordinary
-# `Client` with a real websocket over a socketpair, so `node_thread` remains the
-# only reader of the node's socket; and the SOCKS `CONNECT` reply is sent after
-# the node's `ready`, not before. ⛔ NONE OF THEM WAS THE LOCK, and the block is
-# a real one on this machine rather than an artefact of the case.
-#
-# ⛔ SO IT IS NOT IN THE GATE, and `docs/open-issues.md` says the forward
-# carries no bytes. A gate entry that is always red is a gate nobody reads, and
-# a green tick on a test that skips would be worse.
+# was the shape of the defect while the node published nothing: the
+# destination is announced once in the open, so a forward that opens and then
+# delivers nothing is a forward whose node never dialled. The `futex_do_wait`
+# diagnosis in the earlier history was wrong: the node never reached a mutex
+# at all, because the publish path sat inside the ssh-spawn branch and a
+# SOCKS session never reached it. Recorded so the next diagnosis reads the
+# braces before the stacks.
 set -u
 
 D="${1:?usage: socks-forward-test.sh DISTDIR}"

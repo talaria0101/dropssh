@@ -860,6 +860,7 @@ static void on_control(Mux *m, const char *json) {
              * dropbear's socketpair does, so everything below this line is the
              * ordinary session path with no special case in it. */
             int tfd = transport_detach_fd(out);
+            out->close(out); /* the fd is detached; free the husk */
             if (tfd < 0) {
                 out->close(out);
                 char msg[512];
@@ -888,6 +889,15 @@ static void on_control(Mux *m, const char *json) {
             s->sock = tfd;
             s->pid = -1;
             s->is_socks = 1;
+            /* The dialled socket is already non-blocking via wrap_fd, but
+             * the session pump requires it, so assert it here rather than
+             * assuming the transport kept it. */
+            {
+                int fl = fcntl(s->sock, F_GETFL, 0);
+                if (fl >= 0) {
+                    fcntl(s->sock, F_SETFL, fl | O_NONBLOCK);
+                }
+            }
         } else {
         if (start_server(server_cmd_for_sessions(), &s->sock, &s->pid, why,
                          sizeof why) != 0) {
@@ -904,6 +914,7 @@ static void on_control(Mux *m, const char *json) {
             free(s);
             return;
         }
+        } /* end of the dial-vs-spawn branch: both paths converge below */
 
         /* Publish the session BEFORE sending `ready`, so a data frame that
          * arrives in the same instant as the `ready` finds a session to land in.
@@ -964,8 +975,7 @@ static void on_control(Mux *m, const char *json) {
      * ABOVE it, where a human looks, and the phrase a machine greps for is left
      * exactly as it was. */
     logf("operator opened session %.8s (ready sent)", s->id);
-        }   /* end of the else: the ordinary session path */
-        }
+        } /* end of the open-handling block: dial and spawn converge above */
 }
 
 /* Route ONE data frame to its session, or refuse it.

@@ -712,10 +712,10 @@ head_ "the SOCKS5 listener reaches exactly one named destination"
 # which is the point: a test that copies the policy asserts the copy, and a
 # test that includes the real one cannot go stale without saying so.
 #
-# What is NOT established, and is not claimed: that the SOCKS5 wire format is
-# parsed correctly, that a forward reaches a node, or that bytes move. None of
-# those can be run here, and a case that claims to cover them is the thing this
-# project keeps refusing to write.
+# What is NOT established, and is not claimed: the INET listener path and an
+# INET destination. The listener binds an INET socket on machines that allow
+# it, and the byte path through a node is now asserted below over unix
+# sockets, which is the only form the reference cage can bind or dial at all.
 if [ -f "$HERE/socks-policy-test.sh" ]; then
     if sh "$HERE/socks-policy-test.sh"; then
         ok "the SOCKS5 listener reaches only the destination the operator named, and refuses everything else"
@@ -739,6 +739,23 @@ else
     bad "--socks with no --socks-dest did not refuse; see $sockcfg_out"
 fi
 rm -f "$WORK/socks-cfg.sock"
+
+head_ "a SOCKS5 forward carries bytes through a node and back"
+# The policy above says where a forward may go; this says a forward goes.
+# Listener and destination are both unix sockets, which is the only form the
+# reference cage can bind or dial at all (dropssh#6, measured 24/24). The
+# destination announces itself once in the `open`; every data frame still
+# carries the session id, because the id is addressing and not a destination
+# encoding. Failing open here would be a gate nobody reads, so it fails here.
+if [ -f "$HERE/socks-forward-test.sh" ]; then
+    if sh "$HERE/socks-forward-test.sh" "$DIST"; then
+        ok "a SOCKS5 forward carried bytes through a node and back, over unix sockets"
+    else
+        bad "a SOCKS5 forward connected and delivered nothing; see the output above"
+    fi
+else
+    bad "tests/socks-forward-test.sh is missing, so the byte path is unasserted"
+fi
 
 head_ "a node that cannot pair says so instead of retrying for ever"
 # ⛔ A CAPPED BACKOFF WITH NO TOTAL IS AN AGENT THAT NEVER ADMITS IT IS BROKEN,

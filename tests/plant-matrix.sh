@@ -214,6 +214,29 @@ s=s[:i]+"int socks_destination_allowed(unsigned char atyp, const unsigned char *
 open(p,"w").write(s)
 ' './tests/socks-policy-test.sh'
 
+# ---------------------------------------------------------------- the SOCKS byte path
+# Plant P1, 2026-09-30: dropping a SOCKS session before publish is the exact
+# bug the forward shipped with (its publish path sat inside the ssh-spawn
+# branch). The forward test fails: the relay waits 20 s for a `ready` that
+# never comes and the client times out. Proven by hand 2026-09-30 before this
+# row existed: plant exit 1, fix exit 0, 3/3.
+row "a SOCKS session never published" '
+p="src/serve.c"; s=open(p).read()
+old="""            s->sock = tfd;
+            s->pid = -1;
+            s->is_socks = 1;"""
+new=old+"""
+            close(s->sock);
+            buf_free(&s->inbox);
+            pthread_mutex_destroy(&s->lock);
+            pthread_cond_destroy(&s->cv);
+            free(s);
+            return;"""
+assert old in s, "plant target not found"
+s=s.replace(old,new,1)
+open(p,"w").write(s)
+' 'if [ -d .deps/dropbear/x86_64-linux-gnu ]; then (cd .deps/dropbear/x86_64-linux-gnu && git checkout -- src/); fi; if ! ./scripts/build.sh --target x86_64-linux-musl --out '"$WORK"'/d >/dev/null 2>&1; then echo "plant-row: build error, experiment skipped"; exit 0; fi; sh ./tests/socks-forward-test.sh '"$WORK"'/d'
+
 # ---------------------------------------------------------------- the retry budget
 row "the reconnection budget removed" '
 p="src/serve.c"; s=open(p).read()

@@ -112,7 +112,7 @@ anyone in is the failure this project exists to prevent**, and `dropbear -t`,
 `file` and a green `make` are all incapable of seeing it: it appears at login,
 on a machine with no `/etc/passwd`, as a message that names the wrong thing.
 
-**Thirty-five** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
+**Thirty-six** cases, green on a CI runner at uid 1001 and in a cage at uid 0:
 
 * dropbear is dynamically linked, so the shim can reach it
 * `dropbear -i` stays up on a **socketpair** waiting for a session
@@ -146,6 +146,9 @@ on a machine with no `/etc/passwd`, as a message that names the wrong thing.
 * **the SOCKS5 destination policy** (`tests/socks-policy-test.sh`): the
   listener reaches only the destination the operator named, and a
   `--socks` with no `--socks-dest` is refused at startup
+* **a SOCKS5 forward carries bytes** (`tests/socks-forward-test.sh`):
+  listener and destination both unix sockets, the destination announced once
+  in the `open`, 225 bytes each way through a node and back
 * **the release ships a CA bundle** and a binary in an otherwise empty
   directory finds it beside itself
 * **a node that cannot pair within `--retry-budget`** exits 4, and the log names
@@ -199,8 +202,10 @@ tests/plant-matrix.sh
                 ⛔ every guard, with the defect it claims to catch PLANTED and the
                 test that claims to catch it RUN. ⛔ A claim that a guard fires is
                 a claim about a counterfactual, and reading a test shows what it
-                would check, not what it does. 13 of 15 rows go red; the two
+                would check, not what it does. 14 of 16 rows go red; the two
                 that do not are documented as unreachable, with the reason.
+                The SOCKS publish row is the newest: dropping a SOCKS session
+                before publish fails the forward test.
 tests/relay-session.sh
                 ⛔ NEEDS A NETWORK AND A THIRD PARTY, so it is NOT in the e2e and
                 must not be. It mints its own pair with `POST /v1/pair` --
@@ -208,9 +213,17 @@ tests/relay-session.sh
                 270528-byte transfer by sha256, and two sessions alive at once
                 on one node socket against `tcp.ssh.relay.ajam.dev`.
 tests/socks-forward-test.sh
-                ⛔ NOT IN THE GATE AND NOT PASSING. Kept failing in the open
-                because a gate entry that is always red is a gate nobody reads.
-                Its header says what is proven and what is not.
+                IN THE GATE since 2026-09-30 as e2e case 36: a SOCKS5 forward
+                carries bytes through a node and back, over unix sockets.
+                Its header keeps the history of the failure it used to be.
+tests/case3-loop.py
+                a focused sampler for the case-3 close-code question: the text
+                frame on a data leg, N times against one relay, reporting the
+                flake rate. Network-free like the probe it borrows from.
+tests/socks-wait-probe.py
+                a node that never answers `ready` gets a bounded SOCKS
+                refusal (20 s), not a hang. Manual check for the relay's
+                ready wait, not in the gate: it takes 20 s by construction.
 docs/           the measurements, which are the real documentation
 vendor/         does not exist, on purpose: inputs are fetched and pinned
 ```

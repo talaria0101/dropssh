@@ -271,7 +271,13 @@ typedef struct Client {
      * extra. The first version carried `socks_fd` here so the forward could
      * tell its own socket from an operator's, and the second dropped it by
      * making the forward a Client, which is the same thing said properly. */
-    int         socks_unused;
+    /* A SOCKS5 forward is an operator with a socketpair instead of a
+     * websocket, and this flag is how the node thread knows. A forward's
+     * table entry carries the session id and the ready gate like any
+     * operator, but control frames are never written into its socketpair:
+     * its reader is the forward loop, not client_thread, and a text frame
+     * there would be refused as data rather than read as control. */
+    int         is_socks;
     /* ⛔ A REFERENCE COUNT, BECAUSE A POINTER OUT OF THE TABLE IS NOT A
      * REFERENCE TO THE OBJECT.
      *
@@ -961,6 +967,8 @@ static void node_thread(NodeCtx *nc) {
                                  * begin until the lock is released. */
                                 if (strcmp(verb, "ready") == 0) {
                                     c->ready_seen = 1;
+                                } else if (c->is_socks) {
+                                    c->ready_seen = -1;
                                 }
                                 c->refs++;
                                 target = c;
@@ -971,8 +979,14 @@ static void node_thread(NodeCtx *nc) {
                 }
                 pthread_mutex_unlock(&tlock);
                 if (target) {
-                    ws_write_text(&target->ws, (const unsigned char *)json, n);
-                    client_unref(target);
+                    if (target->is_socks) {
+                        /* A forward's loop polls the flag; no text frame is
+                         * written into its socketpair. */
+                        client_unref(target);
+                    } else {
+                        ws_write_text(&target->ws, (const unsigned char *)json, n);
+                        client_unref(target);
+                    }
                 }
             } else if (strcmp(verb, "close") == 0) {
                 /* Same rule as `ready` and the data path: a REFERENCE, not the
@@ -997,11 +1011,18 @@ static void node_thread(NodeCtx *nc) {
                 }
                 pthread_mutex_unlock(&tlock);
                 if (target) {
-                    char msg[96];
-                    snprintf(msg, sizeof msg, "{\"type\":\"close\",\"id\":\"%s\"}", id);
-                    ws_write_text(&target->ws, (const unsigned char *)msg, strlen(msg));
-                    client_release(target, 1000, "session closed");
-                    client_unref(target);
+                    if (target->is_socks) {
+                        /* Closing the pair wakes the forward loop; no text
+                         * frame is written into it. */
+                        client_release(target, 1000, "session closed");
+                        client_unref(target);
+                    } else {
+                        char msg[96];
+                        snprintf(msg, sizeof msg, "{\"type\":\"close\",\"id\":\"%s\"}", id);
+                        ws_write_text(&target->ws, (const unsigned char *)msg, strlen(msg));
+                        client_release(target, 1000, "session closed");
+                        client_unref(target);
+                    }
                 }
             } else if (strcmp(verb, "bye") == 0) {
                 break;
@@ -1546,12 +1567,11 @@ static void *socks_accept_thread(void *unused) {
     return NULL;
 }
 
-/* ⛔ THE SOCKS FORWARD IS AN ORDINARY `Client`, AND THAT IS THE ONLY SHAPE IT
- * CAN HAVE.
+/* THE SOCKS FORWARD IS A TABLE `Client` WITH ITS OWN LOOP, AND THAT IS
+ * THE ONLY SHAPE IT CAN HAVE.
  *
- * ⛔ TWO EARLIER VERSIONS WERE BUILT AND BOTH WERE WRONG IN A WAY THE LOGS
- * NAMED EXACTLY, and they are recorded because the second one is a rule this
- * file has a name for and violated.
+ * THREE EARLIER VERSIONS WERE BUILT AND ALL WERE WRONG IN A WAY THE LOGS
+ * NAMED EXACTLY.
  *
  * THE FIRST: a private loop that read the SOCKS client and wrote to the node's
  * websocket under the node's `wlock`. It never carried a session id, so the
@@ -1559,135 +1579,134 @@ static void *socks_accept_thread(void *unused) {
  *
  *     a data frame carried an id that is not 32 hex; ignored
  *
- * ⛔ The id is not decoration. The node's leg is a MULTIPLEX: every frame is
- * addressed by its 32-hex session id, and a frame without one belongs to no
- * session. That is the whole reason the id exists, and dropping#10's
- * "announce the destination once, in the setup" is compatible with keeping it
- * -- the DESTINATION goes in the `open`, and the ADDRESSING stays on every
- * frame. I had collapsed the two, and the collapse cost a session.
- *
  * THE SECOND: a forward that WAITED for the node's `ready` by calling
  * `ws_poll_frame` on the node's websocket. That is a SECOND READER on a socket
- * whose only reader is `node_thread` -- the rule written at the top of this
- * file -- and it deadlocked: the node sent `ready`, `node_thread` read it, and
- * nothing forwarded it to a socket nobody was allowed to read. The symptom was
+ * whose only reader is `node_thread`, and it deadlocked.
  *
- *     the node did not answer `ready` within 15s, so the forward is not started
+ * THE THIRD: the forward as an ordinary `Client` over a socketpair, with a raw
+ * byte pump into the pair's far end and `client_thread` reading it. That never
+ * carried a byte either, for two reasons at once: the node never published a
+ * SOCKS session or sent `ready` for it (its publish path sat inside the
+ * ssh-spawn branch), and a raw pump writes bytes where `client_thread` reads
+ * websocket frames, so the first payload was parsed as a frame header and the
+ * forward died unnamed.
  *
- * against a node that had answered in milliseconds. ⛔ A second reader on a
- * shared socket does not fail loudly. It fails as somebody else's silence, and
- * the cost of the rule is a comment that says why.
+ * So the forward keeps the parts of `Client` that are about identity and
+ * lifecycle -- the table entry, the session id, the ready gate, the refcount,
+ * the 1011 sweep -- and drives the bytes with its own two halves instead of
+ * `client_thread`: this thread reads raw bytes from the SOCKS client and
+ * writes id-prefixed frames to the node under the node's `wlock`, and
+ * `socks_n2s_thread` decodes the frames the node thread writes into the
+ * table entry and writes bare payload to the SOCKS client. Every rule then
+ * holds by construction rather than by care:
  *
- * So the SOCKS forward is a `Client`. Its `ws` is a REAL websocket over one end
- * of a socketpair, `client_thread` reads it exactly as it reads an operator's,
- * the SOCKS client is pumped into the socketpair's OTHER end, and the node
- * receives ordinary `id+payload` frames through the ordinary path. Every rule
- * in this file then holds by construction rather than by care:
- *
- *   one reader per websocket, ever          -- client_thread, and nobody else
+ *   one reader per websocket, ever          -- node_thread on the node socket
  *   one writer per websocket, ever          -- the per-node wlock
  *   a frame's header and payload together   -- ws_write, never a raw write
- *   `ready` reaches the forward              -- the `ready` branch, unchanged
+ *   `ready` reaches the forward              -- the ready flag, polled bounded
  *   the 1011 sweep on a node that goes      -- the client list, unchanged
  *   the refcount                            -- the same mechanism as an operator
  *
- * ⛔ AND THE COST IS STATED RATHER THAN DISCOVERED: the SOCKS client speaks
- * SOCKS and the socketpair speaks websocket, so there is a framing layer
- * between them that an operator does not have. It is one `ws_write` on one side
- * and one `read` on the other, both bounded, and it is why the SOCKS client
- * never touches the node's socket directly.
+ * The destination still goes in the `open`, once, and the session id stays on
+ * every data frame: the DESTINATION is announced once in the setup and the
+ * ADDRESSING stays on every frame, which are two different fields.
  */
-typedef struct {
-    int cfd;             /* the SOCKS client */
-    int pair;            /* the socketpair end `client_thread` reads */
-} socks_pump;
 
-static void *socks_pump_thread(void *arg) {
-    socks_pump *p = (socks_pump *)arg;
-    unsigned char buf[32768];
-    struct pollfd pf[2];
-    int client_open = 1;
-    /* ⛔ BOTH ENDS ARE NON-BLOCKING BEFORE ANY PUMP, AND `wrap_fd` DOES NOT DO
-     * IT FOR THESE TWO. Every other descriptor here goes through
-     * `transport_from_fd`, which sets O_NONBLOCK, and the comment there says
-     * why: a blocking read is a hang. An `accept`ed SOCKS client and a raw
-     * socketpair end are the two exceptions, and a blocking read on a client
-     * that has gone quiet would hold a relay thread until the kernel gives up. */
-    for (int i = 0; i < 2; i++) {
-        int fl = fcntl(i ? p->pair : p->cfd, F_GETFL, 0);
-        if (fl >= 0) {
-            fcntl(i ? p->pair : p->cfd, F_SETFL, fl | O_NONBLOCK);
-        }
+
+/* The node-to-client half of a SOCKS forward. It owns a websocket session
+ * over the socketpair's far end and decodes the frames the node thread
+ * writes into the forward's table entry, forwarding bare payload to the
+ * SOCKS client. Text frames are never forwarded: the node thread sets the
+ * ready flag without writing control into a forward's pair, so text here
+ * would be a protocol error, and it is dropped rather than delivered as
+ * bytes. When this direction ends it shuts the SOCKS socket down, which is
+ * what wakes the client-to-node loop. */
+typedef struct {
+    int pair_fd;
+    int socks_fd;
+} socks_n2s;
+
+static void *socks_n2s_thread(void *arg) {
+    socks_n2s *p = (socks_n2s *)arg;
+    int pair_fd = p->pair_fd;
+    int socks_fd = p->socks_fd;
+    free(p);
+    Transport *ct = transport_from_fd(pair_fd, "socks-n2s");
+    if (ct == NULL) {
+        close(pair_fd);
+        shutdown(socks_fd, SHUT_RDWR);
+        return NULL;
     }
+    WsSession ws;
+    memset(&ws, 0, sizeof ws);
+    ws.t = ct;
+    ws.is_client = 1;
+    ws.keepalive_ms = 0;
+    ws.fq_cap = WS_DEFAULT_QUEUE_BYTES;
+    ws.max_frame = WS_HELLO_DEFAULT_FRAME;
+    ws.max_sessions = WS_HELLO_DEFAULT_SESSIONS;
+    buf_init(&ws.rbuf);
+    buf_init(&ws.frag);
+    buf_init(&ws.spill);
+    buffer frame;
+    buf_init(&frame);
     for (;;) {
-        pf[0].fd = client_open ? p->cfd : -1;
-        pf[0].events = POLLIN;
-        pf[0].revents = 0;
-        pf[1].fd = p->pair;
-        pf[1].events = POLLIN;
-        pf[1].revents = 0;
-        int pr = poll(pf, 2, 1000);
-        if (pr < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return NULL;
+        int op = 0, closed = 0, fatal = 0;
+        size_t n = 0;
+        if (ws_recv_frame(&ws, &op, &frame, &n, &closed, &fatal) < 0) {
+            break;
         }
-        if (pr == 0) {
+        if (op == 0x1) {
             continue;
         }
-        if (pf[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t n = read(p->cfd, buf, sizeof buf);
-            if (n > 0) {
-                size_t off = 0;
-                while (off < (size_t)n) {
-                    ssize_t w = write(p->pair, buf + off, (size_t)n - off);
-                    if (w > 0) {
-                        off += (size_t)w;
-                    } else if (w < 0 && (errno == EINTR || errno == EAGAIN ||
-                                         errno == EWOULDBLOCK)) {
-                        struct pollfd wp = { .fd = p->pair, .events = POLLOUT };
-                        poll(&wp, 1, 1000);
-                        continue;
-                    } else {
-                        return NULL;
-                    }
-                }
-            } else if (n == 0) {
-                /* ⛔ THE CLIENT HALF-CLOSED, AND THE FAR END IS TOLD SO RATHER
-                 * THAN THE FORWARD SIMPLY ENDING. HTTP over a SOCKS proxy
-                 * half-closes after its request and the response still has to
-                 * come back, so this is a normal state and not an ending. */
-                shutdown(p->pair, SHUT_WR);
-                client_open = 0;
-                pf[0].fd = -1;
-            } else if (errno != EINTR && errno != EAGAIN) {
-                return NULL;
+        if (n == 0) {
+            continue;
+        }
+        size_t off = 0;
+        while (off < n) {
+            ssize_t w = write(socks_fd, frame.p + off, n - off);
+            if (w > 0) {
+                off += (size_t)w;
+            } else if (w < 0 && errno == EINTR) {
+                continue;
+            } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                struct pollfd wp = { .fd = socks_fd, .events = POLLOUT };
+                poll(&wp, 1, 1000);
+                continue;
+            } else {
+                goto n2s_out;
             }
         }
-        if (pf[1].revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t n = read(p->pair, buf, sizeof buf);
-            if (n > 0) {
-                size_t off = 0;
-                while (off < (size_t)n) {
-                    ssize_t w = write(p->cfd, buf + off, (size_t)n - off);
-                    if (w > 0) {
-                        off += (size_t)w;
-                    } else if (w < 0 && (errno == EINTR || errno == EAGAIN ||
-                                         errno == EWOULDBLOCK)) {
-                        struct pollfd wp = { .fd = p->cfd, .events = POLLOUT };
-                        poll(&wp, 1, 1000);
-                        continue;
-                    } else {
-                        return NULL;
-                    }
-                }
-            } else if (n == 0) {
-                return NULL;
-            } else if (errno != EINTR && errno != EAGAIN) {
-                return NULL;
-            }
-        }
+    }
+n2s_out:
+    buf_free(&frame);
+    ws_close(&ws); /* closes pair_fd: the thread owns it */
+    shutdown(socks_fd, SHUT_RDWR);
+    return NULL;
+}
+
+/* Tell the node a forward's session is unwanted so it does not linger.
+ * Harmless when the node already tore it down: its close branch drops
+ * frames for unknown ids. Lock order matches every other node write:
+ * tlock, then the node's wlock, with a held reference across the write. */
+static void socks_close_node(const char *name, const char *id) {
+    pthread_mutex_lock(&tlock);
+    NameSlot *cns = slot_locked(name, 0);
+    NodeCtx *cenc = node_hold_locked(cns);
+    if (cns) {
+        pthread_mutex_lock(&cns->wlock);
+    }
+    pthread_mutex_unlock(&tlock);
+    if (cenc && cns) {
+        char cm[96];
+        snprintf(cm, sizeof cm, "{\"type\":\"close\",\"id\":\"%s\"}", id);
+        ws_write_text(&cenc->ws, (const unsigned char *)cm, strlen(cm));
+    }
+    if (cns) {
+        pthread_mutex_unlock(&cns->wlock);
+    }
+    if (cenc) {
+        node_drop(cenc);
     }
 }
 
@@ -1699,6 +1718,11 @@ static void *socks_pump_thread(void *arg) {
  * `Ns->node` read is not enough. */
 static void *socks_thread(void *arg) {
     int fd = (int)(intptr_t)arg;
+    /* Declared here so every `goto socks_cleanup` below reads values that
+     * were set: a goto that jumps over an initialiser would read garbage. */
+    socks_n2s *n2s = NULL;
+    pthread_t n2s_th;
+    int have_n2s = 0;
     unsigned char head[2];
     if (read_exact(fd, head, 2, 10000) != 0 || head[0] != 0x05) {
         close(fd);
@@ -1950,14 +1974,13 @@ static void *socks_thread(void *arg) {
     ws_move(&c->ws, &cws);            /* ⛔ U2: moved, not copied, once */
     snprintf(c->name, sizeof c->name, "%s", socks_node_name);
     snprintf(c->id, sizeof c->id, "%s", id);
-    /* `ready` is the node's answer that the session exists, and it is what
-     * the `ready` branch in node_thread sets. It is set HERE, before
-     * `client_thread` starts, because the SOCKS client has already been told
-     * CONNECT succeeded and the first bytes it sends must be forwarded rather
-     * than refused with 1008 -- and the refusal would be correct, because the
-     * node has not answered yet. ⛔ The destination has been dialled by the
-     * node and the node publishes before it sends `ready`, so by the time a
-     * frame arrives from this forward the session exists on the node. */
+    c->is_socks = 1;
+    c->ready_seen = 0;
+    /* `ready` is the node's answer that the session exists, and the `ready`
+     * branch in node_thread sets this entry's flag without writing a frame
+     * into its pair: the forward loop below polls the flag, and a text frame
+     * there would be refused as data rather than read as control. Nothing
+     * here tells the client anything until that flag says the node dialled. */
     pthread_mutex_lock(&tlock);
     ns = slot_locked(socks_node_name, 0);
     c->next = ns->clients;
@@ -1972,38 +1995,146 @@ static void *socks_thread(void *arg) {
     pthread_mutex_unlock(&tlock);
     node_drop(enc);
 
-    /* ⛔ AND THE PUMP IS STARTED BEFORE THE REPLY, SO THE CLIENT'S FIRST BYTES
-     * CANNOT BE LOST BETWEEN THE REPLY AND THE PUMP. A SOCKS client that is
-     * told "connected" and then has its request dropped has been told
-     * something false, and the window is one `sendall`. */
-    socks_pump pump = { fd, pair[1] };
-    pthread_t pth;
-    pthread_attr_t pattr;
-    pthread_attr_init(&pattr);
-    pthread_attr_setdetachstate(&pattr, PTHREAD_CREATE_DETACHED);
-    int pumping = (pthread_create(&pth, &pattr, socks_pump_thread, &pump) == 0);
-    pthread_attr_destroy(&pattr);
-    if (!pumping) {
+    /* Wait for the node's answer, bounded: an unanswered `ready` is a node
+     * that is not going to answer, and a forward that never starts is better
+     * than one that starts on a dead session. */
+    int ready_rc = 0;
+    for (int waited = 0; waited < 20000; waited += 50) {
+        int st = 0, gone = 0;
+        pthread_mutex_lock(&tlock);
+        st = c->ready_seen;
+        gone = (c->ws_released != 0);
+        pthread_mutex_unlock(&tlock);
+        if (st == 1) {
+            ready_rc = 1;
+            break;
+        }
+        if (st < 0 || gone) {
+            ready_rc = -1;
+            break;
+        }
+        dropssh_sleep_ms(50);
+    }
+    if (ready_rc != 1) {
+        /* Tell the node its session is unwanted so it does not linger, then
+         * refuse the client rather than holding it past the bound. */
+        socks_close_node(socks_node_name, id);
+        logf("socks: the node did not answer `ready` for %.8s", id);
+        socks_reply(fd, SOCKS_HOST_UNREACHABLE, atyp, addr, dport[1]);
+        client_release(c, 0, NULL);
+        goto socks_cleanup;
+    }
+
+    /* The node dialled and answered. Start the node-to-client half before
+     * the reply, so bytes the destination sends first cannot be lost between
+     * the reply and the reader. */
+    n2s = malloc(sizeof *n2s);
+    if (n2s != NULL) {
+        n2s->pair_fd = pair[1];
+        n2s->socks_fd = fd;
+        if (pthread_create(&n2s_th, NULL, socks_n2s_thread, n2s) == 0) {
+            have_n2s = 1;
+        } else {
+            free(n2s);
+        }
+    }
+    if (!have_n2s) {
         socks_reply(fd, SOCKS_FAIL, atyp, addr, dport[1]);
         client_release(c, 1011, "the forward could not be started");
         goto socks_cleanup;
     }
 
-    /* ⛔ AND THE SOCKS `CONNECT` REPLY GOES OUT ONLY NOW, ONCE THE FORWARD IS
-     * LIVE. RFC 1928 has one success code and it should mean one thing. */
+    /* AND THE SOCKS `CONNECT` REPLY GOES OUT ONLY NOW, ONCE THE NODE HAS
+     * ANSWERED. RFC 1928 has one success code and it should mean one thing:
+     * a client told "connected" has a session the node dialled. */
     if (socks_reply(fd, SOCKS_OK, atyp, addr, dport[1]) != 0) {
+        shutdown(pair[1], SHUT_RDWR);
+        pthread_join(n2s_th, NULL);
         client_release(c, 0, NULL);
         goto socks_cleanup;
     }
 
-    client_thread(c);
+    /* Client to node: raw bytes from the SOCKS client become id-prefixed
+     * frames on the node's socket, under the node's write lock like every
+     * other operator. This thread owns that direction; the n2s thread owns
+     * the other. Either ending shuts the peer down, which is what wakes the
+     * other half. */
+    for (;;) {
+        struct pollfd pf = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pf, 1, 1000);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (pr == 0) {
+            int gone = 0;
+            pthread_mutex_lock(&tlock);
+            gone = (c->ws_released != 0);
+            pthread_mutex_unlock(&tlock);
+            if (gone) {
+                break;
+            }
+            continue;
+        }
+        if (pf.revents & (POLLIN | POLLHUP | POLLERR)) {
+            unsigned char buf[32768];
+            ssize_t n = read(fd, buf, sizeof buf);
+            if (n <= 0) {
+                if (n < 0 && (errno == EINTR || errno == EAGAIN ||
+                              errno == EWOULDBLOCK)) {
+                    continue;
+                }
+                break;
+            }
+            pthread_mutex_lock(&tlock);
+            NameSlot *fns = slot_locked(socks_node_name, 0);
+            NodeCtx *fenc = node_hold_locked(fns);
+            if (fns) {
+                pthread_mutex_lock(&fns->wlock);
+            }
+            pthread_mutex_unlock(&tlock);
+            int wrc = -1;
+            if (fenc && fns) {
+                unsigned char *framed = malloc((size_t)n + RELAY_ID_LEN);
+                if (framed != NULL) {
+                    memcpy(framed, id, RELAY_ID_LEN);
+                    memcpy(framed + RELAY_ID_LEN, buf, (size_t)n);
+                    wrc = ws_write(&fenc->ws, framed,
+                                   (size_t)n + RELAY_ID_LEN);
+                    free(framed);
+                }
+            }
+            if (fns) {
+                pthread_mutex_unlock(&fns->wlock);
+            }
+            if (fenc) {
+                node_drop(fenc);
+            }
+            if (wrc != 0) {
+                break;
+            }
+            stat_bytes_out += (unsigned long long)n;
+        }
+    }
+    shutdown(pair[1], SHUT_RDWR);
+    pthread_join(n2s_th, NULL);
+    /* The client is gone: tell the node so its dialled session does not
+     * linger past the forward. */
+    socks_close_node(socks_node_name, id);
 
 socks_cleanup:
-    /* The SOCKS client and the socketpair's far end belong to this thread and
-     * not to the Client, so they are closed here rather than by
-     * `client_release`, which knows nothing about them. */
+    /* The SOCKS client belongs to this thread and not to the Client, so it
+     * is closed here rather than by `client_release`. The socketpair's far
+     * end belongs to the n2s thread once started, which closes it on exit;
+     * only a forward that never started one still owns it here. have_n2s
+     * is declared at the top of this function so every goto above reads a
+     * value that was set, not one it jumped over. */
     close(fd);
-    close(pair[1]);
+    if (!have_n2s) {
+        close(pair[1]);
+    }
     pthread_mutex_lock(&tlock);
     ns = slot_locked(socks_node_name, 0);
     if (ns) {
