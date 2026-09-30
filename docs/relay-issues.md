@@ -1025,6 +1025,13 @@ it.
   exhausts the relay's 32-name table at exactly 32: 32/32 good, then every
   later upgrade answered with no hello. That is the name cap working, not a
   leak, and the loop reuses names for exactly that reason.
+
+  **Rooted 2026-09-30, in CI:** the probe sent OP-BARE unconditionally, even
+  in cases 2 and 3 that expect the node to CLOSE for the fault frame. The
+  relay may forward those bytes first, and the probe then parses a DATA
+  frame as the close it waits for (measured: close 33319 with an id
+  fragment as reason). Cases expecting a node close now send nothing after
+  the fault. A probe race, not a relay bug.
 * ⛔ **`--retry-budget` was measured at 3 attempts against an absent relay.**
   A budget that interacts with a slow-but-present relay, or with a relay that
   accepts the upgrade and then drops the node, is not measured.
